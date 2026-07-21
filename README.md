@@ -37,8 +37,8 @@ Isaac Sim --/joint_states--> arm_node <--/arm/joint_command--> Isaac Sim
 Isaac Sim --/amr/sim_pose--> amr_node <--/amr/cmd_vel--> Isaac Sim
 ```
 
-`Collected_World0/`가 이 워크스페이스의 Isaac Sim 씬 에셋이다. 위 시뮬 인터페이스
-토픽들을 Isaac Sim 쪽에서 퍼블리시/서브스크라이브하도록 연동하면 된다.
+Isaac Sim 씬 에셋은 이 저장소에 포함하지 않는다. 위 시뮬 인터페이스 토픽들을
+Isaac Sim 쪽에서 퍼블리시/서브스크라이브하도록 연동하면 된다.
 
 ### 빌드 및 실행
 
