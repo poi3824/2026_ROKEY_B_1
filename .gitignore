@@ -3,6 +3,10 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+# perception_prototype: 임시 테스트 모델/생성 이미지 (재생성 가능, git 제외)
+*.pt
+perception_prototype/experiments/variants/*.png
+
 # C extensions
 *.so
 
