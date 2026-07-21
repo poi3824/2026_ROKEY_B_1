@@ -219,3 +219,10 @@ __marimo__/
 
 # Personal access token
 github_pat
+
+# ROS2 / colcon
+build/
+install/
+log/
+.vscode/
+
