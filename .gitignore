@@ -1,0 +1,19 @@
+# ROS 2 Build & Workspace Outputs
+build/
+install/
+log/
+
+# Python Compilation Artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# ROS 2 Log & Test Output
+*.log
+.pytest_cache/
+
+# IDE & OS Artifacts (Optional)
+.vscode/
+.idea/
+.DS_Store
