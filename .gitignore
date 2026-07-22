@@ -232,3 +232,7 @@ log/
 /rosbag2_*/
 *.pt
 
+# Isaac Sim collected world assets (large binaries, 100MB+ files) - keep out of repo
+/isaacpjt/
+/src/Collected_World0123/
+
