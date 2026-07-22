@@ -232,3 +232,11 @@ log/
 /rosbag2_*/
 *.pt
 
+# Isaac Sim collected world assets (large binaries, 100MB+ files) - keep out of repo
+/isaacpjt/
+/src/Collected_World0123/
+
+# 궤적 녹화 스크립트 실행 로그 (재현 시 매번 새로 생성됨, 로컬 절대경로 포함)
+src/arm_node/scripts/record_result.txt
+src/arm_node/scripts/record_stdout.log
+
