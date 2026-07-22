@@ -25,7 +25,8 @@ class YoloSegDetector:
         self.names = self._model.names
 
     def detect(self, image: np.ndarray, conf_threshold: float) -> list[dict]:
-        """반환: [{"label", "score", "pixel": (u, v), "bbox_size_px": (w, h)}, ...]"""
+        """반환: [{"label", "score", "pixel": (u, v), "bbox_px": (x0,y0,x1,y1),
+        "mask_xy": np.ndarray}, ...]"""
         results = self._model(image, conf=conf_threshold, verbose=False)[0]
         detections = []
         if results.masks is None:
@@ -34,12 +35,13 @@ class YoloSegDetector:
         for box, mask_xy, cls, conf in zip(
             results.boxes.xyxy, results.masks.xy, results.boxes.cls, results.boxes.conf
         ):
-            u, v = mask_centroid(np.asarray(mask_xy), image.shape)
-            x0, y0, x1, y1 = box.tolist()
+            mask_xy = np.asarray(mask_xy)
+            u, v = mask_centroid(mask_xy, image.shape)
             detections.append({
                 "label": self.names[int(cls)],
                 "score": float(conf),
                 "pixel": (u, v),
-                "bbox_size_px": (x1 - x0, y1 - y0),
+                "bbox_px": tuple(box.tolist()),
+                "mask_xy": mask_xy,
             })
         return detections

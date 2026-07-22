@@ -16,6 +16,9 @@
   <depend>tf2_ros</depend>
   <depend>tf2_geometry_msgs</depend>
   <exec_depend>python3-opencv</exec_depend>
+  <!-- scripts/inspect_bag_frame.py (오프라인 bag 프레임 디버그 도구) 전용 -->
+  <exec_depend>rosbag2_py</exec_depend>
+  <exec_depend>tf2_msgs</exec_depend>
   <!-- ultralytics, torch: rosdep 키가 아닌 pip 패키지. 별도로 pip install 필요 -->
 
 
