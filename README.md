@@ -59,5 +59,8 @@ Isaac Sim 및 실제 인식·모션 로직 연동이 필요한 TODO로 남겨져
 - `fleet_manager_node`: 비전 스캔 기반 "남은 작업 판단" (현재는 station_1~3 순차 데모)
 - `behavior_node`: 복구 로직의 실제 후퇴(retreat) 모션 위임
 - `amr_node`: Isaac Sim 실좌표 피드백 기반 도착 판정 (`/amr/sim_pose`)
-- `arm_node`: IK/모션 플래닝, 실제 토크 센서 기반 체결 판정
+- `arm_node`: 너트 체결(APPROACH/FASTEN)은 World0123.usd에서 녹화한 관절 궤적
+  (`scripts/record_nut_fasten_trajectory.py` → `data/nut_fasten_trajectory.json`)을
+  재생하도록 구현됨. 버스바 파지·삽입은 아직 IK/모션 플래닝 TODO, 체결 성공 판정도
+  아직 실제 토크 센서가 아닌 시뮬레이션 값
 - `perception_node`: YOLO 모델 연동, 픽셀→3D pose 역투영 (depth + intrinsic)
