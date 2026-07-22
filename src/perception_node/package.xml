@@ -3,15 +3,21 @@
 <package format="3">
   <name>perception_node</name>
   <version>0.0.0</version>
-  <description>D455 시뮬 영상 기반 스터드/버스바/너트 위치 검출 (Hough Circle, YOLO)</description>
+  <description>YOLO 세그멘테이션 기반 bolt/nut/busbar 검출 -> world 좌표 변환 -> 토픽 발행</description>
   <maintainer email="poi3824@gmail.com">soo</maintainer>
   <license>Apache-2.0</license>
 
   <depend>rclpy</depend>
-  <depend>fms_interfaces</depend>
   <depend>sensor_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>vision_msgs</depend>
   <depend>cv_bridge</depend>
+  <depend>image_geometry</depend>
+  <depend>tf2_ros</depend>
+  <depend>tf2_geometry_msgs</depend>
   <exec_depend>python3-opencv</exec_depend>
+  <!-- ultralytics, torch: rosdep 키가 아닌 pip 패키지. 별도로 pip install 필요 -->
+
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

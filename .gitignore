@@ -226,3 +226,9 @@ install/
 log/
 .vscode/
 
+# local-only data, not part of the repo (only src/ is tracked here)
+/datasets/
+/experiments/
+/rosbag2_*/
+*.pt
+

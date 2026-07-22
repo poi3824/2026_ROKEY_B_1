@@ -1,24 +1,40 @@
 """perception_node
-실행 계층 · D455 시뮬 센서 인식 (Hough Circle 스터드 검출, YOLO 버스바/너트 검출).
+실행 계층 · YOLO 검출(bolt/nut/busbar) -> world 좌표 변환 -> 토픽 발행.
 
-SUB /camera/color   (sensor_msgs/Image)  <- Isaac Sim D455
-SUB /camera/depth   (sensor_msgs/Image)  <- Isaac Sim D455
+SUB <rgb_topic>          (sensor_msgs/Image, rgb8)
+SUB <depth_topic>        (sensor_msgs/Image, 32FC1, m)
+SUB <camera_info_topic>  (sensor_msgs/CameraInfo)
 
-PUB /vision/stud_pose      (fms_interfaces/StudPose)
-PUB /vision/busbar_grasp   (fms_interfaces/BusbarGrasp)
-PUB /vision/nut_pose       (fms_interfaces/NutPose)
+PUB /perception/detections_3d  (vision_msgs/Detection3DArray, <world_frame> 기준)
+
+카메라 프레임 -> world_frame 변환은 tf2 lookupTransform으로 조회한다. 이 노드는
+카메라가 어디에 있는지 알지 못하며, world_frame -> 카메라 frame_id로의 tf가 어디선가
+(로봇 URDF/robot_state_publisher, 또는 캘리브레이션용 static_transform_publisher)
+발행되고 있어야 world 좌표가 채워진다. tf가 없으면 해당 검출은 skip하고 경고 로그만
+남긴다.
 """
-import cv2
+import os
+
 import numpy as np
-
 import rclpy
-from rclpy.node import Node
-from sensor_msgs.msg import Image
+from ament_index_python.packages import get_package_share_directory
 from cv_bridge import CvBridge
+from geometry_msgs.msg import PointStamped
+from rclpy.duration import Duration
+from rclpy.node import Node
+from rclpy.time import Time
+from sensor_msgs.msg import CameraInfo, Image
+from tf2_geometry_msgs import do_transform_point
+from tf2_ros import TransformException
+from tf2_ros.buffer import Buffer
+from tf2_ros.transform_listener import TransformListener
+from vision_msgs.msg import Detection3D, Detection3DArray, ObjectHypothesisWithPose
 
-from fms_interfaces.msg import StudPose, BusbarGrasp, NutPose
+from perception_node.camera_geometry import make_camera_model, pixel_to_camera_point
+from perception_node.detector import YoloSegDetector
 
-DETECTION_PERIOD_SEC = 0.5
+DEFAULT_MODEL_PATH = os.path.join(
+    get_package_share_directory('perception_node'), 'models', 'best.pt')
 
 
 class PerceptionNode(Node):
@@ -26,97 +42,131 @@ class PerceptionNode(Node):
     def __init__(self):
         super().__init__('perception_node')
 
+        self.declare_parameter('rgb_topic', '/rgb')
+        self.declare_parameter('depth_topic', '/depth')
+        self.declare_parameter('camera_info_topic', '/camera_info')
+        self.declare_parameter('model_path', DEFAULT_MODEL_PATH)
+        self.declare_parameter('world_frame', 'world')
+        self.declare_parameter('conf_threshold', 0.5)
+        self.declare_parameter('detection_period_sec', 0.5)
+
+        rgb_topic = self.get_parameter('rgb_topic').value
+        depth_topic = self.get_parameter('depth_topic').value
+        camera_info_topic = self.get_parameter('camera_info_topic').value
+        model_path = self.get_parameter('model_path').value
+        self._world_frame = self.get_parameter('world_frame').value
+        self._conf_threshold = self.get_parameter('conf_threshold').value
+        detection_period_sec = self.get_parameter('detection_period_sec').value
+
         self._bridge = CvBridge()
-        self._latest_color = None
+        self._detector = YoloSegDetector(model_path)
+
+        self._latest_rgb = None
+        self._latest_rgb_header = None
         self._latest_depth = None
+        self._camera_model = None
+        self._camera_frame_id = None
 
-        self._color_sub = self.create_subscription(
-            Image, '/camera/color', self._on_color, 10)
-        self._depth_sub = self.create_subscription(
-            Image, '/camera/depth', self._on_depth, 10)
+        self._tf_buffer = Buffer()
+        self._tf_listener = TransformListener(self._tf_buffer, self)
 
-        self._stud_pub = self.create_publisher(StudPose, '/vision/stud_pose', 10)
-        self._busbar_grasp_pub = self.create_publisher(BusbarGrasp, '/vision/busbar_grasp', 10)
-        self._nut_pub = self.create_publisher(NutPose, '/vision/nut_pose', 10)
+        self._rgb_sub = self.create_subscription(Image, rgb_topic, self._on_rgb, 10)
+        self._depth_sub = self.create_subscription(Image, depth_topic, self._on_depth, 10)
+        self._camera_info_sub = self.create_subscription(
+            CameraInfo, camera_info_topic, self._on_camera_info, 10)
 
-        self._timer = self.create_timer(DETECTION_PERIOD_SEC, self._detect_and_publish)
+        self._detections_pub = self.create_publisher(
+            Detection3DArray, '/perception/detections_3d', 10)
 
-        self.get_logger().info('perception_node started')
+        self._timer = self.create_timer(detection_period_sec, self._detect_and_publish)
 
-    def _on_color(self, msg: Image):
-        self._latest_color = self._bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+        self.get_logger().info(
+            f'perception_node started (model={model_path}, world_frame={self._world_frame})')
+
+    def _on_rgb(self, msg: Image):
+        self._latest_rgb = self._bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+        self._latest_rgb_header = msg.header
 
     def _on_depth(self, msg: Image):
         self._latest_depth = self._bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
 
+    def _on_camera_info(self, msg: CameraInfo):
+        self._camera_model = make_camera_model(msg)
+        self._camera_frame_id = msg.header.frame_id
+
     def _detect_and_publish(self):
-        if self._latest_color is None:
+        if self._latest_rgb is None or self._latest_depth is None or self._camera_model is None:
             return
 
-        for center in self._detect_studs_hough_circle(self._latest_color):
-            self._publish_stud_pose(center)
+        rgb = self._latest_rgb
+        depth = self._latest_depth
+        header = self._latest_rgb_header
 
-        grasp_point = self._detect_busbar_grasp_yolo(self._latest_color)
-        if grasp_point is not None:
-            self._publish_busbar_grasp(grasp_point)
+        array_msg = Detection3DArray()
+        array_msg.header.stamp = header.stamp
+        array_msg.header.frame_id = self._world_frame
 
-        for nut_id, center in self._detect_nuts_yolo(self._latest_color):
-            self._publish_nut_pose(nut_id, center)
+        for det in self._detector.detect(rgb, self._conf_threshold):
+            point_world = self._to_world_point(det['pixel'], depth, header.stamp)
+            if point_world is None:
+                continue
+            array_msg.detections.append(
+                self._make_detection3d(det, point_world, header.stamp))
 
-    # --- Hough Circle 기반 스터드 위치 검출 ------------------------------------
-    def _detect_studs_hough_circle(self, color_image):
-        gray = cv2.cvtColor(color_image, cv2.COLOR_BGR2GRAY)
-        gray = cv2.medianBlur(gray, 5)
-        circles = cv2.HoughCircles(
-            gray, cv2.HOUGH_GRADIENT, dp=1, minDist=20,
-            param1=100, param2=30, minRadius=5, maxRadius=30)
+        self._detections_pub.publish(array_msg)
 
-        if circles is None:
-            return []
-        return [(x, y) for x, y, _r in np.round(circles[0, :]).astype(int)]
+    def _to_world_point(self, pixel_uv, depth_image, stamp):
+        u, v = pixel_uv
+        row, col = int(round(v)), int(round(u))
+        if not (0 <= row < depth_image.shape[0] and 0 <= col < depth_image.shape[1]):
+            return None
 
-    # --- YOLO 기반 버스바 파지점 / 너트 위치 검출 --------------------------------
-    def _detect_busbar_grasp_yolo(self, color_image):
-        # TODO: 학습된 YOLO 모델로 버스바 파지점(bounding box 중심) 추론.
-        return None
+        depth_value = float(depth_image[row, col])
+        if not np.isfinite(depth_value) or depth_value <= 0.0:
+            return None
 
-    def _detect_nuts_yolo(self, color_image):
-        # TODO: 학습된 YOLO 모델로 너트 bounding box 목록 추론.
-        return []
+        cx, cy, cz = pixel_to_camera_point(self._camera_model, u, v, depth_value)
 
-    # --- 픽셀 좌표 -> 3D pose 변환 -------------------------------------------
-    def _pixel_to_pose(self, pixel_xy):
-        # TODO: depth 이미지 + 카메라 intrinsic으로 실제 3D 좌표 역투영.
-        pose = self._make_pose_stamped(0.0, 0.0, 0.0)
-        return pose
+        point_camera = PointStamped()
+        point_camera.header.stamp = stamp
+        point_camera.header.frame_id = self._camera_frame_id
+        point_camera.point.x = cx
+        point_camera.point.y = cy
+        point_camera.point.z = cz
 
-    def _make_pose_stamped(self, x, y, z):
-        from geometry_msgs.msg import PoseStamped
-        pose = PoseStamped()
-        pose.header.stamp = self.get_clock().now().to_msg()
-        pose.header.frame_id = 'camera_color_optical_frame'
-        pose.pose.position.x = x
-        pose.pose.position.y = y
-        pose.pose.position.z = z
-        pose.pose.orientation.w = 1.0
-        return pose
+        try:
+            transform = self._tf_buffer.lookup_transform(
+                self._world_frame, self._camera_frame_id, Time.from_msg(stamp),
+                timeout=Duration(seconds=0.2))
+        except TransformException as ex:
+            self.get_logger().warn(
+                f'{self._world_frame} <- {self._camera_frame_id} tf 조회 실패, 검출 skip: {ex}',
+                throttle_duration_sec=5.0)
+            return None
 
-    def _publish_stud_pose(self, pixel_xy):
-        msg = StudPose()
-        msg.id = 0
-        msg.pose = self._pixel_to_pose(pixel_xy)
-        self._stud_pub.publish(msg)
+        return do_transform_point(point_camera, transform)
 
-    def _publish_busbar_grasp(self, pixel_xy):
-        msg = BusbarGrasp()
-        msg.pose = self._pixel_to_pose(pixel_xy)
-        self._busbar_grasp_pub.publish(msg)
+    def _make_detection3d(self, det, point_world, stamp) -> Detection3D:
+        detection = Detection3D()
+        detection.header.stamp = stamp
+        detection.header.frame_id = self._world_frame
 
-    def _publish_nut_pose(self, nut_id, pixel_xy):
-        msg = NutPose()
-        msg.id = nut_id
-        msg.pose = self._pixel_to_pose(pixel_xy)
-        self._nut_pub.publish(msg)
+        hypothesis = ObjectHypothesisWithPose()
+        hypothesis.hypothesis.class_id = det['label']
+        hypothesis.hypothesis.score = det['score']
+        hypothesis.pose.pose.position = point_world.point
+        hypothesis.pose.pose.orientation.w = 1.0
+        detection.results.append(hypothesis)
+
+        detection.bbox.center.position = point_world.point
+        detection.bbox.center.orientation.w = 1.0
+        # 2D bbox 픽셀 크기를 그대로 xy 크기로 근사한 값일 뿐, 실제 3D extent가 아님.
+        w_px, h_px = det['bbox_size_px']
+        detection.bbox.size.x = float(w_px)
+        detection.bbox.size.y = float(h_px)
+        detection.bbox.size.z = 0.0
+
+        return detection
 
 
 def main(args=None):
