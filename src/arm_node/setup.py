@@ -5,14 +5,16 @@ package_name = 'arm_node'
 setup(
     name=package_name,
     version='0.0.0',
-    packages=find_packages(exclude=['test']),
+    packages=find_packages(exclude=['test']) + [package_name + '.data'],
+    package_data={package_name: ['data/*.json']},
+    include_package_data=True,
     data_files=[
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
     ],
     install_requires=['setuptools'],
-    zip_safe=True,
+    zip_safe=False,
     maintainer='soo',
     maintainer_email='poi3824@gmail.com',
     description='버스바 파지·삽입·너트 체결을 수행하는 매니퓰레이터 노드',
