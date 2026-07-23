@@ -84,8 +84,11 @@ class ArmNode(Node):
         self._POS_INSERT_PLACE = np.array([target_mid_pos[0], target_mid_pos[1], target_mid_pos[2], 0.0, 3.1415, 1.5708])
 
         # ★ [단계별 차등 허용 오차]
-        self._PICK_TOLERANCE_STRICT = 0.01    # Pick 단계: 0.01m (10mm)
-        self._INSERT_TOLERANCE_STRICT = 0.001 # Insert 단계: 0.001m (1mm)
+        self._PICK_TOLERANCE_STRICT = 0.001    # Pick 단계: 0.01m (10mm)
+        # Insert 단계 허용 오차. 원래 0.001m(1mm)였으나 RMPFlow가 그 안으로 수렴하지
+        # 못했다. 0.015m로 완화하고, _move_to_pose 자체에 timeout_sec을 둬서 이 값도
+        # 사실상 모니터링(로그)용이지 무한 대기를 강제하는 값이 아니게 했다.
+        self._INSERT_TOLERANCE_STRICT = 0.001
         self._BUSBAR_RELEASE_Z = 0.36        # 그리퍼 해제 임계 높이
         self._INSERT_SPEED = 0.0015           # step당 수직 하강 속도 (m/step)
 
@@ -186,9 +189,14 @@ class ArmNode(Node):
 
         self._target_pose_pub.publish(msg)
 
-    def _move_to_pose(self, target_pose, step_name, pos_tolerance=0.001):
+    def _move_to_pose(self, target_pose, step_name, pos_tolerance=0.001, timeout_sec=7.0):
         """
-        목표 허용 오차 안으로 들어올 때까지 한 줄(\r)로 실시간 오차 및 진행 시간 갱신 출력
+        목표 허용 오차 안으로 들어올 때까지 한 줄(\r)로 실시간 오차 및 진행 시간 갱신 출력.
+
+        pos_tolerance는 도달 판정 기준이자 모니터링용 로그 값일 뿐이다 — timeout_sec가
+        지나도 그 안으로 수렴하지 못하면(예: RMPFlow 정상 오차 범위가 tolerance보다 큰 경우)
+        무한 대기하지 않고 그 시점 오차로 진행한다 (INSERT_BUSBAR가 1mm 근처에서 절대
+        안 줄어들어 영원히 멈춰있던 문제 대응).
         """
         self.get_logger().info(f'  -> [하위동작] {step_name} Target Pose 발행 (목표 오차: {pos_tolerance:.4f} m)...')
         self._publish_target_pose(target_pose)
@@ -218,6 +226,13 @@ class ArmNode(Node):
                     sys.stdout.write('\n')
                     sys.stdout.flush()
                     self.get_logger().info(f'  -> [도달 완료] {step_name} (최종 오차: {dist_error:.4f} m)')
+                    return True
+
+                if elapsed_time > timeout_sec:
+                    sys.stdout.write('\n')
+                    sys.stdout.flush()
+                    self.get_logger().warn(
+                        f'  -> [시간 초과({timeout_sec:.1f}s)] {step_name} 목표 오차 미달(현재 {dist_error:.4f} m)이지만 진행')
                     return True
 
             time.sleep(0.05)

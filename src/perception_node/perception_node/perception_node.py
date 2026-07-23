@@ -57,8 +57,15 @@ class PerceptionNode(Node):
         self.declare_parameter('camera_info_topic', '/camera_info')
         self.declare_parameter('model_path', DEFAULT_MODEL_PATH)
         self.declare_parameter('world_frame', 'world')
-        self.declare_parameter('camera_frame_override', '')
-        self.declare_parameter('conf_threshold', 0.5)
+        # 기본값은 라이브 Isaac Sim(World0123.usd) 카메라 구성 기준: 이미지 헤더의
+        # frame_id는 sim_camera지만 tf 트리는 camera_color_optical_frame으로 발행되므로,
+        # 인자 없이 `ros2 run perception_node perception_node`만으로 동작하도록 맞춰둔다.
+        # 다른 tf 프레임을 쓰는 bag 등에서는 camera_frame_override 파라미터로 덮어쓰면 된다.
+        self.declare_parameter('camera_frame_override', 'camera_color_optical_frame')
+        # conf 상향 + iou 하향 = 사실상 비최대억제(NMS)를 더 세게 걸어 한 객체에 대해
+        # 중복/저신뢰 박스가 살아남는 걸 줄임 (ultralytics 기본값은 conf=0.25, iou=0.7).
+        self.declare_parameter('conf_threshold', 0.6)
+        self.declare_parameter('iou_threshold', 0.45)
         self.declare_parameter('detection_period_sec', 0.5)
         self.declare_parameter('publish_debug_image', True)
         self.declare_parameter('debug_image_topic', '/perception/debug_image')
@@ -71,6 +78,7 @@ class PerceptionNode(Node):
         self._world_frame = self.get_parameter('world_frame').value
         self._camera_frame_override = self.get_parameter('camera_frame_override').value
         self._conf_threshold = self.get_parameter('conf_threshold').value
+        self._iou_threshold = self.get_parameter('iou_threshold').value
         detection_period_sec = self.get_parameter('detection_period_sec').value
         publish_debug_image = self.get_parameter('publish_debug_image').value
         debug_image_topic = self.get_parameter('debug_image_topic').value
@@ -138,7 +146,7 @@ class PerceptionNode(Node):
         debug_image = rgb.copy() if self._debug_image_pub is not None else None
         best_this_tick = {}  # label -> (score, world_point), 이번 tick 안에서만 비교
 
-        for det in self._detector.detect(rgb, self._conf_threshold):
+        for det in self._detector.detect(rgb, self._conf_threshold, self._iou_threshold):
             camera_point, world_point, status = self._transform_pixel(
                 det['pixel'], depth, header.stamp)
 

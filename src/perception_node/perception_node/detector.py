@@ -32,10 +32,10 @@ class YoloSegDetector:
         self._model = YOLO(model_path)
         self.names = self._model.names
 
-    def detect(self, image: np.ndarray, conf_threshold: float) -> list[dict]:
+    def detect(self, image: np.ndarray, conf_threshold: float, iou_threshold: float = 0.7) -> list[dict]:
         """반환: [{"label", "score", "pixel": (u, v), "bbox_px": (x0,y0,x1,y1),
         "mask_xy": np.ndarray}, ...]"""
-        results = self._model(image, conf=conf_threshold, verbose=False)[0]
+        results = self._model(image, conf=conf_threshold, iou=iou_threshold, verbose=False)[0]
         detections = []
         if results.masks is None:
             return detections
@@ -67,10 +67,10 @@ class YoloPoseDetector:
         self._model = YOLO(model_path)
         self.names = self._model.names
 
-    def detect(self, image: np.ndarray, conf_threshold: float) -> list[dict]:
+    def detect(self, image: np.ndarray, conf_threshold: float, iou_threshold: float = 0.7) -> list[dict]:
         """반환: [{"label", "score", "pixel": (u, v), "bbox_px": (x0,y0,x1,y1),
         "keypoints_px": np.ndarray shape (9,2)}, ...]"""
-        results = self._model(image, conf=conf_threshold, verbose=False)[0]
+        results = self._model(image, conf=conf_threshold, iou=iou_threshold, verbose=False)[0]
         detections = []
         if results.keypoints is None:
             return detections
