@@ -8,7 +8,12 @@ from rclpy.callback_groups import ReentrantCallbackGroup
 
 from geometry_msgs.msg import PoseStamped
 from std_msgs.msg import Int32
+from vision_msgs.msg import Detection3DArray
 from fms_interfaces.srv import ArmControl
+
+# perception_node가 /perception/detections_3d (vision_msgs/Detection3DArray)에 발행하는
+# 검출 중 이 라벨의 world 좌표를 버스바 파지점으로 사용한다.
+PERCEPTION_BUSBAR_LABEL = 'busbar'
 
 
 class ArmNode(Node):
@@ -43,10 +48,21 @@ class ArmNode(Node):
             callback_group=self._cb_group
         )
 
+        # 5. Perception 검출 서브스크라이버 (perception_node -> world 좌표 검출 결과)
+        self._latest_busbar_world_xy = None
+        self._latest_busbar_stamp = None
+        self._detections_sub = self.create_subscription(
+            Detection3DArray,
+            '/perception/detections_3d',
+            self._on_detections,
+            10,
+            callback_group=self._cb_group
+        )
+        self._PERCEPTION_STALE_SEC = 5.0
+
         # ★ [좌표 및 파라미터 정의 - 01_pick_and_lift.py 동일]
-        self._POS_GRAB_PICK = np.array([0.5128, 0.4477, 0.455, 0.0, 3.1415, 1.5708])
-        self._POS_GRAB_ABOVE = self._POS_GRAB_PICK + np.array([0.0, 0.0, 0.145, 0.0, 0.0, 0.0])
-        self._BUSBAR_LIFT_MOVE_POS = self._POS_GRAB_PICK + np.array([0.0, 0.1, 0.145, 0.0, 0.0, 0.0])
+        # perception 검출이 없거나 오래됐을 때 쓰는 대체(fallback) 파지 좌표.
+        self._DEFAULT_POS_GRAB_PICK = np.array([0.5128, 0.4477, 0.455, 0.0, 3.1415, 1.5708])
 
         target_mid_pos = np.array([1.03115, -0.07855, 0.0693])
         self._POS_INSERT_ABOVE = np.array([target_mid_pos[0], target_mid_pos[1], 0.6, 0.0, 3.1415, 1.5708])
@@ -66,6 +82,38 @@ class ArmNode(Node):
 
     def _current_pose_callback(self, msg: PoseStamped):
         self._current_ee_pose = msg.pose
+
+    def _on_detections(self, msg: Detection3DArray):
+        best_score, best_position = None, None
+        for detection in msg.detections:
+            for result in detection.results:
+                if result.hypothesis.class_id != PERCEPTION_BUSBAR_LABEL:
+                    continue
+                if best_score is None or result.hypothesis.score > best_score:
+                    best_score = result.hypothesis.score
+                    best_position = detection.bbox.center.position
+
+        if best_position is None:
+            return
+
+        self._latest_busbar_world_xy = (best_position.x, best_position.y)
+        self._latest_busbar_stamp = self.get_clock().now()
+
+    def _resolve_grab_pick_pose(self) -> np.ndarray:
+        """perception 검출 기반 파지 좌표를 반환. 검출이 없거나 오래됐으면 하드코딩 좌표로 대체."""
+        if self._latest_busbar_world_xy is not None:
+            age_sec = (self.get_clock().now() - self._latest_busbar_stamp).nanoseconds / 1e9
+            if age_sec <= self._PERCEPTION_STALE_SEC:
+                pick_pose = self._DEFAULT_POS_GRAB_PICK.copy()
+                pick_pose[0], pick_pose[1] = self._latest_busbar_world_xy
+                self.get_logger().info(
+                    f'/perception/detections_3d 검출 좌표 사용 -> x={pick_pose[0]:.4f}, y={pick_pose[1]:.4f}')
+                return pick_pose
+            self.get_logger().warn(
+                f'perception 검출값이 {age_sec:.1f}s 전 데이터로 오래됨, 기본 좌표로 대체')
+        else:
+            self.get_logger().warn('perception 검출 없음, 기본 좌표로 대체')
+        return self._DEFAULT_POS_GRAB_PICK.copy()
 
     def _publish_gripper_state(self, state: int):
         self._current_gripper_state = state
@@ -190,14 +238,20 @@ class ArmNode(Node):
 
         if cmd == 'GRAB_BUSBAR':
             self._publish_gripper_state(0)
-            
+
+            # perception_node 검출(/perception/detections_3d) 기반 파지 좌표 산출.
+            # above/lift는 항상 파지점 기준 상대 오프셋이므로 매 호출마다 다시 계산한다.
+            pos_grab_pick = self._resolve_grab_pick_pose()
+            pos_grab_above = pos_grab_pick + np.array([0.0, 0.0, 0.145, 0.0, 0.0, 0.0])
+            busbar_lift_move_pos = pos_grab_pick + np.array([0.0, 0.1, 0.145, 0.0, 0.0, 0.0])
+
             # 1. 버스바 상공 접근 (Tol: 0.01m)
-            if not self._move_to_pose(self._POS_GRAB_ABOVE, '1. 버스바 상공 접근', pos_tolerance=self._PICK_TOLERANCE_STRICT):
+            if not self._move_to_pose(pos_grab_above, '1. 버스바 상공 접근', pos_tolerance=self._PICK_TOLERANCE_STRICT):
                 response.success, response.message = False, '상공 접근 실패'
                 return response
 
             # 2. 파지 위치 하강 (Tol: 0.01m)
-            if not self._move_to_pose(self._POS_GRAB_PICK, '2. 버스바 파지점 하강', pos_tolerance=self._PICK_TOLERANCE_STRICT):
+            if not self._move_to_pose(pos_grab_pick, '2. 버스바 파지점 하강', pos_tolerance=self._PICK_TOLERANCE_STRICT):
                 response.success, response.message = False, '파지점 하강 실패'
                 return response
 
@@ -205,7 +259,7 @@ class ArmNode(Node):
             self._control_gripper(close=True)
 
             # 3. 버스바 상승 이동 (Tol: 0.01m)
-            if not self._move_to_pose(self._BUSBAR_LIFT_MOVE_POS, '3. 버스바 상승 및 이동', pos_tolerance=self._PICK_TOLERANCE_STRICT):
+            if not self._move_to_pose(busbar_lift_move_pos, '3. 버스바 상승 및 이동', pos_tolerance=self._PICK_TOLERANCE_STRICT):
                 response.success, response.message = False, '상승 이동 실패'
                 return response
 

@@ -17,3 +17,16 @@ __pycache__/
 .vscode/
 .idea/
 .DS_Store
+
+# Dataset captures (large binary data, regenerate/re-extract from datasets/_archive if needed)
+datasets/segmentation/
+datasets/keypoints/
+datasets/_archive/
+
+# Generated training data / runs / eval outputs (regenerate via training/*/prepare_dataset.py, train.py)
+training/segmentation/data/
+training/segmentation/runs/
+training/keypoints/data/
+training/keypoints/runs/
+training/eval/results/
+*.pt
