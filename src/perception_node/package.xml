@@ -3,7 +3,7 @@
 <package format="3">
   <name>perception_node</name>
   <version>0.0.0</version>
-  <description>YOLO 세그멘테이션 기반 bolt/nut/busbar 검출 -> world 좌표 변환 -> 토픽 발행</description>
+  <description>YOLO keypoints 기반 bolt/nut/busbar 검출 -> world 좌표 변환 -> 토픽/서비스 발행</description>
   <maintainer email="poi3824@gmail.com">soo</maintainer>
   <license>Apache-2.0</license>
 
@@ -11,6 +11,7 @@
   <depend>sensor_msgs</depend>
   <depend>geometry_msgs</depend>
   <depend>vision_msgs</depend>
+  <depend>fms_interfaces</depend>
   <depend>cv_bridge</depend>
   <depend>image_geometry</depend>
   <depend>tf2_ros</depend>

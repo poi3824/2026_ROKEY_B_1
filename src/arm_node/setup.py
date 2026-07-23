@@ -29,7 +29,9 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'arm_node = arm_node.arm_node:main'
+            'arm_node = arm_node.arm_node:main',
+            # 스캔-정지-서비스요청 흐름 테스트용 복제본 (arm_node.py 원본 미변경).
+            'arm_node_scan_test = arm_node.arm_node_scan_test:main',
         ],
     },
 )

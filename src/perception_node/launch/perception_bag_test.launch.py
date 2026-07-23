@@ -19,6 +19,13 @@ bag에 따라 tf 유무가 다르다:
     ros2 launch perception_node perception_bag_test.launch.py \
         publish_placeholder_tf:=true camera_frame_override:=sim_camera
     ros2 bag play <bag 경로>/rosbag2_2026_07_22-12_27_13
+
+라이브 Isaac Sim(예: isaacpjt/M0609/execute_isaac.py, World0123.usd)에도 인자 없이 그대로
+쓸 수 있다 — 이 씬의 카메라도 rosbag2_busbar와 동일하게 이미지 frame_id는 sim_camera,
+tf는 camera_color_optical_frame이라 기본값이 그대로 맞는다(실측 확인됨: /rgb, /depth,
+/camera_info 토픽명도 perception_node 기본값과 일치). Isaac Sim을 띄우기 전에는
+`export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$HOME/dev_ws/isaac_sim/isaacsim/_build/linux-x86_64/release/exts/isaacsim.ros2.bridge/humble/lib`
+(alias: isaac_ros2)가 필요하다.
 """
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument

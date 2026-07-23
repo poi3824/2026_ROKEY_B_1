@@ -7,8 +7,13 @@ SUB <camera_info_topic>  (sensor_msgs/CameraInfo)
 
 PUB /perception/detections_3d  (vision_msgs/Detection3DArray, <world_frame> 기준)
 PUB <debug_image_topic>         (sensor_msgs/Image, bgr8) — rqt_image_view 등으로
-                                 마스크/bbox/좌표(픽셀, 카메라 프레임, world 프레임)를
+                                 keypoints/bbox/좌표(픽셀, 카메라 프레임, world 프레임)를
                                  확인하기 위한 디버그 오버레이. publish_debug_image로 끌 수 있음.
+SRV /perception/get_grasp_pose (fms_interfaces/GetGraspPose) — 라벨별 최신 검출(world 좌표)을
+                                 캐시에서 그대로 반환. 호출 시점에 재추론하지 않으므로, 호출
+                                 전에 타이머 주기(detection_period_sec)만큼은 대상이 카메라
+                                 시야에 안정적으로 들어와 있어야 한다. grasp_query_max_age_sec
+                                 보다 캐시가 오래됐거나 해당 라벨 검출이 없으면 found=false.
 
 카메라 프레임 -> world_frame 변환은 tf2 lookupTransform으로 조회한다. 이 노드는
 카메라가 어디에 있는지 알지 못하며, world_frame -> 카메라 frame_id로의 tf가 어디선가
@@ -26,6 +31,8 @@ import os
 import rclpy
 from ament_index_python.packages import get_package_share_directory
 from cv_bridge import CvBridge
+from fms_interfaces.srv import GetGraspPose
+from geometry_msgs.msg import PoseStamped
 from rclpy.node import Node
 from sensor_msgs.msg import CameraInfo, Image
 from tf2_ros.buffer import Buffer
@@ -34,10 +41,10 @@ from vision_msgs.msg import Detection3D, Detection3DArray, ObjectHypothesisWithP
 
 from perception_node import overlay
 from perception_node.camera_geometry import make_camera_model, transform_pixel_to_world
-from perception_node.detector import YoloSegDetector
+from perception_node.detector import YoloPoseDetector
 
 DEFAULT_MODEL_PATH = os.path.join(
-    get_package_share_directory('perception_node'), 'models', 'best.pt')
+    get_package_share_directory('perception_node'), 'models', 'keypoints_best.pt')
 
 
 class PerceptionNode(Node):
@@ -55,6 +62,7 @@ class PerceptionNode(Node):
         self.declare_parameter('detection_period_sec', 0.5)
         self.declare_parameter('publish_debug_image', True)
         self.declare_parameter('debug_image_topic', '/perception/debug_image')
+        self.declare_parameter('grasp_query_max_age_sec', 5.0)
 
         rgb_topic = self.get_parameter('rgb_topic').value
         depth_topic = self.get_parameter('depth_topic').value
@@ -66,15 +74,20 @@ class PerceptionNode(Node):
         detection_period_sec = self.get_parameter('detection_period_sec').value
         publish_debug_image = self.get_parameter('publish_debug_image').value
         debug_image_topic = self.get_parameter('debug_image_topic').value
+        self._grasp_query_max_age_sec = self.get_parameter('grasp_query_max_age_sec').value
 
         self._bridge = CvBridge()
-        self._detector = YoloSegDetector(model_path)
+        self._detector = YoloPoseDetector(model_path)
 
         self._latest_rgb = None
         self._latest_rgb_header = None
         self._latest_depth = None
         self._camera_model = None
         self._camera_frame_id = None
+
+        # 라벨별 최신 검출(world 좌표 + 시각) 캐시. /perception/get_grasp_pose 서비스가
+        # 이 캐시를 그대로 반환한다 (호출 시점에 재추론하지 않음).
+        self._latest_by_label = {}
 
         self._tf_buffer = Buffer()
         self._tf_listener = TransformListener(self._tf_buffer, self)
@@ -90,6 +103,9 @@ class PerceptionNode(Node):
         self._debug_image_pub = None
         if publish_debug_image:
             self._debug_image_pub = self.create_publisher(Image, debug_image_topic, 10)
+
+        self._grasp_pose_srv = self.create_service(
+            GetGraspPose, '/perception/get_grasp_pose', self._handle_get_grasp_pose)
 
         self._timer = self.create_timer(detection_period_sec, self._detect_and_publish)
 
@@ -120,6 +136,7 @@ class PerceptionNode(Node):
         array_msg.header.frame_id = self._world_frame
 
         debug_image = rgb.copy() if self._debug_image_pub is not None else None
+        best_this_tick = {}  # label -> (score, world_point), 이번 tick 안에서만 비교
 
         for det in self._detector.detect(rgb, self._conf_threshold):
             camera_point, world_point, status = self._transform_pixel(
@@ -131,6 +148,14 @@ class PerceptionNode(Node):
             if world_point is not None:
                 array_msg.detections.append(
                     self._make_detection3d(det, world_point, header.stamp))
+                label, score = det['label'], det['score']
+                if label not in best_this_tick or score > best_this_tick[label][0]:
+                    best_this_tick[label] = (score, world_point)
+
+        now = self.get_clock().now()
+        for label, (score, world_point) in best_this_tick.items():
+            # 라벨별 최신값 캐시를 이번 tick 결과로 갱신(덮어쓰기) — /perception/get_grasp_pose가 참조.
+            self._latest_by_label[label] = (score, world_point, now)
 
         self._detections_pub.publish(array_msg)
 
@@ -175,6 +200,32 @@ class PerceptionNode(Node):
         detection.bbox.size.z = 0.0
 
         return detection
+
+    def _handle_get_grasp_pose(self, request, response):
+        cached = self._latest_by_label.get(request.label)
+        if cached is None:
+            response.found = False
+            response.message = f"'{request.label}' 라벨 검출 캐시 없음"
+            return response
+
+        _score, world_point, stamp = cached
+        age_sec = (self.get_clock().now() - stamp).nanoseconds / 1e9
+        if age_sec > self._grasp_query_max_age_sec:
+            response.found = False
+            response.message = f"'{request.label}' 캐시가 {age_sec:.1f}s 전 데이터로 오래됨"
+            return response
+
+        wx, wy, wz = world_point
+        response.found = True
+        response.pose = PoseStamped()
+        response.pose.header.frame_id = self._world_frame
+        response.pose.header.stamp = stamp.to_msg()
+        response.pose.pose.position.x = wx
+        response.pose.pose.position.y = wy
+        response.pose.pose.position.z = wz
+        response.pose.pose.orientation.w = 1.0
+        response.message = f"'{request.label}' 검출 좌표 반환 ({age_sec:.2f}s 전)"
+        return response
 
 
 def main(args=None):
