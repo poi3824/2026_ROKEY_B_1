@@ -1,0 +1,294 @@
+#usda 1.0
+(
+    defaultPrim = "BatteryPack"
+    kilogramsPerUnit = 1
+    metersPerUnit = 1
+    timeCodesPerSecond = 60
+    upAxis = "Z"
+)
+
+def Xform "BatteryPack" (
+    kind = "assembly"
+)
+{
+    def Mesh "Housing" (
+        prepend apiSchemas = ["PhysicsCollisionAPI", "PhysicsMeshCollisionAPI", "SemanticsLabelsAPI:class"]
+    )
+    {
+        uniform bool doubleSided = 0
+        int[] faceVertexCounts = [3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3]
+        int[] faceVertexIndices = [3, 4, 0, 0, 1, 2, 2, 3, 0, 5, 9, 8, 7, 6, 5, 5, 8, 7, 0, 5, 6, 0, 6, 1, 1, 6, 7, 1, 7, 2, 2, 7, 8, 2, 8, 3, 3, 8, 9, 3, 9, 4, 4, 9, 5, 4, 5, 0]
+        uniform token orientation = "rightHanded"
+        uniform token physics:approximation = "none"
+        point3f[] points = [(-1.0975, -0.1735, -1.11758706e-10), (0.7475, -0.1735, -1.11758706e-10), (1.0975, 0, -1.11758706e-10), (0.7475, 0.1735, -1.11758706e-10), (-1.0975, 0.1735, -1.11758706e-10), (-1.0975, -0.1735, -0.01), (0.7475, -0.1735, -0.01), (1.0975, 0, -0.01), (0.7475, 0.1735, -0.01), (-1.0975, 0.1735, -0.01)]
+        color3f[] primvars:displayColor = [(0.55, 0.56, 0.58)] (
+            interpolation = "constant"
+        )
+        uniform token purpose = "default"
+        token[] semantics:labels:class = ["pack_housing"]
+        uniform token subdivisionScheme = "none"
+    }
+
+    def Scope "Modules"
+    {
+        def Xform "Module_00" (
+            instanceable = true
+            prepend references = @../components/module_vda355.usda@
+        )
+        {
+            double3 xformOp:translate = (-0.9, -0.078, 0.054)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+
+        def Xform "Module_01" (
+            instanceable = true
+            prepend references = @../components/module_vda355.usda@
+        )
+        {
+            double3 xformOp:translate = (-0.54, -0.078, 0.054)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+
+        def Xform "Module_02" (
+            instanceable = true
+            prepend references = @../components/module_vda355.usda@
+        )
+        {
+            double3 xformOp:translate = (-0.18000000000000005, -0.078, 0.054)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+
+        def Xform "Module_03" (
+            instanceable = true
+            prepend references = @../components/module_vda355.usda@
+        )
+        {
+            double3 xformOp:translate = (0.18000000000000005, -0.078, 0.054)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+
+        def Xform "Module_04" (
+            instanceable = true
+            prepend references = @../components/module_vda355.usda@
+        )
+        {
+            double3 xformOp:translate = (0.5399999999999999, -0.078, 0.054)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+
+        def Xform "Module_05" (
+            instanceable = true
+            prepend references = @../components/module_vda355.usda@
+        )
+        {
+            double3 xformOp:translate = (0.8999999999999998, -0.078, 0.054)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+
+        def Xform "Module_06" (
+            instanceable = true
+            prepend references = @../components/module_vda355.usda@
+        )
+        {
+            double3 xformOp:translate = (-0.9, 0.078, 0.054)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+
+        def Xform "Module_07" (
+            instanceable = true
+            prepend references = @../components/module_vda355.usda@
+        )
+        {
+            double3 xformOp:translate = (-0.54, 0.078, 0.054)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+
+        def Xform "Module_08" (
+            instanceable = true
+            prepend references = @../components/module_vda355.usda@
+        )
+        {
+            double3 xformOp:translate = (-0.18000000000000005, 0.078, 0.054)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+
+        def Xform "Module_09" (
+            instanceable = true
+            prepend references = @../components/module_vda355.usda@
+        )
+        {
+            double3 xformOp:translate = (0.18000000000000005, 0.078, 0.054)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+
+        def Xform "Module_10" (
+            instanceable = true
+            prepend references = @../components/module_vda355.usda@
+        )
+        {
+            double3 xformOp:translate = (0.5399999999999999, 0.078, 0.054)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+
+        def Xform "Module_11" (
+            instanceable = true
+            prepend references = @../components/module_vda355.usda@
+        )
+        {
+            double3 xformOp:translate = (0.8999999999999998, 0.078, 0.054)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+    }
+
+    def Scope "AssemblySlots"
+    {
+        def Xform "Slot_00"
+        {
+            custom string slot:busbarType = "SHORT"
+            custom int slot:sequence = 0
+            custom token slot:state = "empty"
+            custom rel slot:terminalA
+            prepend rel slot:terminalA = </BatteryPack/Modules/Module_00/Terminals/Terminal_N>
+            custom rel slot:terminalB
+            prepend rel slot:terminalB = </BatteryPack/Modules/Module_01/Terminals/Terminal_P>
+        }
+
+        def Xform "Slot_01"
+        {
+            custom string slot:busbarType = "SHORT"
+            custom int slot:sequence = 1
+            custom token slot:state = "empty"
+            custom rel slot:terminalA
+            prepend rel slot:terminalA = </BatteryPack/Modules/Module_01/Terminals/Terminal_N>
+            custom rel slot:terminalB
+            prepend rel slot:terminalB = </BatteryPack/Modules/Module_02/Terminals/Terminal_P>
+        }
+
+        def Xform "Slot_02"
+        {
+            custom string slot:busbarType = "SHORT"
+            custom int slot:sequence = 2
+            custom token slot:state = "empty"
+            custom rel slot:terminalA
+            prepend rel slot:terminalA = </BatteryPack/Modules/Module_02/Terminals/Terminal_N>
+            custom rel slot:terminalB
+            prepend rel slot:terminalB = </BatteryPack/Modules/Module_03/Terminals/Terminal_P>
+        }
+
+        def Xform "Slot_03"
+        {
+            custom string slot:busbarType = "SHORT"
+            custom int slot:sequence = 3
+            custom token slot:state = "empty"
+            custom rel slot:terminalA
+            prepend rel slot:terminalA = </BatteryPack/Modules/Module_03/Terminals/Terminal_N>
+            custom rel slot:terminalB
+            prepend rel slot:terminalB = </BatteryPack/Modules/Module_04/Terminals/Terminal_P>
+        }
+
+        def Xform "Slot_04"
+        {
+            custom string slot:busbarType = "SHORT"
+            custom int slot:sequence = 4
+            custom token slot:state = "empty"
+            custom rel slot:terminalA
+            prepend rel slot:terminalA = </BatteryPack/Modules/Module_04/Terminals/Terminal_N>
+            custom rel slot:terminalB
+            prepend rel slot:terminalB = </BatteryPack/Modules/Module_05/Terminals/Terminal_P>
+        }
+
+        def Xform "Slot_05"
+        {
+            custom string slot:busbarType = "LONG"
+            custom int slot:sequence = 5
+            custom token slot:state = "empty"
+            custom rel slot:terminalA
+            prepend rel slot:terminalA = </BatteryPack/Modules/Module_05/Terminals/Terminal_N>
+            custom rel slot:terminalB
+            prepend rel slot:terminalB = </BatteryPack/Modules/Module_11/Terminals/Terminal_N>
+        }
+
+        def Xform "Slot_06"
+        {
+            custom string slot:busbarType = "SHORT"
+            custom int slot:sequence = 6
+            custom token slot:state = "empty"
+            custom rel slot:terminalA
+            prepend rel slot:terminalA = </BatteryPack/Modules/Module_11/Terminals/Terminal_P>
+            custom rel slot:terminalB
+            prepend rel slot:terminalB = </BatteryPack/Modules/Module_10/Terminals/Terminal_N>
+        }
+
+        def Xform "Slot_07"
+        {
+            custom string slot:busbarType = "SHORT"
+            custom int slot:sequence = 7
+            custom token slot:state = "empty"
+            custom rel slot:terminalA
+            prepend rel slot:terminalA = </BatteryPack/Modules/Module_10/Terminals/Terminal_P>
+            custom rel slot:terminalB
+            prepend rel slot:terminalB = </BatteryPack/Modules/Module_09/Terminals/Terminal_N>
+        }
+
+        def Xform "Slot_08"
+        {
+            custom string slot:busbarType = "SHORT"
+            custom int slot:sequence = 8
+            custom token slot:state = "empty"
+            custom rel slot:terminalA
+            prepend rel slot:terminalA = </BatteryPack/Modules/Module_09/Terminals/Terminal_P>
+            custom rel slot:terminalB
+            prepend rel slot:terminalB = </BatteryPack/Modules/Module_08/Terminals/Terminal_N>
+        }
+
+        def Xform "Slot_09"
+        {
+            custom string slot:busbarType = "SHORT"
+            custom int slot:sequence = 9
+            custom token slot:state = "empty"
+            custom rel slot:terminalA
+            prepend rel slot:terminalA = </BatteryPack/Modules/Module_08/Terminals/Terminal_P>
+            custom rel slot:terminalB
+            prepend rel slot:terminalB = </BatteryPack/Modules/Module_07/Terminals/Terminal_N>
+        }
+
+        def Xform "Slot_10"
+        {
+            custom string slot:busbarType = "SHORT"
+            custom int slot:sequence = 10
+            custom token slot:state = "empty"
+            custom rel slot:terminalA
+            prepend rel slot:terminalA = </BatteryPack/Modules/Module_07/Terminals/Terminal_P>
+            custom rel slot:terminalB
+            prepend rel slot:terminalB = </BatteryPack/Modules/Module_06/Terminals/Terminal_N>
+        }
+    }
+
+    def Scope "Cosmetics"
+    {
+        def BasisCurves "Cable_00"
+        {
+            int[] curveVertexCounts = [8]
+            point3f[] points = [(-1.0475, -0.067041755, 0.124), (-0.7482143, -0.080444865, 0.124), (-0.44892856, -0.063656084, 0.124), (-0.14964285, -0.07010528, 0.124), (0.14964285, -0.09423291, 0.124), (0.44892856, -0.058975104, 0.124), (0.7482143, -0.067554414, 0.124), (1.0475, -0.06655743, 0.124)]
+            color3f[] primvars:displayColor = [(0.15, 0.15, 0.15)] (
+                interpolation = "constant"
+            )
+            uniform token purpose = "render"
+            uniform token type = "linear"
+            float[] widths = [0.004, 0.004, 0.004, 0.004, 0.004, 0.004, 0.004, 0.004]
+        }
+
+        def BasisCurves "Cable_01"
+        {
+            int[] curveVertexCounts = [8]
+            point3f[] points = [(-1.0475, 0.063124545, 0.124), (-0.7482143, 0.076015435, 0.124), (-0.44892856, 0.07283192, 0.124), (-0.14964285, 0.0950706, 0.124), (0.14964285, 0.08375461, 0.124), (0.44892856, 0.090910465, 0.124), (0.7482143, 0.07573657, 0.124), (1.0475, 0.06708955, 0.124)]
+            color3f[] primvars:displayColor = [(0.6, 0.6, 0.65)] (
+                interpolation = "constant"
+            )
+            uniform token purpose = "render"
+            uniform token type = "linear"
+            float[] widths = [0.004, 0.004, 0.004, 0.004, 0.004, 0.004, 0.004, 0.004]
+        }
+    }
+}
+

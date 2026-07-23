@@ -1,0 +1,427 @@
+#usda 1.0
+(
+    defaultPrim = "World"
+    kilogramsPerUnit = 1
+    metersPerUnit = 1
+    timeCodesPerSecond = 60
+    upAxis = "Z"
+)
+
+def Xform "World"
+{
+    def PhysicsScene "PhysicsScene" (
+        prepend apiSchemas = ["PhysxSceneAPI"]
+    )
+    {
+        vector3f physics:gravityDirection = (0, 0, -1)
+        float physics:gravityMagnitude = 9.81
+        custom token physxScene:broadphaseType = "GPU"
+        custom bool physxScene:enableCCD = 1
+        custom bool physxScene:enableGPUDynamics = 1
+        custom token physxScene:solverType = "TGS"
+        custom float physxScene:timeStepsPerSecond = 240
+    }
+
+    def Scope "PhysicsMaterials"
+    {
+        def Material "Copper_Steel" (
+            prepend apiSchemas = ["PhysicsMaterialAPI"]
+        )
+        {
+            float physics:dynamicFriction = 0.45
+            float physics:restitution = 0.05
+            float physics:staticFriction = 0.55
+        }
+
+        def Material "Gripper_Pad" (
+            prepend apiSchemas = ["PhysicsMaterialAPI"]
+        )
+        {
+            float physics:dynamicFriction = 1
+            float physics:restitution = 0
+            float physics:staticFriction = 1.2
+        }
+    }
+
+    def Scope "Environment"
+    {
+        def DomeLight "DomeLight"
+        {
+            float inputs:intensity = 1000
+        }
+
+        def DistantLight "KeyLight"
+        {
+            float inputs:angle = 1
+            float inputs:intensity = 3000
+            quatf xformOp:orient = (1, 0, 0, 0)
+            double3 xformOp:translate = (0, 0, 2)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient"]
+        }
+
+        def Mesh "GroundPlane" (
+            prepend apiSchemas = ["PhysicsCollisionAPI"]
+        )
+        {
+            float3[] extent = [(-5, -5, 0), (5, 5, 0)]
+            int[] faceVertexCounts = [4]
+            int[] faceVertexIndices = [0, 1, 2, 3]
+            point3f[] points = [(-5, -5, 0), (5, -5, 0), (5, 5, 0), (-5, 5, 0)]
+            color3f[] primvars:displayColor = [(0.2, 0.2, 0.22)] (
+                interpolation = "constant"
+            )
+        }
+    }
+
+    def Xform "Fixture"
+    {
+        def Xform "BatteryPack" (
+            prepend references = @../assemblies/battery_pack.usda@
+            variants = {
+                string assemblyState = "bare"
+            }
+            prepend variantSets = "assemblyState"
+        )
+        {
+            double3 xformOp:translate = (0, 0, 0)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+            variantSet "assemblyState" = {
+                "bare" {
+                    def Scope "AssembledBusbars"
+                    {
+                    }
+
+                }
+                "complete" {
+                    def Scope "AssembledBusbars"
+                    {
+                        def Xform "Busbar_00" (
+                            prepend references = @../components/busbar_short.usda@
+                        )
+                        {
+                            quatf xformOp:orient = (1, 0, 0, 0)
+                            double3 xformOp:translate = (-0.72, -0.078, 0.11599999999999999)
+                            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient"]
+                        }
+
+                        def Xform "Busbar_01" (
+                            prepend references = @../components/busbar_short.usda@
+                        )
+                        {
+                            quatf xformOp:orient = (1, 0, 0, 0)
+                            double3 xformOp:translate = (-0.36000000000000004, -0.078, 0.11599999999999999)
+                            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient"]
+                        }
+
+                        def Xform "Busbar_02" (
+                            prepend references = @../components/busbar_short.usda@
+                        )
+                        {
+                            quatf xformOp:orient = (1, 0, 0, 0)
+                            double3 xformOp:translate = (0, -0.078, 0.11599999999999999)
+                            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient"]
+                        }
+
+                        def Xform "Busbar_03" (
+                            prepend references = @../components/busbar_short.usda@
+                        )
+                        {
+                            quatf xformOp:orient = (1, 0, 0, 0)
+                            double3 xformOp:translate = (0.36, -0.078, 0.11599999999999999)
+                            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient"]
+                        }
+
+                        def Xform "Busbar_04" (
+                            prepend references = @../components/busbar_short.usda@
+                        )
+                        {
+                            quatf xformOp:orient = (1, 0, 0, 0)
+                            double3 xformOp:translate = (0.7199999999999999, -0.078, 0.11599999999999999)
+                            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient"]
+                        }
+
+                        def Xform "Busbar_05" (
+                            prepend references = @../components/busbar_long.usda@
+                        )
+                        {
+                            quatf xformOp:orient = (-0.70710677, 0, 0, 0.70710677)
+                            double3 xformOp:translate = (1.0499999999999998, 0, 0.11599999999999999)
+                            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient"]
+                        }
+
+                        def Xform "Busbar_06" (
+                            prepend references = @../components/busbar_short.usda@
+                        )
+                        {
+                            quatf xformOp:orient = (6.123234e-17, 0, 0, 1)
+                            double3 xformOp:translate = (0.7199999999999999, 0.078, 0.11599999999999999)
+                            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient"]
+                        }
+
+                        def Xform "Busbar_07" (
+                            prepend references = @../components/busbar_short.usda@
+                        )
+                        {
+                            quatf xformOp:orient = (6.123234e-17, 0, 0, 1)
+                            double3 xformOp:translate = (0.36, 0.078, 0.11599999999999999)
+                            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient"]
+                        }
+
+                        def Xform "Busbar_08" (
+                            prepend references = @../components/busbar_short.usda@
+                        )
+                        {
+                            quatf xformOp:orient = (6.123234e-17, 0, 0, 1)
+                            double3 xformOp:translate = (0, 0.078, 0.11599999999999999)
+                            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient"]
+                        }
+
+                        def Xform "Busbar_09" (
+                            prepend references = @../components/busbar_short.usda@
+                        )
+                        {
+                            quatf xformOp:orient = (6.123234e-17, 0, 0, 1)
+                            double3 xformOp:translate = (-0.36000000000000004, 0.078, 0.11599999999999999)
+                            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient"]
+                        }
+
+                        def Xform "Busbar_10" (
+                            prepend references = @../components/busbar_short.usda@
+                        )
+                        {
+                            quatf xformOp:orient = (6.123234e-17, 0, 0, 1)
+                            double3 xformOp:translate = (-0.72, 0.078, 0.11599999999999999)
+                            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient"]
+                        }
+                    }
+
+                    over "AssemblySlots"
+                    {
+                        over "Slot_00"
+                        {
+                            custom token slot:state = "fastened"
+                        }
+
+                        over "Slot_01"
+                        {
+                            custom token slot:state = "fastened"
+                        }
+
+                        over "Slot_02"
+                        {
+                            custom token slot:state = "fastened"
+                        }
+
+                        over "Slot_03"
+                        {
+                            custom token slot:state = "fastened"
+                        }
+
+                        over "Slot_04"
+                        {
+                            custom token slot:state = "fastened"
+                        }
+
+                        over "Slot_05"
+                        {
+                            custom token slot:state = "fastened"
+                        }
+
+                        over "Slot_06"
+                        {
+                            custom token slot:state = "fastened"
+                        }
+
+                        over "Slot_07"
+                        {
+                            custom token slot:state = "fastened"
+                        }
+
+                        over "Slot_08"
+                        {
+                            custom token slot:state = "fastened"
+                        }
+
+                        over "Slot_09"
+                        {
+                            custom token slot:state = "fastened"
+                        }
+
+                        over "Slot_10"
+                        {
+                            custom token slot:state = "fastened"
+                        }
+                    }
+
+                }
+                "partial" {
+                    def Scope "AssembledBusbars"
+                    {
+                        def Xform "Busbar_00" (
+                            prepend references = @../components/busbar_short.usda@
+                        )
+                        {
+                            quatf xformOp:orient = (1, 0, 0, 0)
+                            double3 xformOp:translate = (-0.72, -0.078, 0.11599999999999999)
+                            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient"]
+                        }
+
+                        def Xform "Busbar_01" (
+                            prepend references = @../components/busbar_short.usda@
+                        )
+                        {
+                            quatf xformOp:orient = (1, 0, 0, 0)
+                            double3 xformOp:translate = (-0.36000000000000004, -0.078, 0.11599999999999999)
+                            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient"]
+                        }
+
+                        def Xform "Busbar_02" (
+                            prepend references = @../components/busbar_short.usda@
+                        )
+                        {
+                            quatf xformOp:orient = (1, 0, 0, 0)
+                            double3 xformOp:translate = (0, -0.078, 0.11599999999999999)
+                            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient"]
+                        }
+
+                        def Xform "Busbar_03" (
+                            prepend references = @../components/busbar_short.usda@
+                        )
+                        {
+                            quatf xformOp:orient = (1, 0, 0, 0)
+                            double3 xformOp:translate = (0.36, -0.078, 0.11599999999999999)
+                            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient"]
+                        }
+
+                        def Xform "Busbar_04" (
+                            prepend references = @../components/busbar_short.usda@
+                        )
+                        {
+                            quatf xformOp:orient = (1, 0, 0, 0)
+                            double3 xformOp:translate = (0.7199999999999999, -0.078, 0.11599999999999999)
+                            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient"]
+                        }
+                    }
+
+                    over "AssemblySlots"
+                    {
+                        over "Slot_00"
+                        {
+                            custom token slot:state = "fastened"
+                        }
+
+                        over "Slot_01"
+                        {
+                            custom token slot:state = "fastened"
+                        }
+
+                        over "Slot_02"
+                        {
+                            custom token slot:state = "fastened"
+                        }
+
+                        over "Slot_03"
+                        {
+                            custom token slot:state = "fastened"
+                        }
+
+                        over "Slot_04"
+                        {
+                            custom token slot:state = "fastened"
+                        }
+                    }
+
+                }
+            }
+        }
+
+        def Scope "StationPlan"
+        {
+            def Xform "Station_0"
+            {
+                custom double[] station:coverX = [-1.08, -0.25]
+                custom int[] station:slots = [0, 1, 2]
+                quatf xformOp:orient = (0.70710677, 0, 0, 0.70710677)
+                double3 xformOp:translate = (-0.72, -0.85, 0)
+                uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient"]
+            }
+
+            def Xform "Station_1"
+            {
+                custom double[] station:coverX = [-0.4145, 0.4145]
+                custom int[] station:slots = [3, 4, 5, 6]
+                quatf xformOp:orient = (0.70710677, 0, 0, 0.70710677)
+                double3 xformOp:translate = (0, -0.85, 0)
+                uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient"]
+            }
+
+            def Xform "Station_2"
+            {
+                custom double[] station:coverX = [0.3055, 1.1345]
+                custom int[] station:slots = [7, 8, 9, 10]
+                quatf xformOp:orient = (0.70710677, 0, 0, 0.70710677)
+                double3 xformOp:translate = (0.72, -0.85, 0)
+                uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient"]
+            }
+        }
+    }
+
+    def Xform "AMR"
+    {
+        double3 xformOp:translate = (-0.72, -0.85, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+
+        def Xform "base_link" (
+            prepend apiSchemas = ["PhysicsRigidBodyAPI"]
+        )
+        {
+        }
+
+        def Xform "MountFrame"
+        {
+            double3 xformOp:translate = (0, 0, 0.5)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+
+            def Xform "M0609" (
+                prepend references = @../robots/Collected_m0609_camera/m0609_camera.usd@</World/m0609>
+            )
+            {
+                over "onrobot_rg2ft"
+                {
+                    over "gripper_body"
+                    {
+                        def Xform "GraspSensor"
+                        {
+                            double3 xformOp:translate = (0.02705170192752887, -0.0047499930598436935, 0.09459735435251504)
+                            uniform token[] xformOpOrder = ["xformOp:translate"]
+                        }
+                    }
+                }
+            }
+        }
+
+        def Xform "OnboardTray" (
+            prepend references = @../assemblies/busbar_tray.usda@
+        )
+        {
+            double3 xformOp:translate = (0.2, 0, 0.5)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+    }
+
+    def Scope "Sensors"
+    {
+        def Camera "PackCam"
+        {
+            float focalLength = 18
+            quatf xformOp:orient = (1, 0, 0, 0)
+            double3 xformOp:translate = (0, 0, 1.2)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient"]
+        }
+    }
+
+    def Scope "Scope_Assembled"
+    {
+    }
+}
+

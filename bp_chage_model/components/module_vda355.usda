@@ -1,0 +1,88 @@
+#usda 1.0
+(
+    defaultPrim = "Module"
+    kilogramsPerUnit = 1
+    metersPerUnit = 1
+    timeCodesPerSecond = 60
+    upAxis = "Z"
+)
+
+def Xform "Module" (
+    prepend apiSchemas = ["SemanticsLabelsAPI:class"]
+    kind = "component"
+)
+{
+    custom double module:height = 0.108
+    custom double module:length = 0.355
+    custom double module:width = 0.151
+    token[] semantics:labels:class = ["module"]
+
+    def Scope "Geom"
+    {
+        def Cube "Body"
+        {
+            uniform token purpose = "render"
+            double size = 2
+            float3 xformOp:scale = (0.1775, 0.0755, 0.054)
+            uniform token[] xformOpOrder = ["xformOp:scale"]
+        }
+    }
+
+    def Scope "Terminals"
+    {
+        def Xform "Terminal_N" (
+            prepend apiSchemas = ["SemanticsLabelsAPI:class"]
+        )
+        {
+            token[] semantics:labels:class = ["terminal_negative"]
+            double3 xformOp:translate = (0.15, 0, 0.054)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+
+            def Cylinder "Post" (
+                prepend apiSchemas = ["PhysicsCollisionAPI"]
+            )
+            {
+                uniform token axis = "Z"
+                double height = 0.008
+                uniform token purpose = "render"
+                double radius = 0.007
+                double3 xformOp:translate = (0, 0, 0.004)
+                uniform token[] xformOpOrder = ["xformOp:translate"]
+            }
+
+            def Xform "MateTarget"
+            {
+                double3 xformOp:translate = (0, 0, 0.008)
+                uniform token[] xformOpOrder = ["xformOp:translate"]
+            }
+        }
+
+        def Xform "Terminal_P" (
+            prepend apiSchemas = ["SemanticsLabelsAPI:class"]
+        )
+        {
+            token[] semantics:labels:class = ["terminal_positive"]
+            double3 xformOp:translate = (-0.15, 0, 0.054)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+
+            def Cylinder "Post" (
+                prepend apiSchemas = ["PhysicsCollisionAPI"]
+            )
+            {
+                uniform token axis = "Z"
+                double height = 0.008
+                uniform token purpose = "render"
+                double radius = 0.007
+                double3 xformOp:translate = (0, 0, 0.004)
+                uniform token[] xformOpOrder = ["xformOp:translate"]
+            }
+
+            def Xform "MateTarget"
+            {
+                double3 xformOp:translate = (0, 0, 0.008)
+                uniform token[] xformOpOrder = ["xformOp:translate"]
+            }
+        }
+    }
+}
+

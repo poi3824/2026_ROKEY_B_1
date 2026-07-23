@@ -1,0 +1,226 @@
+#usda 1.0
+(
+    defaultPrim = "BusbarTray"
+    kilogramsPerUnit = 1
+    metersPerUnit = 1
+    timeCodesPerSecond = 60
+    upAxis = "Z"
+)
+
+def Xform "BusbarTray" (
+    kind = "assembly"
+)
+{
+    def Cube "Jig" (
+        prepend apiSchemas = ["PhysicsCollisionAPI", "PhysicsMeshCollisionAPI"]
+    )
+    {
+        uniform token physics:approximation = "none"
+        double size = 2
+        float3 xformOp:scale = (0.075, 0.195, 0.005)
+        double3 xformOp:translate = (0.03, -0.15, -0.005)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+    }
+
+    def Scope "Slots"
+    {
+        def Xform "Slot_00"
+        {
+            double3 xformOp:translate = (0, 0, 0)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+
+            def Xform "Busbar_00" (
+                instanceable = true
+                prepend references = @../components/busbar_short.usda@
+            )
+            {
+                bool physics:kinematicEnabled = 1
+                custom string tray:busbarType = "SHORT"
+                custom int tray:slotIndex = 0
+                double3 xformOp:translate = (0, 0, 0.0015)
+                uniform token[] xformOpOrder = ["xformOp:translate"]
+            }
+        }
+
+        def Xform "Slot_01"
+        {
+            double3 xformOp:translate = (0.06, 0, 0)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+
+            def Xform "Busbar_01" (
+                instanceable = true
+                prepend references = @../components/busbar_short.usda@
+            )
+            {
+                bool physics:kinematicEnabled = 1
+                custom string tray:busbarType = "SHORT"
+                custom int tray:slotIndex = 1
+                double3 xformOp:translate = (0, 0, 0.0015)
+                uniform token[] xformOpOrder = ["xformOp:translate"]
+            }
+        }
+
+        def Xform "Slot_02"
+        {
+            double3 xformOp:translate = (0, -0.06, 0)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+
+            def Xform "Busbar_02" (
+                instanceable = true
+                prepend references = @../components/busbar_short.usda@
+            )
+            {
+                bool physics:kinematicEnabled = 1
+                custom string tray:busbarType = "SHORT"
+                custom int tray:slotIndex = 2
+                double3 xformOp:translate = (0, 0, 0.0015)
+                uniform token[] xformOpOrder = ["xformOp:translate"]
+            }
+        }
+
+        def Xform "Slot_03"
+        {
+            double3 xformOp:translate = (0.06, -0.06, 0)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+
+            def Xform "Busbar_03" (
+                instanceable = true
+                prepend references = @../components/busbar_short.usda@
+            )
+            {
+                bool physics:kinematicEnabled = 1
+                custom string tray:busbarType = "SHORT"
+                custom int tray:slotIndex = 3
+                double3 xformOp:translate = (0, 0, 0.0015)
+                uniform token[] xformOpOrder = ["xformOp:translate"]
+            }
+        }
+
+        def Xform "Slot_04"
+        {
+            double3 xformOp:translate = (0, -0.12, 0)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+
+            def Xform "Busbar_04" (
+                instanceable = true
+                prepend references = @../components/busbar_short.usda@
+            )
+            {
+                bool physics:kinematicEnabled = 1
+                custom string tray:busbarType = "SHORT"
+                custom int tray:slotIndex = 4
+                double3 xformOp:translate = (0, 0, 0.0015)
+                uniform token[] xformOpOrder = ["xformOp:translate"]
+            }
+        }
+
+        def Xform "Slot_05"
+        {
+            double3 xformOp:translate = (0.06, -0.12, 0)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+
+            def Xform "Busbar_05" (
+                instanceable = true
+                prepend references = @../components/busbar_long.usda@
+            )
+            {
+                bool physics:kinematicEnabled = 1
+                custom string tray:busbarType = "LONG"
+                custom int tray:slotIndex = 5
+                double3 xformOp:translate = (0, 0, 0.0015)
+                uniform token[] xformOpOrder = ["xformOp:translate"]
+            }
+        }
+
+        def Xform "Slot_06"
+        {
+            double3 xformOp:translate = (0, -0.18, 0)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+
+            def Xform "Busbar_06" (
+                instanceable = true
+                prepend references = @../components/busbar_short.usda@
+            )
+            {
+                bool physics:kinematicEnabled = 1
+                custom string tray:busbarType = "SHORT"
+                custom int tray:slotIndex = 6
+                double3 xformOp:translate = (0, 0, 0.0015)
+                uniform token[] xformOpOrder = ["xformOp:translate"]
+            }
+        }
+
+        def Xform "Slot_07"
+        {
+            double3 xformOp:translate = (0.06, -0.18, 0)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+
+            def Xform "Busbar_07" (
+                instanceable = true
+                prepend references = @../components/busbar_short.usda@
+            )
+            {
+                bool physics:kinematicEnabled = 1
+                custom string tray:busbarType = "SHORT"
+                custom int tray:slotIndex = 7
+                double3 xformOp:translate = (0, 0, 0.0015)
+                uniform token[] xformOpOrder = ["xformOp:translate"]
+            }
+        }
+
+        def Xform "Slot_08"
+        {
+            double3 xformOp:translate = (0, -0.24, 0)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+
+            def Xform "Busbar_08" (
+                instanceable = true
+                prepend references = @../components/busbar_short.usda@
+            )
+            {
+                bool physics:kinematicEnabled = 1
+                custom string tray:busbarType = "SHORT"
+                custom int tray:slotIndex = 8
+                double3 xformOp:translate = (0, 0, 0.0015)
+                uniform token[] xformOpOrder = ["xformOp:translate"]
+            }
+        }
+
+        def Xform "Slot_09"
+        {
+            double3 xformOp:translate = (0.06, -0.24, 0)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+
+            def Xform "Busbar_09" (
+                instanceable = true
+                prepend references = @../components/busbar_short.usda@
+            )
+            {
+                bool physics:kinematicEnabled = 1
+                custom string tray:busbarType = "SHORT"
+                custom int tray:slotIndex = 9
+                double3 xformOp:translate = (0, 0, 0.0015)
+                uniform token[] xformOpOrder = ["xformOp:translate"]
+            }
+        }
+
+        def Xform "Slot_10"
+        {
+            double3 xformOp:translate = (0, -0.3, 0)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+
+            def Xform "Busbar_10" (
+                instanceable = true
+                prepend references = @../components/busbar_short.usda@
+            )
+            {
+                bool physics:kinematicEnabled = 1
+                custom string tray:busbarType = "SHORT"
+                custom int tray:slotIndex = 10
+                double3 xformOp:translate = (0, 0, 0.0015)
+                uniform token[] xformOpOrder = ["xformOp:translate"]
+            }
+        }
+    }
+}
+
