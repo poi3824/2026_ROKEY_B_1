@@ -2,7 +2,8 @@
 
 GPU/Isaac Sim 없이 behavior_node + fleet_manager_node의 FSM을 검증하기 위한
 더미 실행 노드. arm_node · amr_node · perception_node가 실제로 발행할 토픽을
-대신 발행하고, 이들이 구독할 커맨드 토픽을 구독해 즉시 응답을 준다.
+대신 발행하고, arm_node가 서빙할 busbar_insert · nut_fasten 액션을 대신 서빙해
+즉시 응답을 준다.
 
 사용법
 ------
@@ -30,12 +31,12 @@ behavior_node의 MAX_RETRY(3회)와 재시도 로직이 정상 동작하는지, 
 /fleet/report 에 success=False 로 보고되는지까지 확인할 수 있다.
 """
 import rclpy
+from rclpy.action import ActionServer
 from rclpy.node import Node
 
+from fms_interfaces.action import BusbarInsert, NutFasten
 from fms_interfaces.msg import (
     AmrGoal, AmrStatus,
-    BusbarCommand, BusbarResult,
-    FastenCommand, FastenResult,
     StudPose, NutPose, BusbarGrasp,
 )
 
@@ -59,11 +60,11 @@ class DummyExecutorNode(Node):
         self._amr_status_pub = self.create_publisher(AmrStatus, '/amr/status', 10)
         self.create_subscription(AmrGoal, '/amr/goal', self._on_amr_goal, 10)
 
-        # arm_node 대신: 버스바/체결 커맨드를 받아 결과를 보고한다.
-        self._busbar_result_pub = self.create_publisher(BusbarResult, '/busbar/result', 10)
-        self._fasten_result_pub = self.create_publisher(FastenResult, '/fasten/result', 10)
-        self.create_subscription(BusbarCommand, '/busbar/command', self._on_busbar_command, 10)
-        self.create_subscription(FastenCommand, '/fasten/command', self._on_fasten_command, 10)
+        # arm_node 대신: 버스바/체결 액션을 서빙해 즉시 결과를 응답한다.
+        self._busbar_action_server = ActionServer(
+            self, BusbarInsert, 'busbar_insert', execute_callback=self._execute_busbar_insert)
+        self._fasten_action_server = ActionServer(
+            self, NutFasten, 'nut_fasten', execute_callback=self._execute_nut_fasten)
 
         self.get_logger().info(
             f'dummy_executor_node started (GPU/Isaac Sim 없이 FSM 검증용) '
@@ -95,23 +96,30 @@ class DummyExecutorNode(Node):
             f'[dummy amr] /amr/goal <- {msg.station_id} -> state={status.state}')
 
     # --- arm_node 대역 (버스바) -------------------------------------------------
-    def _on_busbar_command(self, msg: BusbarCommand):
-        result = BusbarResult()
-        result.success = msg.command not in FAIL_STAGES
-        result.message = f'{msg.command} 더미 {"성공" if result.success else "실패"}'
-        self._busbar_result_pub.publish(result)
+    def _execute_busbar_insert(self, goal_handle):
+        command = goal_handle.request.command
+        success = command not in FAIL_STAGES
+        message = f'{command} 더미 {"성공" if success else "실패"}'
+        if success:
+            goal_handle.succeed()
+        else:
+            goal_handle.abort()
         self.get_logger().info(
-            f'[dummy arm] /busbar/command <- {msg.command} -> success={result.success}')
+            f'[dummy arm] ACTION busbar_insert <- {command} -> success={success}')
+        return BusbarInsert.Result(success=success, message=message)
 
     # --- arm_node 대역 (체결) --------------------------------------------------
-    def _on_fasten_command(self, msg: FastenCommand):
-        result = FastenResult()
-        result.success = msg.command not in FAIL_STAGES
-        result.torque = 12.5
-        result.message = f'{msg.command} 더미 {"성공" if result.success else "실패"}'
-        self._fasten_result_pub.publish(result)
+    def _execute_nut_fasten(self, goal_handle):
+        command = goal_handle.request.command
+        success = command not in FAIL_STAGES
+        message = f'{command} 더미 {"성공" if success else "실패"}'
+        if success:
+            goal_handle.succeed()
+        else:
+            goal_handle.abort()
         self.get_logger().info(
-            f'[dummy arm] /fasten/command <- {msg.command} -> success={result.success}')
+            f'[dummy arm] ACTION nut_fasten <- {command} -> success={success}')
+        return NutFasten.Result(success=success, torque=12.5, message=message)
 
 
 def main(args=None):
