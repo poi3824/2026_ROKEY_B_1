@@ -11,14 +11,21 @@ SUB /vision/busbar_grasp · /vision/nut_pose · /vision/stud_pose
 버스바 파지·삽입(GRASP/INSERT)은 /arm/target_pose(PoseStamped)를 Isaac Sim의 RMPFlow에
 발행하고 /arm/current_pose(PoseStamped)로 수렴을 확인하는 실시간 Cartesian 제어로 수행한다.
 GRASP 목표 좌표는 behavior_node가 goal.target_pose로 실어 보내는 /vision/busbar_grasp
-검출값(없으면 하드코딩 fallback)을 쓰고, INSERT 목표는 아직 스터드 vision 연동 전이라
-target_mid_pos 하드코딩 좌표를 그대로 쓴다 (TODO: /vision/stud_pose 연동).
+검출값(없으면 하드코딩 fallback)을 쓴다.
+
+INSERT 목표는 상공 접근(POS_INSERT_ABOVE) 도달 후 정지를 확인하고
+perception_node의 /perception/get_bolt_pair 서비스를 동기 호출해, 버스바가 다리를
+걸치는 볼트 2개의 실측 XY 중간점으로 하드코딩된 target_mid_pos의 XY를 대체한다
+(볼트 미검출/서비스 실패 시 하드코딩 좌표로 폴백). vision_offset_x/y 파라미터는
+TCP(그리퍼 기준점)와 비전이 알려주는 목표 지점 사이의 체계적 오차를 보정하는 값으로,
+GRASP/INSERT 모두에 동일하게 적용된다 (측정 방법은 vision_offset_x/y 선언부 주석 참고).
 
 너트 체결(APPROACH/FASTEN)은 scripts/record_nut_fasten_trajectory.py로 World0123.usd에서
 미리 녹화해둔 관절 궤적(data/nut_fasten_trajectory.json)을 그대로 재생해 /arm/joint_command로
 발행한다 — 대상 nut1/peg_0 -> bolt_2 위치가 고정이라 실시간 IK 없이도 충분하기 때문.
 녹화 파일이 없으면 더미 딜레이 + 임의 토크로 대체(_execute_nut_fasten_dummy).
 """
+import collections
 import json
 import os
 import random
@@ -37,6 +44,7 @@ from std_msgs.msg import Int32
 
 from fms_interfaces.action import BusbarInsert, NutFasten
 from fms_interfaces.msg import BusbarGrasp, NutPose, StudPose
+from fms_interfaces.srv import GetBoltPair
 
 FASTEN_TORQUE_MIN_NM = 8.0
 FASTEN_TORQUE_MAX_NM = 12.0
@@ -47,11 +55,20 @@ ACTION_DELAY_SEC = 1.5
 
 # feedback.phase에 실어 보낼 단계 이름. GRAB_BUSBAR/INSERT_BUSBAR 실제 동작 단계와 1:1 대응.
 BUSBAR_GRASP_PHASES = ['BUSBAR_APPROACH', 'BUSBAR_DESCEND', 'BUSBAR_GRASP', 'BUSBAR_LIFT']
-BUSBAR_INSERT_PHASES = ['MOVE_TO_BOLT_APPROACH', 'BUSBAR_DESCEND_TO_BOLT', 'BUSBAR_RELEASE_AND_RETRACT']
+BUSBAR_INSERT_PHASES = ['MOVE_TO_BOLT_APPROACH', 'BOLT_PAIR_SCAN', 'BUSBAR_DESCEND_TO_BOLT',
+                         'BUSBAR_RELEASE_AND_RETRACT']
 
 TRAJECTORY_PATH = os.path.join(os.path.dirname(__file__), 'data', 'nut_fasten_trajectory.json')
 REPLAY_JOINT_NAMES = ['joint_1', 'joint_2', 'joint_3', 'joint_4', 'joint_5', 'joint_6',
                        'finger_joint', 'right_inner_knuckle_joint']
+
+# 정지 판정: 최근 이 개수만큼의 연속 샘플이 모두 속도 임계값 이하여야 "정지"로 본다.
+# (arm_node_scan_test.py의 검증된 패턴 이식)
+STATIONARY_MIN_SAMPLES = 3
+STATIONARY_SPEED_THRESHOLD_M_S = 0.005
+STATIONARY_WAIT_TIMEOUT_SEC = 3.0
+
+BOLT_PAIR_SERVICE_TIMEOUT_SEC = 3.0
 
 
 class ArmNode(Node):
@@ -77,10 +94,16 @@ class ArmNode(Node):
         self._target_pose_pub = self.create_publisher(PoseStamped, '/arm/target_pose', 10)
         self._gripper_pub = self.create_publisher(Int32, '/arm/gripper_command', 10)
         self._current_ee_pose = None
+        # 정지 판정(_is_stationary)용 최근 EE 위치 샘플 이력.
+        self._recent_pose_samples = collections.deque(maxlen=STATIONARY_MIN_SAMPLES)
         self._current_pose_sub = self.create_subscription(
             PoseStamped, '/arm/current_pose', self._current_pose_callback, 10,
             callback_group=self._cb_group,
         )
+
+        # perception_node에 볼트 2개 위치를 동기 요청하는 서비스 클라이언트 (INSERT 정렬용).
+        self._bolt_pair_client = self.create_client(
+            GetBoltPair, '/perception/get_bolt_pair', callback_group=self._cb_group)
 
         # 3. 너트 체결 궤적 재생 및 Isaac Sim 조인트 상태 인터페이스
         self._joint_states_sub = self.create_subscription(
@@ -102,6 +125,20 @@ class ArmNode(Node):
         self._latest_busbar_grasp = None
         self._latest_nut_pose = None
         self._latest_stud_pose = None
+
+        # TCP(그리퍼 기준점)와 비전이 알려주는 목표 지점 사이의 체계적 오차 보정값.
+        # 카메라 캘리브레이션/그리퍼 형상 등에서 오는 고정 오차라고 보고 GRASP/INSERT
+        # 공통으로 적용한다. 측정 방법: vision_offset_x/y=0으로 두고 perception_node
+        # 터미널 로그(평균 좌표)와 이미 검증된 하드코딩 기준 좌표
+        # (_DEFAULT_POS_GRAB_PICK, target_mid_pos)를 비교 -> offset = 기준좌표 - 비전평균좌표
+        # -> 이 값을 아래 파라미터로 설정 (재빌드 없이 `--ros-args -p vision_offset_x:=...`
+        # 또는 `ros2 param set`으로 조정 가능).
+        self.declare_parameter('vision_offset_x', 0.0)
+        self.declare_parameter('vision_offset_y', 0.0)
+        self._vision_offset_xy = np.array([
+            self.get_parameter('vision_offset_x').value,
+            self.get_parameter('vision_offset_y').value,
+        ])
 
         # ★ [좌표 및 파라미터 정의 - 01_pick_and_lift.py 동일]
         # vision 검출이 없을 때 쓰는 대체(fallback) 파지 좌표.
@@ -146,6 +183,80 @@ class ArmNode(Node):
 
     def _current_pose_callback(self, msg: PoseStamped):
         self._current_ee_pose = msg.pose
+        self._recent_pose_samples.append((
+            np.array([msg.pose.position.x, msg.pose.position.y, msg.pose.position.z]),
+            time.time(),
+        ))
+
+    def _is_stationary(self) -> bool:
+        """최근 STATIONARY_MIN_SAMPLES개 샘플의 연속 구간 속도가 모두 임계값 이하인지 확인.
+
+        /arm/current_pose에는 속도 필드가 없어 위치 차분으로 직접 계산한다.
+        """
+        if len(self._recent_pose_samples) < STATIONARY_MIN_SAMPLES:
+            return False
+
+        samples = list(self._recent_pose_samples)
+        for (pos_a, t_a), (pos_b, t_b) in zip(samples, samples[1:]):
+            dt = t_b - t_a
+            if dt <= 0:
+                continue
+            speed = np.linalg.norm(pos_b - pos_a) / dt
+            if speed > STATIONARY_SPEED_THRESHOLD_M_S:
+                return False
+        return True
+
+    def _wait_until_stationary(self, timeout_sec: float = STATIONARY_WAIT_TIMEOUT_SEC) -> bool:
+        self.get_logger().info('  -> 정지 판정 대기 중 (속도 <= '
+                                f'{STATIONARY_SPEED_THRESHOLD_M_S} m/s, 연속 {STATIONARY_MIN_SAMPLES}샘플)...')
+        start_time = time.time()
+        while time.time() - start_time < timeout_sec:
+            if self._is_stationary():
+                self.get_logger().info('  -> 정지 확인 완료')
+                return True
+            time.sleep(0.05)
+        self.get_logger().warn(f'  -> 정지 판정 타임아웃({timeout_sec}s), 계속 진행')
+        return False
+
+    def _request_bolt_pair(self, label: str = 'bolt'):
+        """perception_node에 볼트 2개의 world 좌표를 동기 요청. 반환: ((ax,ay), (bx,by))
+        또는 실패(서비스 없음/타임아웃/미검출) 시 None."""
+        if not self._bolt_pair_client.wait_for_service(timeout_sec=BOLT_PAIR_SERVICE_TIMEOUT_SEC):
+            self.get_logger().warn('/perception/get_bolt_pair 서비스 대기 타임아웃')
+            return None
+
+        request = GetBoltPair.Request()
+        request.label = label
+        future = self._bolt_pair_client.call_async(request)
+
+        start_time = time.time()
+        while not future.done():
+            if time.time() - start_time > BOLT_PAIR_SERVICE_TIMEOUT_SEC:
+                self.get_logger().warn('/perception/get_bolt_pair 응답 타임아웃')
+                return None
+            time.sleep(0.05)
+
+        response = future.result()
+        if response is None or not response.found:
+            message = response.message if response is not None else 'no response'
+            self.get_logger().warn(f'/perception/get_bolt_pair 검출 없음: {message}')
+            return None
+
+        a = (response.pose_a.pose.position.x, response.pose_a.pose.position.y)
+        b = (response.pose_b.pose.position.x, response.pose_b.pose.position.y)
+        self.get_logger().info(
+            f'/perception/get_bolt_pair 응답 좌표 사용 -> A=({a[0]:.4f},{a[1]:.4f}) '
+            f'B=({b[0]:.4f},{b[1]:.4f}) ({response.message})')
+        return a, b
+
+    def _apply_vision_offset(self, xy: np.ndarray) -> np.ndarray:
+        corrected = np.asarray(xy, dtype=float) + self._vision_offset_xy
+        if np.any(self._vision_offset_xy != 0.0):
+            self.get_logger().info(
+                f'vision_offset 적용 -> 원본=({xy[0]:.4f},{xy[1]:.4f}) '
+                f'보정후=({corrected[0]:.4f},{corrected[1]:.4f}) '
+                f'(offset=({self._vision_offset_xy[0]:.4f},{self._vision_offset_xy[1]:.4f}))')
+        return corrected
 
     # --- vision 토픽 콜백 ------------------------------------------------------
     def _on_busbar_grasp(self, msg: BusbarGrasp):
@@ -173,8 +284,8 @@ class ArmNode(Node):
         하드코딩 좌표로 대체."""
         if target_pose.position.x != 0.0 or target_pose.position.y != 0.0:
             pick_pose = self._DEFAULT_POS_GRAB_PICK.copy()
-            pick_pose[0] = target_pose.position.x
-            pick_pose[1] = target_pose.position.y
+            pick_pose[0], pick_pose[1] = self._apply_vision_offset(
+                np.array([target_pose.position.x, target_pose.position.y]))
             self.get_logger().info(
                 f'goal.target_pose(vision) 좌표 사용 -> x={pick_pose[0]:.4f}, y={pick_pose[1]:.4f}')
             return pick_pose
@@ -377,24 +488,54 @@ class ArmNode(Node):
 
         return True, 'GRAB_BUSBAR 시퀀스 최종 완료'
 
+    def _resolve_insert_poses(self) -> tuple:
+        """볼트 2개의 실측 XY 중간점으로 하드코딩된 target_mid_pos(XY)를 보정한
+        (pos_insert_above, pos_insert_place)를 반환. 볼트 미검출/서비스 실패 시
+        self._POS_INSERT_ABOVE/PLACE(하드코딩 fallback)를 그대로 복사해 반환 —
+        self._POS_INSERT_ABOVE/PLACE 자체는 건드리지 않는다."""
+        pos_insert_above = self._POS_INSERT_ABOVE.copy()
+        pos_insert_place = self._POS_INSERT_PLACE.copy()
+
+        bolt_pair = self._request_bolt_pair()
+        if bolt_pair is None:
+            self.get_logger().warn('볼트 쌍 미검출/서비스 실패, 하드코딩 체결 좌표로 대체')
+            return pos_insert_above, pos_insert_place
+
+        (ax, ay), (bx, by) = bolt_pair
+        mid_xy = self._apply_vision_offset(np.array([(ax + bx) / 2.0, (ay + by) / 2.0]))
+        self.get_logger().info(
+            f'볼트 쌍 실측 중간점 사용 -> x={mid_xy[0]:.4f}, y={mid_xy[1]:.4f} '
+            f'(기존 하드코딩: x={pos_insert_above[0]:.4f}, y={pos_insert_above[1]:.4f})')
+        pos_insert_above[0], pos_insert_above[1] = mid_xy
+        pos_insert_place[0], pos_insert_place[1] = mid_xy
+        return pos_insert_above, pos_insert_place
+
     def _run_busbar_insert(self, goal, goal_handle):
         phases = BUSBAR_INSERT_PHASES
 
-        # 1. 체결 위치 상공 접근
-        self._publish_busbar_feedback(goal_handle, phases[0], 1 / 3)
+        # 1. 체결 위치(하드코딩 기준) 상공 접근 — 이 지점이 볼트 트레이를 내려다보는
+        # 위치라 볼트 스캔의 관측 지점으로도 그대로 쓴다.
+        self._publish_busbar_feedback(goal_handle, phases[0], 1 / 4)
         if not self._move_to_pose(self._POS_INSERT_ABOVE, '1. 체결위치 상공 접근', pos_tolerance=self._INSERT_TOLERANCE_STRICT):
             return False, '체결 상공 접근 실패'
 
+        # 1b. 정지 대기 후 볼트 2개 위치를 실측 조회해 삽입 좌표 보정, 보정된 위치로 재접근.
+        self._publish_busbar_feedback(goal_handle, phases[1], 2 / 4)
+        self._wait_until_stationary()
+        pos_insert_above, pos_insert_place = self._resolve_insert_poses()
+        if not self._move_to_pose(pos_insert_above, '1b. 보정된 체결위치 재접근', pos_tolerance=self._INSERT_TOLERANCE_STRICT):
+            return False, '보정된 체결 상공 접근 실패'
+
         # 2. 체결 위치 점진적 하강 (step당 -0.0015m 하강 및 Z=0.36m 감지)
-        self._publish_busbar_feedback(goal_handle, phases[1], 2 / 3)
-        if not self._descend_step_by_step(self._POS_INSERT_ABOVE, self._POS_INSERT_PLACE, '2. 체결 위치 점진적 하강 및 삽입'):
+        self._publish_busbar_feedback(goal_handle, phases[2], 3 / 4)
+        if not self._descend_step_by_step(pos_insert_above, pos_insert_place, '2. 체결 위치 점진적 하강 및 삽입'):
             return False, '체결 위치 하강 실패'
 
         # 그리퍼 열기 (0) + 상공 이탈
         self._control_gripper(close=False)
-        if not self._move_to_pose(self._POS_INSERT_ABOVE, '3. 상공 이탈', pos_tolerance=self._INSERT_TOLERANCE_STRICT):
+        if not self._move_to_pose(pos_insert_above, '3. 상공 이탈', pos_tolerance=self._INSERT_TOLERANCE_STRICT):
             return False, '상공 이탈 실패'
-        self._publish_busbar_feedback(goal_handle, phases[2], 3 / 3)
+        self._publish_busbar_feedback(goal_handle, phases[3], 4 / 4)
 
         return True, 'INSERT_BUSBAR 시퀀스 최종 완료'
 

@@ -1,0 +1,8 @@
+# Request
+string label          # 'bolt'
+---
+# Response
+bool found             # 볼트 2개가 모두 검출/신선할 때만 true
+geometry_msgs/PoseStamped pose_a
+geometry_msgs/PoseStamped pose_b
+string message
