@@ -1,0 +1,16 @@
+# behavior_node -> arm_node : 너트 파지 · 착좌 · Kinematic 체결 (10_busbar_assembly.py NUT2_* phase 기반)
+# ACTION /nut_fasten
+
+# Goal
+string command         # APPROACH | FASTEN
+string nut_id
+---
+# Result
+bool success
+float64 torque
+string message
+---
+# Feedback
+string phase
+float32 progress
+geometry_msgs/Pose vision_target_pose

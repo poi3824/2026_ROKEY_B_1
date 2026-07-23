@@ -1,17 +1,15 @@
 <?xml version="1.0"?>
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
-  <name>arm_node</name>
+  <name>amr_node</name>
   <version>0.0.0</version>
-  <description>버스바 파지·삽입·너트 체결을 수행하는 매니퓰레이터 노드</description>
+  <description>목표 스테이션으로 이동 · 상태 보고 노드</description>
   <maintainer email="poi3824@gmail.com">soo</maintainer>
   <license>Apache-2.0</license>
 
   <depend>rclpy</depend>
   <depend>fms_interfaces</depend>
-  <depend>sensor_msgs</depend>
   <depend>geometry_msgs</depend>
-  <depend>std_msgs</depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

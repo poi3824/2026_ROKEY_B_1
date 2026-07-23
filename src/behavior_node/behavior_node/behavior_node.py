@@ -1,12 +1,53 @@
-#!/usr/bin/env python3
+"""behavior_node
+지휘 계층 · job 하나를 받아 한 스테이션의 조립을 끝까지 지휘.
+
+SUB /fleet/job                                         (fms_interfaces/FleetJob)
+PUB /fleet/report                                       (fms_interfaces/FleetReport)
+
+PUB /amr/goal            SUB /amr/status                (이동)
+ACTION /busbar_insert                                    (버스바 파지·삽입, GRASP -> INSERT)
+ACTION /nut_fasten                                       (너트 체결, APPROACH -> FASTEN)
+SUB /vision/stud_pose · /vision/busbar_grasp · /vision/nut_pose
 """
-behavior_node.py (수정본)
-- 타이머 취소(cancel) 처리 추가
-"""
+from enum import Enum, auto
 
 import rclpy
+from rclpy.action import ActionClient
 from rclpy.node import Node
-from fms_interfaces.srv import ArmControl
+
+from fms_interfaces.action import BusbarInsert, NutFasten
+from fms_interfaces.msg import (
+    FleetJob, FleetReport,
+    AmrGoal, AmrStatus,
+    StudPose, BusbarGrasp, NutPose,
+)
+
+# 스테이션 좌표 (Isaac Sim 월드 기준). TODO: 실제 스테이션 배치로 교체.
+STATION_POSES = {
+    'station_1': (1.0, 0.0, 0.0),
+    'station_2': (2.0, 0.0, 0.0),
+    'station_3': (3.0, 0.0, 0.0),
+}
+
+MAX_RETRY = 3
+
+# perception_node가 아직 없어 vision 토픽이 발행되지 않는 동안은 WAIT_*_VISION에서
+# 무한 대기하지 않도록 건너뛴다. arm_node 쪽 좌표가 이미 하드코딩돼 있어 target_pose
+# 없이도 GRASP/FASTEN 커맨드는 그대로 보낼 수 있다. perception_node 붙으면 True로.
+VISION_ENABLED = False
+
+
+class State(Enum):
+    IDLE = auto()
+    MOVE_TO_STATION = auto()
+    WAIT_BUSBAR_VISION = auto()
+    GRASP_BUSBAR = auto()
+    INSERT_BUSBAR = auto()
+    WAIT_NUT_VISION = auto()
+    FASTEN_APPROACH = auto()
+    FASTEN = auto()
+    RECOVER = auto()
+    REPORT = auto()
 
 
 class BehaviorNode(Node):
@@ -14,55 +55,223 @@ class BehaviorNode(Node):
     def __init__(self):
         super().__init__('behavior_node')
 
-        self._arm_client = self.create_client(ArmControl, '/arm/control')
+        # FMS 인터페이스
+        self._job_sub = self.create_subscription(FleetJob, '/fleet/job', self._on_job, 10)
+        self._report_pub = self.create_publisher(FleetReport, '/fleet/report', 10)
 
-        self._job_sequence = [
-            'GRAB_BUSBAR',
-            'INSERT_BUSBAR',
-        ]
-        self._current_step_idx = 0
+        # amr_node 인터페이스
+        self._amr_goal_pub = self.create_publisher(AmrGoal, '/amr/goal', 10)
+        self._amr_status_sub = self.create_subscription(
+            AmrStatus, '/amr/status', self._on_amr_status, 10)
 
-        self.get_logger().info('behavior_node 시작')
+        # arm_node 인터페이스 (ROS2 Action - goal 실행 중 feedback으로 vision 보정값 수신)
+        self._busbar_action_client = ActionClient(self, BusbarInsert, 'busbar_insert')
+        self._fasten_action_client = ActionClient(self, NutFasten, 'nut_fasten')
 
-        # 1회성 실행을 위한 타이머 저장
-        self._timer = self.create_timer(1.0, self._start_sequence_once)
+        # perception_node 인터페이스
+        self._stud_pose_sub = self.create_subscription(
+            StudPose, '/vision/stud_pose', self._on_stud_pose, 10)
+        self._busbar_grasp_sub = self.create_subscription(
+            BusbarGrasp, '/vision/busbar_grasp', self._on_busbar_grasp, 10)
+        self._nut_pose_sub = self.create_subscription(
+            NutPose, '/vision/nut_pose', self._on_nut_pose, 10)
 
-    def _start_sequence_once(self):
-        # 타이머 중복 실행 방지를 위한 cancel
-        self._timer.cancel()
-        self._send_next_command()
+        self._state = State.IDLE
+        self._job = None
+        self._retry_count = 0
+        self._recover_target_state = None
+        self._latest_busbar_grasp = None
+        self._latest_stud_pose = None
+        self._latest_nut_pose = None
 
-    def _send_next_command(self):
-        if self._current_step_idx >= len(self._job_sequence):
-            self.get_logger().info('🎉 모든 버스바 및 너트 체결 공정이 성공적으로 완료되었습니다!')
+        self._timer = self.create_timer(0.5, self._step)
+
+        self.get_logger().info('behavior_node started')
+
+    # --- job 해석 ---------------------------------------------------------
+    def _on_job(self, msg: FleetJob):
+        if self._state != State.IDLE:
+            self.get_logger().warn(
+                f'job {msg.job_id} 수신했지만 이미 {self._job.job_id if self._job else "?"} 처리 중, 무시')
             return
 
-        cmd = self._job_sequence[self._current_step_idx]
+        self.get_logger().info(
+            f'SUB /fleet/job <- {msg.job_id} ({msg.station_id}, {msg.job_type})')
+        self._job = msg
+        self._retry_count = 0
+        self._latest_busbar_grasp = None
+        self._latest_stud_pose = None
+        self._latest_nut_pose = None
+        self._set_state(State.MOVE_TO_STATION)
 
-        if not self._arm_client.wait_for_service(timeout_sec=2.0):
-            self.get_logger().warn('/arm/control 서비스 대기 중...')
-            # 재시도용 1초 뒤 호출
-            self._timer = self.create_timer(1.0, self._start_sequence_once)
+    # --- 조립 FSM 상태 전이 -------------------------------------------------
+    def _set_state(self, new_state: State):
+        self.get_logger().info(f'[FSM] {self._state.name} -> {new_state.name}')
+        self._state = new_state
+
+    def _step(self):
+        if self._job is None:
             return
 
-        req = ArmControl.Request()
-        req.command = cmd
-        self.get_logger().info(f'[{self._current_step_idx + 1}/{len(self._job_sequence)}] 서비스 요청 전달 -> {cmd}')
+        if self._state == State.MOVE_TO_STATION:
+            self._enter_move_to_station()
+        elif self._state == State.WAIT_BUSBAR_VISION:
+            if self._latest_busbar_grasp is not None:
+                self._set_state(State.GRASP_BUSBAR)
+                self._send_busbar_goal('GRASP')
+        elif self._state == State.WAIT_NUT_VISION:
+            if self._latest_stud_pose is not None and self._latest_nut_pose is not None:
+                self._set_state(State.FASTEN_APPROACH)
+                self._send_fasten_goal('APPROACH')
+        elif self._state == State.REPORT:
+            self._send_report(success=True, message='조립 완료')
+            self._set_state(State.IDLE)
+            self._job = None
 
-        future = self._arm_client.call_async(req)
-        future.add_done_callback(self._on_arm_response)
+    # --- 이동 -------------------------------------------------------------
+    def _enter_move_to_station(self):
+        if getattr(self, '_move_goal_sent', False):
+            return
+        x, y, theta = STATION_POSES.get(self._job.station_id, (0.0, 0.0, 0.0))
+        goal = AmrGoal()
+        goal.station_id = self._job.station_id
+        goal.x, goal.y, goal.theta = x, y, theta
+        self._amr_goal_pub.publish(goal)
+        self._move_goal_sent = True
+        self.get_logger().info(f'PUB /amr/goal -> {goal.station_id}')
 
-    def _on_arm_response(self, future):
-        try:
-            res = future.result()
-            if res.success:
-                self.get_logger().info(f'작업 성공 응답 수신: {res.message}')
-                self._current_step_idx += 1
-                self._send_next_command()
+    def _on_amr_status(self, msg: AmrStatus):
+        if self._state != State.MOVE_TO_STATION:
+            return
+        if msg.state == AmrStatus.STATE_ARRIVED:
+            self._move_goal_sent = False
+            if VISION_ENABLED:
+                self._set_state(State.WAIT_BUSBAR_VISION)
             else:
-                self.get_logger().error(f'작업 실패 응답 수신: {res.message}. 시퀀스를 중단합니다.')
-        except Exception as e:
-            self.get_logger().error(f'서비스 통신 예외 발생: {e}')
+                self._set_state(State.GRASP_BUSBAR)
+                self._send_busbar_goal('GRASP')
+        elif msg.state == AmrStatus.STATE_ERROR:
+            self._move_goal_sent = False
+            self._enter_recover(State.MOVE_TO_STATION, msg.message)
+
+    # --- 버스바 파지 · 삽입 --------------------------------------------------
+    def _on_busbar_grasp(self, msg: BusbarGrasp):
+        self._latest_busbar_grasp = msg
+
+    def _send_busbar_goal(self, command: str):
+        goal = BusbarInsert.Goal()
+        goal.command = command
+        goal.station_id = self._job.station_id
+        if self._latest_busbar_grasp is not None:
+            goal.target_pose = self._latest_busbar_grasp.pose.pose
+        self.get_logger().info(f'ACTION /busbar_insert 요청 -> {command}')
+        send_future = self._busbar_action_client.send_goal_async(
+            goal, feedback_callback=self._on_busbar_feedback)
+        send_future.add_done_callback(self._on_busbar_goal_response)
+
+    def _on_busbar_feedback(self, feedback_msg):
+        fb = feedback_msg.feedback
+        self.get_logger().info(f'[busbar_insert] phase={fb.phase} progress={fb.progress:.2f}')
+
+    def _on_busbar_goal_response(self, future):
+        goal_handle = future.result()
+        if not goal_handle.accepted:
+            self._enter_recover(self._state, 'busbar_insert goal이 거부됨')
+            return
+        result_future = goal_handle.get_result_async()
+        result_future.add_done_callback(self._on_busbar_result)
+
+    def _on_busbar_result(self, future):
+        result = future.result().result
+        if not result.success:
+            self._enter_recover(self._state, result.message)
+            return
+
+        if self._state == State.GRASP_BUSBAR:
+            self._set_state(State.INSERT_BUSBAR)
+            self._send_busbar_goal('INSERT')
+        elif self._state == State.INSERT_BUSBAR:
+            if VISION_ENABLED:
+                self._set_state(State.WAIT_NUT_VISION)
+            else:
+                self._set_state(State.FASTEN_APPROACH)
+                self._send_fasten_goal('APPROACH')
+
+    # --- 너트 체결 시퀀스 ----------------------------------------------------
+    def _on_stud_pose(self, msg: StudPose):
+        self._latest_stud_pose = msg
+
+    def _on_nut_pose(self, msg: NutPose):
+        self._latest_nut_pose = msg
+
+    def _send_fasten_goal(self, command: str):
+        goal = NutFasten.Goal()
+        goal.command = command
+        goal.nut_id = str(self._latest_nut_pose.id) if self._latest_nut_pose else ''
+        self.get_logger().info(f'ACTION /nut_fasten 요청 -> {command}')
+        send_future = self._fasten_action_client.send_goal_async(
+            goal, feedback_callback=self._on_fasten_feedback)
+        send_future.add_done_callback(self._on_fasten_goal_response)
+
+    def _on_fasten_feedback(self, feedback_msg):
+        fb = feedback_msg.feedback
+        self.get_logger().info(f'[nut_fasten] phase={fb.phase} progress={fb.progress:.2f}')
+
+    def _on_fasten_goal_response(self, future):
+        goal_handle = future.result()
+        if not goal_handle.accepted:
+            self._enter_recover(self._state, 'nut_fasten goal이 거부됨')
+            return
+        result_future = goal_handle.get_result_async()
+        result_future.add_done_callback(self._on_fasten_result)
+
+    def _on_fasten_result(self, future):
+        result = future.result().result
+        if not result.success:
+            self._enter_recover(self._state, result.message)
+            return
+
+        if self._state == State.FASTEN_APPROACH:
+            self._set_state(State.FASTEN)
+            self._send_fasten_goal('FASTEN')
+        elif self._state == State.FASTEN:
+            self.get_logger().info(f'체결 토크 확인 완료: {result.torque:.2f} Nm')
+            self._set_state(State.REPORT)
+
+    # --- 복구 로직 ----------------------------------------------------------
+    def _enter_recover(self, failed_state: State, reason: str):
+        self._retry_count += 1
+        self.get_logger().warn(
+            f'{failed_state.name} 실패 ({reason}), 재시도 {self._retry_count}/{MAX_RETRY}')
+
+        if self._retry_count > MAX_RETRY:
+            self._send_report(success=False, message=f'{failed_state.name} 재시도 초과: {reason}')
+            self._set_state(State.IDLE)
+            self._job = None
+            return
+
+        self._recover_target_state = failed_state
+        self._set_state(State.RECOVER)
+        # TODO: 실제 후퇴(retreat) 동작은 arm_node/amr_node에 별도 커맨드로 위임해야 함.
+        # 지금은 동일 단계를 즉시 재시도한다.
+        self._set_state(self._recover_target_state)
+        if failed_state == State.MOVE_TO_STATION:
+            self._enter_move_to_station()
+        elif failed_state in (State.GRASP_BUSBAR, State.INSERT_BUSBAR):
+            self._send_busbar_goal('GRASP' if failed_state == State.GRASP_BUSBAR else 'INSERT')
+        elif failed_state in (State.FASTEN_APPROACH, State.FASTEN):
+            self._send_fasten_goal('APPROACH' if failed_state == State.FASTEN_APPROACH else 'FASTEN')
+
+    # --- FMS 보고 -----------------------------------------------------------
+    def _send_report(self, success: bool, message: str):
+        report = FleetReport()
+        report.job_id = self._job.job_id
+        report.station_id = self._job.station_id
+        report.success = success
+        report.message = message
+        report.stamp = self.get_clock().now().to_msg()
+        self._report_pub.publish(report)
+        self.get_logger().info(f'PUB /fleet/report -> {report.job_id} success={success}')
 
 
 def main(args=None):

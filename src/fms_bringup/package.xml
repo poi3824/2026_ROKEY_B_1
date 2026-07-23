@@ -1,17 +1,20 @@
 <?xml version="1.0"?>
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
-  <name>arm_node</name>
+  <name>fms_bringup</name>
   <version>0.0.0</version>
-  <description>버스바 파지·삽입·너트 체결을 수행하는 매니퓰레이터 노드</description>
+  <description>FMS 연동 ROS2 시스템 아키텍처 전체 노드 launch 패키지</description>
   <maintainer email="poi3824@gmail.com">soo</maintainer>
   <license>Apache-2.0</license>
 
   <depend>rclpy</depend>
-  <depend>fms_interfaces</depend>
-  <depend>sensor_msgs</depend>
-  <depend>geometry_msgs</depend>
-  <depend>std_msgs</depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>fleet_manager_node</exec_depend>
+  <exec_depend>behavior_node</exec_depend>
+  <exec_depend>amr_node</exec_depend>
+  <exec_depend>arm_node</exec_depend>
+  <exec_depend>perception_node</exec_depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>
