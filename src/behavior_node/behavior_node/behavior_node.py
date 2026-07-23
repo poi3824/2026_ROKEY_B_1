@@ -5,20 +5,20 @@ SUB /fleet/job                                         (fms_interfaces/FleetJob)
 PUB /fleet/report                                       (fms_interfaces/FleetReport)
 
 PUB /amr/goal            SUB /amr/status                (이동)
-PUB /busbar/command · /busbar/target                     (버스바 파지·삽입)
-PUB /fasten/command       SUB /busbar/result · /fasten/result
+ACTION /busbar_insert                                    (버스바 파지·삽입, GRASP -> INSERT)
+ACTION /nut_fasten                                       (너트 체결, APPROACH -> FASTEN)
 SUB /vision/stud_pose · /vision/busbar_grasp · /vision/nut_pose
 """
 from enum import Enum, auto
 
 import rclpy
+from rclpy.action import ActionClient
 from rclpy.node import Node
 
+from fms_interfaces.action import BusbarInsert, NutFasten
 from fms_interfaces.msg import (
     FleetJob, FleetReport,
     AmrGoal, AmrStatus,
-    BusbarCommand, BusbarTarget, BusbarResult,
-    FastenCommand, FastenResult,
     StudPose, BusbarGrasp, NutPose,
 )
 
@@ -30,6 +30,11 @@ STATION_POSES = {
 }
 
 MAX_RETRY = 3
+
+# perception_node가 아직 없어 vision 토픽이 발행되지 않는 동안은 WAIT_*_VISION에서
+# 무한 대기하지 않도록 건너뛴다. arm_node 쪽 좌표가 이미 하드코딩돼 있어 target_pose
+# 없이도 GRASP/FASTEN 커맨드는 그대로 보낼 수 있다. perception_node 붙으면 True로.
+VISION_ENABLED = False
 
 
 class State(Enum):
@@ -59,14 +64,9 @@ class BehaviorNode(Node):
         self._amr_status_sub = self.create_subscription(
             AmrStatus, '/amr/status', self._on_amr_status, 10)
 
-        # arm_node 인터페이스
-        self._busbar_cmd_pub = self.create_publisher(BusbarCommand, '/busbar/command', 10)
-        self._busbar_target_pub = self.create_publisher(BusbarTarget, '/busbar/target', 10)
-        self._fasten_cmd_pub = self.create_publisher(FastenCommand, '/fasten/command', 10)
-        self._busbar_result_sub = self.create_subscription(
-            BusbarResult, '/busbar/result', self._on_busbar_result, 10)
-        self._fasten_result_sub = self.create_subscription(
-            FastenResult, '/fasten/result', self._on_fasten_result, 10)
+        # arm_node 인터페이스 (ROS2 Action - goal 실행 중 feedback으로 vision 보정값 수신)
+        self._busbar_action_client = ActionClient(self, BusbarInsert, 'busbar_insert')
+        self._fasten_action_client = ActionClient(self, NutFasten, 'nut_fasten')
 
         # perception_node 인터페이스
         self._stud_pose_sub = self.create_subscription(
@@ -118,11 +118,11 @@ class BehaviorNode(Node):
         elif self._state == State.WAIT_BUSBAR_VISION:
             if self._latest_busbar_grasp is not None:
                 self._set_state(State.GRASP_BUSBAR)
-                self._send_busbar_command('GRASP')
+                self._send_busbar_goal('GRASP')
         elif self._state == State.WAIT_NUT_VISION:
             if self._latest_stud_pose is not None and self._latest_nut_pose is not None:
                 self._set_state(State.FASTEN_APPROACH)
-                self._send_fasten_command('APPROACH')
+                self._send_fasten_goal('APPROACH')
         elif self._state == State.REPORT:
             self._send_report(success=True, message='조립 완료')
             self._set_state(State.IDLE)
@@ -145,37 +145,57 @@ class BehaviorNode(Node):
             return
         if msg.state == AmrStatus.STATE_ARRIVED:
             self._move_goal_sent = False
-            self._set_state(State.WAIT_BUSBAR_VISION)
+            if VISION_ENABLED:
+                self._set_state(State.WAIT_BUSBAR_VISION)
+            else:
+                self._set_state(State.GRASP_BUSBAR)
+                self._send_busbar_goal('GRASP')
         elif msg.state == AmrStatus.STATE_ERROR:
             self._move_goal_sent = False
             self._enter_recover(State.MOVE_TO_STATION, msg.message)
 
     # --- 버스바 파지 · 삽입 --------------------------------------------------
-    def _send_busbar_command(self, command: str):
-        cmd = BusbarCommand()
-        cmd.command = command
-        cmd.station_id = self._job.station_id
-        self._busbar_cmd_pub.publish(cmd)
-
-        target = BusbarTarget()
-        target.station_id = self._job.station_id
-        target.target_pose = self._latest_busbar_grasp.pose.pose
-        self._busbar_target_pub.publish(target)
-        self.get_logger().info(f'PUB /busbar/command -> {command}')
-
     def _on_busbar_grasp(self, msg: BusbarGrasp):
         self._latest_busbar_grasp = msg
 
-    def _on_busbar_result(self, msg: BusbarResult):
-        if not msg.success:
-            self._enter_recover(self._state, msg.message)
+    def _send_busbar_goal(self, command: str):
+        goal = BusbarInsert.Goal()
+        goal.command = command
+        goal.station_id = self._job.station_id
+        if self._latest_busbar_grasp is not None:
+            goal.target_pose = self._latest_busbar_grasp.pose.pose
+        self.get_logger().info(f'ACTION /busbar_insert 요청 -> {command}')
+        send_future = self._busbar_action_client.send_goal_async(
+            goal, feedback_callback=self._on_busbar_feedback)
+        send_future.add_done_callback(self._on_busbar_goal_response)
+
+    def _on_busbar_feedback(self, feedback_msg):
+        fb = feedback_msg.feedback
+        self.get_logger().info(f'[busbar_insert] phase={fb.phase} progress={fb.progress:.2f}')
+
+    def _on_busbar_goal_response(self, future):
+        goal_handle = future.result()
+        if not goal_handle.accepted:
+            self._enter_recover(self._state, 'busbar_insert goal이 거부됨')
+            return
+        result_future = goal_handle.get_result_async()
+        result_future.add_done_callback(self._on_busbar_result)
+
+    def _on_busbar_result(self, future):
+        result = future.result().result
+        if not result.success:
+            self._enter_recover(self._state, result.message)
             return
 
         if self._state == State.GRASP_BUSBAR:
             self._set_state(State.INSERT_BUSBAR)
-            self._send_busbar_command('INSERT')
+            self._send_busbar_goal('INSERT')
         elif self._state == State.INSERT_BUSBAR:
-            self._set_state(State.WAIT_NUT_VISION)
+            if VISION_ENABLED:
+                self._set_state(State.WAIT_NUT_VISION)
+            else:
+                self._set_state(State.FASTEN_APPROACH)
+                self._send_fasten_goal('APPROACH')
 
     # --- 너트 체결 시퀀스 ----------------------------------------------------
     def _on_stud_pose(self, msg: StudPose):
@@ -184,23 +204,38 @@ class BehaviorNode(Node):
     def _on_nut_pose(self, msg: NutPose):
         self._latest_nut_pose = msg
 
-    def _send_fasten_command(self, command: str):
-        cmd = FastenCommand()
-        cmd.command = command
-        cmd.nut_id = str(self._latest_nut_pose.id) if self._latest_nut_pose else ''
-        self._fasten_cmd_pub.publish(cmd)
-        self.get_logger().info(f'PUB /fasten/command -> {command}')
+    def _send_fasten_goal(self, command: str):
+        goal = NutFasten.Goal()
+        goal.command = command
+        goal.nut_id = str(self._latest_nut_pose.id) if self._latest_nut_pose else ''
+        self.get_logger().info(f'ACTION /nut_fasten 요청 -> {command}')
+        send_future = self._fasten_action_client.send_goal_async(
+            goal, feedback_callback=self._on_fasten_feedback)
+        send_future.add_done_callback(self._on_fasten_goal_response)
 
-    def _on_fasten_result(self, msg: FastenResult):
-        if not msg.success:
-            self._enter_recover(self._state, msg.message)
+    def _on_fasten_feedback(self, feedback_msg):
+        fb = feedback_msg.feedback
+        self.get_logger().info(f'[nut_fasten] phase={fb.phase} progress={fb.progress:.2f}')
+
+    def _on_fasten_goal_response(self, future):
+        goal_handle = future.result()
+        if not goal_handle.accepted:
+            self._enter_recover(self._state, 'nut_fasten goal이 거부됨')
+            return
+        result_future = goal_handle.get_result_async()
+        result_future.add_done_callback(self._on_fasten_result)
+
+    def _on_fasten_result(self, future):
+        result = future.result().result
+        if not result.success:
+            self._enter_recover(self._state, result.message)
             return
 
         if self._state == State.FASTEN_APPROACH:
             self._set_state(State.FASTEN)
-            self._send_fasten_command('FASTEN')
+            self._send_fasten_goal('FASTEN')
         elif self._state == State.FASTEN:
-            self.get_logger().info(f'체결 토크 확인 완료: {msg.torque:.2f} Nm')
+            self.get_logger().info(f'체결 토크 확인 완료: {result.torque:.2f} Nm')
             self._set_state(State.REPORT)
 
     # --- 복구 로직 ----------------------------------------------------------
@@ -223,9 +258,9 @@ class BehaviorNode(Node):
         if failed_state == State.MOVE_TO_STATION:
             self._enter_move_to_station()
         elif failed_state in (State.GRASP_BUSBAR, State.INSERT_BUSBAR):
-            self._send_busbar_command('GRASP' if failed_state == State.GRASP_BUSBAR else 'INSERT')
+            self._send_busbar_goal('GRASP' if failed_state == State.GRASP_BUSBAR else 'INSERT')
         elif failed_state in (State.FASTEN_APPROACH, State.FASTEN):
-            self._send_fasten_command('APPROACH' if failed_state == State.FASTEN_APPROACH else 'FASTEN')
+            self._send_fasten_goal('APPROACH' if failed_state == State.FASTEN_APPROACH else 'FASTEN')
 
     # --- FMS 보고 -----------------------------------------------------------
     def _send_report(self, success: bool, message: str):

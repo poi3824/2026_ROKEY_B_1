@@ -40,6 +40,14 @@ Isaac Sim --/amr/sim_pose--> amr_node <--/amr/cmd_vel--> Isaac Sim
 Isaac Sim 씬 에셋은 이 저장소에 포함하지 않는다. 위 시뮬 인터페이스 토픽들을
 Isaac Sim 쪽에서 퍼블리시/서브스크라이브하도록 연동하면 된다.
 
+`/joint_states`, `/arm/joint_command`는 World0123.usd의 `/World/ActionGraph`에
+OmniGraph 노드(`ROS2SubscribeJointState` → `IsaacArticulationController`,
+`ROS2PublishJointState`)로 이미 연동돼 있다 (`scripts/setup_ros2_arm_bridge.py`로
+1회 생성, 대상은 실제 PhysX 아티큘레이션 루트인 `/World/Nova_Carter/chassis_link`).
+카메라(`/camera/color`, `/camera/depth`)와 TF도 `/World/Graph/camera_graph`,
+`/World/ActionGraph`에 동일한 방식으로 이미 연동돼 있다. `/amr/sim_pose`,
+`/amr/cmd_vel`(AMR 구동)만 아직 연동 안 됨 — TODO 참고.
+
 ### 빌드 및 실행
 
 ```bash
@@ -49,6 +57,22 @@ source install/setup.bash
 
 # 전체 노드 기동
 ros2 launch fms_bringup fms_bringup.launch.py
+```
+
+Isaac Sim GUI에서 실제로 팔이 움직이는 걸 보려면:
+
+```bash
+# 1) Isaac Sim에서 World0123.usd를 열고 재생(▶) 버튼을 누른다
+~/dev_ws/isaac_sim/isaacsim/_build/linux-x86_64/release/isaac-sim.sh \
+    /home/rokey/EV_combine/src/Collected_World0123/World0123.usd
+
+# 2) 다른 터미널에서 arm_node 실행
+source /opt/ros/humble/setup.bash && source install/setup.bash
+ros2 run arm_node arm_node
+
+# 3) 또 다른 터미널에서 체결 명령 발행
+ros2 topic pub -1 /fasten/command fms_interfaces/msg/FastenCommand \
+    "{command: 'FASTEN', nut_id: 'nut1'}"
 ```
 
 ### 현재 상태 / TODO

@@ -1,0 +1,16 @@
+# behavior_node -> arm_node : 버스바 파지 · 삽입 (10_busbar_assembly.py BUSBAR_* phase 기반)
+# ACTION /busbar_insert
+
+# Goal
+string command        # GRASP | INSERT
+string station_id
+geometry_msgs/Pose target_pose
+---
+# Result
+bool success
+string message
+---
+# Feedback
+string phase
+float32 progress
+geometry_msgs/Pose vision_target_pose
