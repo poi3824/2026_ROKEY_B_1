@@ -16,9 +16,11 @@ GRASP 목표 좌표는 behavior_node가 goal.target_pose로 실어 보내는 /vi
 INSERT 목표는 상공 접근(POS_INSERT_ABOVE) 도달 후 정지를 확인하고
 perception_node의 /perception/get_bolt_pair 서비스를 동기 호출해, 버스바가 다리를
 걸치는 볼트 2개의 실측 XY 중간점으로 하드코딩된 target_mid_pos의 XY를 대체한다
-(볼트 미검출/서비스 실패 시 하드코딩 좌표로 폴백). vision_offset_x/y 파라미터는
-TCP(그리퍼 기준점)와 비전이 알려주는 목표 지점 사이의 체계적 오차를 보정하는 값으로,
-GRASP/INSERT 모두에 동일하게 적용된다 (측정 방법은 vision_offset_x/y 선언부 주석 참고).
+(볼트 미검출/서비스 실패 시 하드코딩 좌표로 폴백). vision_offset_grasp_x/y,
+vision_offset_insert_x/y 파라미터는 TCP(그리퍼 기준점)와 비전이 알려주는 목표 지점
+사이의 체계적 오차를 보정하는 값이다. GRASP/INSERT는 카메라가 보는 각도·거리가 달라
+실측 오차 크기도 다르게 나와(예: GRASP 수십 mm대 vs INSERT 1mm 이하) 용도별로 별도
+파라미터를 쓴다 (측정 방법은 선언부 주석 참고).
 
 너트 체결(APPROACH/FASTEN)은 scripts/record_nut_fasten_trajectory.py로 World0123.usd에서
 미리 녹화해둔 관절 궤적(data/nut_fasten_trajectory.json)을 그대로 재생해 /arm/joint_command로
@@ -127,17 +129,26 @@ class ArmNode(Node):
         self._latest_stud_pose = None
 
         # TCP(그리퍼 기준점)와 비전이 알려주는 목표 지점 사이의 체계적 오차 보정값.
-        # 카메라 캘리브레이션/그리퍼 형상 등에서 오는 고정 오차라고 보고 GRASP/INSERT
-        # 공통으로 적용한다. 측정 방법: vision_offset_x/y=0으로 두고 perception_node
-        # 터미널 로그(평균 좌표)와 이미 검증된 하드코딩 기준 좌표
-        # (_DEFAULT_POS_GRAB_PICK, target_mid_pos)를 비교 -> offset = 기준좌표 - 비전평균좌표
-        # -> 이 값을 아래 파라미터로 설정 (재빌드 없이 `--ros-args -p vision_offset_x:=...`
-        # 또는 `ros2 param set`으로 조정 가능).
-        self.declare_parameter('vision_offset_x', 0.0)
-        self.declare_parameter('vision_offset_y', 0.0)
-        self._vision_offset_xy = np.array([
-            self.get_parameter('vision_offset_x').value,
-            self.get_parameter('vision_offset_y').value,
+        # 카메라 캘리브레이션/그리퍼 형상 등에서 오는 고정 오차라고 보고 적용한다.
+        # 측정 방법: offset=0으로 두고 perception_node 터미널 로그(평균 좌표)와 이미
+        # 검증된 하드코딩 기준 좌표(_DEFAULT_POS_GRAB_PICK, target_mid_pos)를 비교 ->
+        # offset = 기준좌표 - 비전평균좌표 -> 아래 파라미터로 설정 (재빌드 없이
+        # `--ros-args -p vision_offset_grasp_x:=...` 또는 `ros2 param set`으로 조정 가능).
+        #
+        # GRASP(버스바 픽업 트레이)와 INSERT(볼트 트레이)는 카메라가 보는 각도/거리가
+        # 서로 달라 실측해보니 오차 크기가 확연히 다르다 (예: GRASP는 수십 mm대,
+        # INSERT/볼트는 1mm 이하) — 그래서 하나로 공유하지 않고 용도별로 분리한다.
+        self.declare_parameter('vision_offset_grasp_x', 0.0)
+        self.declare_parameter('vision_offset_grasp_y', 0.0)
+        self.declare_parameter('vision_offset_insert_x', 0.0)
+        self.declare_parameter('vision_offset_insert_y', 0.0)
+        self._vision_offset_grasp_xy = np.array([
+            self.get_parameter('vision_offset_grasp_x').value,
+            self.get_parameter('vision_offset_grasp_y').value,
+        ])
+        self._vision_offset_insert_xy = np.array([
+            self.get_parameter('vision_offset_insert_x').value,
+            self.get_parameter('vision_offset_insert_y').value,
         ])
 
         # ★ [좌표 및 파라미터 정의 - 01_pick_and_lift.py 동일]
@@ -249,13 +260,13 @@ class ArmNode(Node):
             f'B=({b[0]:.4f},{b[1]:.4f}) ({response.message})')
         return a, b
 
-    def _apply_vision_offset(self, xy: np.ndarray) -> np.ndarray:
-        corrected = np.asarray(xy, dtype=float) + self._vision_offset_xy
-        if np.any(self._vision_offset_xy != 0.0):
+    def _apply_vision_offset(self, xy: np.ndarray, offset_xy: np.ndarray, tag: str) -> np.ndarray:
+        corrected = np.asarray(xy, dtype=float) + offset_xy
+        if np.any(offset_xy != 0.0):
             self.get_logger().info(
-                f'vision_offset 적용 -> 원본=({xy[0]:.4f},{xy[1]:.4f}) '
+                f'[{tag}] vision_offset 적용 -> 원본=({xy[0]:.4f},{xy[1]:.4f}) '
                 f'보정후=({corrected[0]:.4f},{corrected[1]:.4f}) '
-                f'(offset=({self._vision_offset_xy[0]:.4f},{self._vision_offset_xy[1]:.4f}))')
+                f'(offset=({offset_xy[0]:.4f},{offset_xy[1]:.4f}))')
         return corrected
 
     # --- vision 토픽 콜백 ------------------------------------------------------
@@ -285,7 +296,8 @@ class ArmNode(Node):
         if target_pose.position.x != 0.0 or target_pose.position.y != 0.0:
             pick_pose = self._DEFAULT_POS_GRAB_PICK.copy()
             pick_pose[0], pick_pose[1] = self._apply_vision_offset(
-                np.array([target_pose.position.x, target_pose.position.y]))
+                np.array([target_pose.position.x, target_pose.position.y]),
+                self._vision_offset_grasp_xy, 'GRASP')
             self.get_logger().info(
                 f'goal.target_pose(vision) 좌표 사용 -> x={pick_pose[0]:.4f}, y={pick_pose[1]:.4f}')
             return pick_pose
@@ -502,7 +514,9 @@ class ArmNode(Node):
             return pos_insert_above, pos_insert_place
 
         (ax, ay), (bx, by) = bolt_pair
-        mid_xy = self._apply_vision_offset(np.array([(ax + bx) / 2.0, (ay + by) / 2.0]))
+        mid_xy = self._apply_vision_offset(
+            np.array([(ax + bx) / 2.0, (ay + by) / 2.0]),
+            self._vision_offset_insert_xy, 'INSERT')
         self.get_logger().info(
             f'볼트 쌍 실측 중간점 사용 -> x={mid_xy[0]:.4f}, y={mid_xy[1]:.4f} '
             f'(기존 하드코딩: x={pos_insert_above[0]:.4f}, y={pos_insert_above[1]:.4f})')
