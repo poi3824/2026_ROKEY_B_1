@@ -10,8 +10,11 @@ SUB /vision/busbar_grasp · /vision/nut_pose · /vision/stud_pose
 
 버스바 파지·삽입(GRASP/INSERT)은 /arm/target_pose(PoseStamped)를 Isaac Sim의 RMPFlow에
 발행하고 /arm/current_pose(PoseStamped)로 수렴을 확인하는 실시간 Cartesian 제어로 수행한다.
-GRASP 목표 좌표는 behavior_node가 goal.target_pose로 실어 보내는 /vision/busbar_grasp
-검출값(없으면 하드코딩 fallback)을 쓴다.
+GRASP 목표는 고정된 스캔 포즈(트레이 상공) 접근 후 정지를 확인하고 perception_node의
+/perception/get_grasp_pose 서비스를 동기 호출해, 'busbar' 라벨의 YOLO 실측 XY로
+하드코딩된 _DEFAULT_POS_GRAB_PICK의 XY를 대체한다 (arm_node_scan_test.py에서 검증된
+패턴 이식). 서비스 실패 시 behavior_node가 goal.target_pose로 실어 보내는
+/vision/busbar_grasp 검출값으로, 그마저 없으면 하드코딩 fallback으로 대체한다.
 
 INSERT 목표는 상공 접근(POS_INSERT_ABOVE) 도달 후 정지를 확인하고
 perception_node의 /perception/get_bolt_pair 서비스를 동기 호출해, 버스바가 다리를
@@ -48,10 +51,10 @@ from std_msgs.msg import Int32
 
 from fms_interfaces.action import BusbarInsert, NutFasten
 from fms_interfaces.msg import BusbarGrasp, NutPose, StudPose
-from fms_interfaces.srv import GetBoltPair
+from fms_interfaces.srv import GetBoltPair, GetGraspPose
 
 # feedback.phase에 실어 보낼 단계 이름. GRAB_BUSBAR/INSERT_BUSBAR 실제 동작 단계와 1:1 대응.
-BUSBAR_GRASP_PHASES = ['BUSBAR_APPROACH', 'BUSBAR_DESCEND', 'BUSBAR_GRASP', 'BUSBAR_LIFT']
+BUSBAR_GRASP_PHASES = ['BUSBAR_APPROACH', 'BUSBAR_SCAN', 'BUSBAR_DESCEND', 'BUSBAR_LIFT']
 BUSBAR_INSERT_PHASES = ['MOVE_TO_BOLT_APPROACH', 'BOLT_PAIR_SCAN', 'BUSBAR_DESCEND_TO_BOLT',
                          'BUSBAR_RELEASE_AND_RETRACT']
 
@@ -72,6 +75,7 @@ STATIONARY_SPEED_THRESHOLD_M_S = 0.005
 STATIONARY_WAIT_TIMEOUT_SEC = 3.0
 
 BOLT_PAIR_SERVICE_TIMEOUT_SEC = 3.0
+GRASP_SERVICE_TIMEOUT_SEC = 3.0
 
 # /arm/joint_command는 60Hz로 유지하고 Action feedback만 이 주기로 제한한다.
 NUT_FASTEN_FEEDBACK_HZ = 7.5
@@ -121,6 +125,9 @@ class ArmNode(Node):
         # perception_node에 볼트 2개 위치를 동기 요청하는 서비스 클라이언트 (INSERT 정렬용).
         self._bolt_pair_client = self.create_client(
             GetBoltPair, '/perception/get_bolt_pair', callback_group=self._cb_group)
+        # perception_node에 버스바(YOLO) 파지 좌표를 동기 요청하는 서비스 클라이언트 (GRASP 정렬용).
+        self._grasp_client = self.create_client(
+            GetGraspPose, '/perception/get_grasp_pose', callback_group=self._cb_group)
 
         # 3. 너트 체결 궤적 재생 및 Isaac Sim 조인트 상태 인터페이스
         self._joint_states_sub = self.create_subscription(
@@ -169,6 +176,9 @@ class ArmNode(Node):
         # ★ [좌표 및 파라미터 정의 - 01_pick_and_lift.py 동일]
         # vision 검출이 없을 때 쓰는 대체(fallback) 파지 좌표.
         self._DEFAULT_POS_GRAB_PICK = np.array([0.5128, 0.4477, 0.455, 0.0, 3.1415, 1.5708])
+        # 버스바 트레이 상공 고정 스캔 포즈 (arm_node_scan_test.py 검증됨). 정확한 파지 좌표를
+        # 몰라도 먼저 이 위치로 접근해 정지한 뒤 get_grasp_pose로 YOLO 실측을 조회한다.
+        self._BUSBAR_SCAN_POSE = self._DEFAULT_POS_GRAB_PICK + np.array([0.0, 0.0, 0.145, 0.0, 0.0, 0.0])
 
         # ★ 수정됨: 볼트 1, 2의 World 프레임 중심 좌표 (World0123.usd에서 실측, 미터 단위)
         # 이전 값은 PolyShape 메시의 로컬(mm 스케일 서브에셋) 좌표를 잘못 대입한 것이었음 (z=8.0은 world 높이가 아님)
@@ -312,6 +322,39 @@ class ArmNode(Node):
             f'/perception/get_bolt_pair 응답 좌표 사용 -> A=({a[0]:.4f},{a[1]:.4f}) '
             f'B=({b[0]:.4f},{b[1]:.4f}) ({response.message})')
         return a, b
+
+    def _request_grasp_pose(self, label: str = 'busbar', goal_handle=None):
+        if not self._grasp_client.wait_for_service(timeout_sec=GRASP_SERVICE_TIMEOUT_SEC):
+            self.get_logger().warn('/perception/get_grasp_pose 서비스 대기 타임아웃')
+            return None
+
+        request = GetGraspPose.Request()
+        request.label = label
+        future = self._grasp_client.call_async(request)
+
+        start_time = time.time()
+        while not future.done():
+            if self._shutdown_requested.is_set() or not rclpy.ok():
+                return None
+            if goal_handle is not None and goal_handle.is_cancel_requested:
+                self._publish_cartesian_hold()
+                return None
+            if time.time() - start_time > GRASP_SERVICE_TIMEOUT_SEC:
+                self.get_logger().warn('/perception/get_grasp_pose 응답 타임아웃')
+                return None
+            time.sleep(0.05)
+
+        response = future.result()
+        if response is None or not response.found:
+            message = response.message if response is not None else 'no response'
+            self.get_logger().warn(f'/perception/get_grasp_pose 검출 없음: {message}')
+            return None
+
+        x = response.pose.pose.position.x
+        y = response.pose.pose.position.y
+        self.get_logger().info(
+            f'/perception/get_grasp_pose 응답 좌표 사용 -> x={x:.4f}, y={y:.4f} ({response.message})')
+        return x, y
 
     def _apply_vision_offset(self, xy: np.ndarray, offset_xy: np.ndarray, tag: str) -> np.ndarray:
         corrected = np.asarray(xy, dtype=float) + offset_xy
@@ -635,37 +678,83 @@ class ArmNode(Node):
         finally:
             self._release_robot()
 
-    def _run_busbar_grasp(self, goal, goal_handle):
-        pos_grab_pick = self._resolve_grab_pick_pose(goal.target_pose)
-        pos_grab_above = pos_grab_pick + np.array([0.0, 0.0, 0.145, 0.0, 0.0, 0.0])
-        busbar_lift_move_pos = pos_grab_pick + np.array([0.0, 0.1, 0.145, 0.0, 0.0, 0.0])
-        phases = BUSBAR_GRASP_PHASES
+    # --- GRAB_BUSBAR 세부 동작 (상공 스캔 -> YOLO 실측 조회 -> 재접근 -> 하강 -> 파지 -> 상승) ---
+    def _busbar_approach_scan_pose(self, goal_handle):
+        return self._move_to_pose(
+            self._BUSBAR_SCAN_POSE, '1. 버스바 트레이 상공 스캔 포즈 접근',
+            pos_tolerance=self._PICK_TOLERANCE_STRICT, goal_handle=goal_handle,
+        )
 
+    def _busbar_locate_pick_pose(self, goal, goal_handle):
+        """스캔 포즈 도달 후 정지를 확인하고 get_grasp_pose로 YOLO 실측 파지 좌표를 조회한다.
+        실패 시 behavior_node가 실어 보낸 goal.target_pose(비전 토픽)로, 그마저 없으면
+        하드코딩 fallback으로 대체한다. 취소/종료 시 None을 반환한다."""
+        if not self._wait_until_stationary(goal_handle=goal_handle):
+            return None
+
+        grasp_xy = self._request_grasp_pose(goal_handle=goal_handle)
+        if goal_handle.is_cancel_requested:
+            return None
+
+        if grasp_xy is not None:
+            pick_pose = self._DEFAULT_POS_GRAB_PICK.copy()
+            pick_pose[0], pick_pose[1] = self._apply_vision_offset(
+                np.array(grasp_xy), self._vision_offset_grasp_xy, 'GRASP')
+            self.get_logger().info(
+                f'get_grasp_pose(YOLO 실측) 좌표 사용 -> x={pick_pose[0]:.4f}, y={pick_pose[1]:.4f}')
+            return pick_pose
+
+        self.get_logger().warn('get_grasp_pose 실패, goal.target_pose(비전 토픽) 기반 좌표로 대체')
+        return self._resolve_grab_pick_pose(goal.target_pose)
+
+    def _busbar_approach_pick_pose(self, goal_handle, pos_grab_above):
+        return self._move_to_pose(
+            pos_grab_above, '2. 버스바 파지점 상공 재접근',
+            pos_tolerance=self._PICK_TOLERANCE_STRICT, goal_handle=goal_handle,
+        )
+
+    def _busbar_descend_to_pick(self, goal_handle, pos_grab_pick):
+        return self._move_to_pose(
+            pos_grab_pick, '3. 버스바 파지점 하강',
+            pos_tolerance=self._PICK_TOLERANCE_STRICT, goal_handle=goal_handle,
+        )
+
+    def _busbar_grasp_close(self, goal_handle):
+        return self._control_gripper(close=True, goal_handle=goal_handle)
+
+    def _busbar_lift(self, goal_handle, lift_pos):
+        return self._move_to_pose(
+            lift_pos, '4. 버스바 상승 및 이동',
+            pos_tolerance=self._PICK_TOLERANCE_STRICT, goal_handle=goal_handle,
+        )
+
+    def _run_busbar_grasp(self, goal, goal_handle):
+        phases = BUSBAR_GRASP_PHASES
         self._publish_gripper_state(0)
 
         self._publish_busbar_feedback(goal_handle, phases[0], 1 / 4)
-        if not self._move_to_pose(
-            pos_grab_above, '1. 버스바 상공 접근',
-            pos_tolerance=self._PICK_TOLERANCE_STRICT, goal_handle=goal_handle,
-        ):
-            return False, '상공 접근 실패'
+        if not self._busbar_approach_scan_pose(goal_handle):
+            return False, '스캔 포즈(상공) 접근 실패'
 
         self._publish_busbar_feedback(goal_handle, phases[1], 2 / 4)
-        if not self._move_to_pose(
-            pos_grab_pick, '2. 버스바 파지점 하강',
-            pos_tolerance=self._PICK_TOLERANCE_STRICT, goal_handle=goal_handle,
-        ):
-            return False, '파지점 하강 실패'
+        pos_grab_pick = self._busbar_locate_pick_pose(goal, goal_handle)
+        if pos_grab_pick is None:
+            return False, '파지 좌표 탐색 취소'
+
+        pos_grab_above = pos_grab_pick + np.array([0.0, 0.0, 0.145, 0.0, 0.0, 0.0])
+        busbar_lift_move_pos = pos_grab_pick + np.array([0.0, 0.1, 0.145, 0.0, 0.0, 0.0])
+
+        if not self._busbar_approach_pick_pose(goal_handle, pos_grab_above):
+            return False, '파지점 상공 재접근 실패'
 
         self._publish_busbar_feedback(goal_handle, phases[2], 3 / 4)
-        if not self._control_gripper(close=True, goal_handle=goal_handle):
+        if not self._busbar_descend_to_pick(goal_handle, pos_grab_pick):
+            return False, '파지점 하강 실패'
+        if not self._busbar_grasp_close(goal_handle):
             return False, '그리퍼 닫기 취소'
 
         self._publish_busbar_feedback(goal_handle, phases[3], 4 / 4)
-        if not self._move_to_pose(
-            busbar_lift_move_pos, '3. 버스바 상승 및 이동',
-            pos_tolerance=self._PICK_TOLERANCE_STRICT, goal_handle=goal_handle,
-        ):
+        if not self._busbar_lift(goal_handle, busbar_lift_move_pos):
             return False, '상승 이동 실패'
 
         return True, 'GRAB_BUSBAR 시퀀스 최종 완료'
