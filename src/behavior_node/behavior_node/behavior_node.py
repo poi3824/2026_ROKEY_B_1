@@ -6,7 +6,7 @@ PUB /fleet/report                                       (fms_interfaces/FleetRep
 
 PUB /amr/goal            SUB /amr/status                (이동)
 ACTION /busbar_insert                                    (버스바 파지·삽입, GRASP -> INSERT)
-ACTION /nut_fasten                                       (너트 체결, APPROACH -> FASTEN)
+ACTION /nut_fasten     (너트 체결, NUT_APPROACH -> NUT_GRASP -> FASTEN_APPROACH -> FASTEN)
 SUB /vision/stud_pose · /vision/busbar_grasp · /vision/nut_pose
 
 arm_node가 없거나 응답이 없어도 무한 대기하지 않도록, goal마다 서버 연결(server_is_ready) ->
@@ -46,9 +46,13 @@ GOAL_RESPONSE_CLEANUP_TIMEOUT_SEC = 5.0 # accept 지연 시 응답을 기다려 
 CANCEL_COMPLETION_TIMEOUT_SEC = 10.0    # cancel 수락 후 최종 CANCELED result 대기 한도
 BUSBAR_GRASP_RESULT_TIMEOUT_SEC = 35.0  # Cartesian 이동 3회 + 그리퍼 동작
 BUSBAR_INSERT_RESULT_TIMEOUT_SEC = 60.0 # 이동/정지/볼트조회/점진하강/이탈
-# nut_fasten_trajectory.json: approach=939, fasten=1895, physics_dt=1/60초.
-NUT_APPROACH_RESULT_TIMEOUT_SEC = 25.0  # JSON 재생 15.65초 + 통신/스케줄링 여유
-NUT_FASTEN_RESULT_TIMEOUT_SEC = 45.0    # JSON 재생 31.58초 + 통신/스케줄링 여유
+# 너트 체결은 동작 사이 정지/정착 시간을 두기 위해 busbar처럼 goal 4개로 나눠 보낸다
+# (NUT_APPROACH -> NUT_GRASP -> FASTEN_APPROACH -> FASTEN). 앞 3개는 Cartesian 이동
+# (_move_to_pose 1회당 최대 8초), FASTEN만 기록 궤적 재생(1895프레임, physics_dt=1/60초).
+NUT_APPROACH_RESULT_TIMEOUT_SEC = 15.0        # 이동 1회
+NUT_GRASP_RESULT_TIMEOUT_SEC = 20.0           # 하강+그리퍼+상승 (이동 2회 + 그리퍼 대기)
+FASTEN_APPROACH_RESULT_TIMEOUT_SEC = 30.0     # 이동 2회, 자세 수렴까지 확인(각 12초) + 여유
+NUT_FASTEN_RESULT_TIMEOUT_SEC = 45.0          # 자세 정렬 램프 1초 + JSON 재생 31.58초 + 여유
 
 
 class _PendingGoal:
@@ -93,6 +97,8 @@ class State(Enum):
     GRASP_BUSBAR = auto()
     INSERT_BUSBAR = auto()
     WAIT_NUT_VISION = auto()
+    NUT_APPROACH = auto()
+    NUT_GRASP = auto()
     FASTEN_APPROACH = auto()
     FASTEN = auto()
     RECOVER = auto()
@@ -176,8 +182,8 @@ class BehaviorNode(Node):
                 self._send_busbar_goal('GRASP')
         elif self._state == State.WAIT_NUT_VISION:
             if self._latest_stud_pose is not None and self._latest_nut_pose is not None:
-                self._set_state(State.FASTEN_APPROACH)
-                self._send_fasten_goal('APPROACH')
+                self._set_state(State.NUT_APPROACH)
+                self._send_fasten_goal('NUT_APPROACH')
         elif self._state == State.REPORT:
             self._send_report(success=True, message='조립 완료')
             self._set_state(State.IDLE)
@@ -444,8 +450,8 @@ class BehaviorNode(Node):
             if VISION_ENABLED:
                 self._set_state(State.WAIT_NUT_VISION)
             else:
-                self._set_state(State.FASTEN_APPROACH)
-                self._send_fasten_goal('APPROACH')
+                self._set_state(State.NUT_APPROACH)
+                self._send_fasten_goal('NUT_APPROACH')
 
     # --- 너트 체결 시퀀스 ----------------------------------------------------
     def _on_stud_pose(self, msg: StudPose):
@@ -454,13 +460,19 @@ class BehaviorNode(Node):
     def _on_nut_pose(self, msg: NutPose):
         self._latest_nut_pose = msg
 
+    _FASTEN_RESULT_TIMEOUTS = {
+        'NUT_APPROACH': NUT_APPROACH_RESULT_TIMEOUT_SEC,
+        'NUT_GRASP': NUT_GRASP_RESULT_TIMEOUT_SEC,
+        'FASTEN_APPROACH': FASTEN_APPROACH_RESULT_TIMEOUT_SEC,
+        'FASTEN': NUT_FASTEN_RESULT_TIMEOUT_SEC,
+    }
+
     def _send_fasten_goal(self, command: str):
         goal = NutFasten.Goal()
         goal.command = command
         goal.nut_id = str(self._latest_nut_pose.id) if self._latest_nut_pose else ''
         self.get_logger().info(f'ACTION /nut_fasten 요청 -> {command}')
-        result_timeout = (NUT_APPROACH_RESULT_TIMEOUT_SEC if command == 'APPROACH'
-                           else NUT_FASTEN_RESULT_TIMEOUT_SEC)
+        result_timeout = self._FASTEN_RESULT_TIMEOUTS[command]
         self._send_action_goal(
             self._fasten_action_client, goal, 'nut_fasten', command,
             on_result=self._on_fasten_result, result_timeout_sec=result_timeout)
@@ -470,7 +482,13 @@ class BehaviorNode(Node):
             self._enter_recover(self._state, result.message)
             return
 
-        if self._state == State.FASTEN_APPROACH:
+        if self._state == State.NUT_APPROACH:
+            self._set_state(State.NUT_GRASP)
+            self._send_fasten_goal('NUT_GRASP')
+        elif self._state == State.NUT_GRASP:
+            self._set_state(State.FASTEN_APPROACH)
+            self._send_fasten_goal('FASTEN_APPROACH')
+        elif self._state == State.FASTEN_APPROACH:
             self._set_state(State.FASTEN)
             self._send_fasten_goal('FASTEN')
         elif self._state == State.FASTEN:
@@ -512,8 +530,10 @@ class BehaviorNode(Node):
             self._enter_move_to_station()
         elif failed_state in (State.GRASP_BUSBAR, State.INSERT_BUSBAR):
             self._send_busbar_goal('GRASP' if failed_state == State.GRASP_BUSBAR else 'INSERT')
-        elif failed_state in (State.FASTEN_APPROACH, State.FASTEN):
-            self._send_fasten_goal('APPROACH' if failed_state == State.FASTEN_APPROACH else 'FASTEN')
+        elif failed_state in (State.NUT_APPROACH, State.NUT_GRASP,
+                               State.FASTEN_APPROACH, State.FASTEN):
+            # state 이름이 곧 nut_fasten의 command 문자열이라 그대로 재사용한다.
+            self._send_fasten_goal(failed_state.name)
 
     # --- FMS 보고 -----------------------------------------------------------
     def _send_report(self, success: bool, message: str):

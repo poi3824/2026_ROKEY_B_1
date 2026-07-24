@@ -33,10 +33,10 @@ def generate_launch_description():
             name='arm_node',
             output='screen',
         ),
-        Node(
-            package='perception_node',
-            executable='perception_node',
-            name='perception_node',
-            output='screen',
-        ),
+        # Node(
+        #     package='perception_node',
+        #     executable='perception_node',
+        #     name='perception_node',
+        #     output='screen',
+        # ),
     ])

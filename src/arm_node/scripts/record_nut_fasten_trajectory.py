@@ -51,6 +51,12 @@ NUT_POLYSHAPE_PATHS = {
     "nut1": "/World/nut1/geo/PolyShape",
     "nut2": "/World/nut2/geo/PolyShape",
 }
+# ★ World0123.usd 실측 절대좌표 (2026-07-24, World 프레임). bbox 중심 계산이 참조 해석
+# 이슈 등으로 어긋날 수 있어 픽 XY는 이 값을 그대로 쓰고, bbox 계산값은 로그로만 비교한다.
+NUT_PICK_XY_ABSOLUTE = {
+    "nut1": np.array([0.5746, -0.1008]),
+    "nut2": np.array([0.6643, -0.1031]),
+}
 BOLT_POLYSHAPE_PATHS = {
     "bolt_1": "/World/battery_pack3/_2_8V60Ah_BT/bolt_1/geo/PolyShape",
     "bolt_2": "/World/battery_pack3/_2_8V60Ah_BT/bolt_2/geo/PolyShape",
@@ -223,6 +229,21 @@ def axis_tilt_deg(quat_wxyz):
     return float(np.degrees(np.arccos(cos_a)))
 
 
+def upright_local_z(quat_wxyz):
+    """local Z가 world -Z(뒤집힌 상태)로 authoring된 nut을 180도 보정해 위를 향하게 한다.
+    이미 위를 향해 있으면 그대로 반환 -- scene에서 나중에 orientation을 고치더라도
+    이 보정이 다시 뒤집는 일이 없도록 측정값 기반으로 조건부 적용한다."""
+    q = Gf.Quatd(float(quat_wxyz[0]), Gf.Vec3d(float(quat_wxyz[1]), float(quat_wxyz[2]), float(quat_wxyz[3])))
+    rot = Gf.Rotation(q)
+    local_z = rot.TransformDir(Gf.Vec3d(0.0, 0.0, 1.0))
+    if local_z[2] >= 0.0:
+        return np.asarray(quat_wxyz)
+    flip_rot = Gf.Rotation(Gf.Vec3d(1.0, 0.0, 0.0), 180.0)
+    combined = flip_rot * rot
+    cq = combined.GetQuat()
+    return np.array([cq.GetReal(), *cq.GetImaginary()])
+
+
 def yaw_rotated_quat(base_wxyz, delta_deg):
     base_q = Gf.Quatd(float(base_wxyz[0]), Gf.Vec3d(float(base_wxyz[1]), float(base_wxyz[2]), float(base_wxyz[3])))
     base_rot = Gf.Rotation(base_q)
@@ -298,14 +319,25 @@ def main():
     )
     nut_rest_origin, nut_rest_orientation = nut_xform.get_world_pose()
     nut_rest_origin = np.asarray(nut_rest_origin).copy()
-    nut_rest_orientation = np.asarray(nut_rest_orientation).copy()
+    nut_rest_orientation_raw = np.asarray(nut_rest_orientation).copy()
+    nut_rest_orientation = upright_local_z(nut_rest_orientation_raw)
+    if not np.allclose(nut_rest_orientation, nut_rest_orientation_raw):
+        log(
+            f"[보정] {TARGET_NUT_ID} local Z가 아래를 향해(뒤집힘) 있어 180도 보정 적용: "
+            f"raw={np.round(nut_rest_orientation_raw, 4)} -> fixed={np.round(nut_rest_orientation, 4)}"
+        )
     nut_origin_to_bottom = float(nut_rest_origin[2] - nut_bottom_z)
 
     bolt_tip_z = float(bolt_bbox.GetMax()[2])
     bolt_cx = float((bolt_bbox.GetMin()[0] + bolt_bbox.GetMax()[0]) / 2.0)
     bolt_cy = float((bolt_bbox.GetMin()[1] + bolt_bbox.GetMax()[1]) / 2.0)
 
-    NUT_PICK_XY = np.array([nut_cx, nut_cy])
+    NUT_PICK_XY = NUT_PICK_XY_ABSOLUTE.get(TARGET_NUT_ID, np.array([nut_cx, nut_cy]))
+    if TARGET_NUT_ID in NUT_PICK_XY_ABSOLUTE:
+        log(
+            f"[대상] {TARGET_NUT_ID} pick_xy 하드코딩 절대좌표 사용: {np.round(NUT_PICK_XY, 4)} "
+            f"(bbox 중심 계산값={np.round([nut_cx, nut_cy], 4)})"
+        )
     NUT_REST_ROOT_Z = nut_bottom_z
     BOLT_XY = np.array([bolt_cx, bolt_cy])
     BOLT_TIP_Z = bolt_tip_z

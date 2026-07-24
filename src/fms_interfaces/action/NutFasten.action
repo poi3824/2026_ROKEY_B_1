@@ -2,7 +2,7 @@
 # ACTION /nut_fasten
 
 # Goal
-string command         # APPROACH | FASTEN
+string command         # NUT_APPROACH | NUT_GRASP | FASTEN_APPROACH | FASTEN
 string nut_id
 ---
 # Result
