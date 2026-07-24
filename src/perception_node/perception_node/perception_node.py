@@ -57,6 +57,7 @@ from fms_interfaces.msg import BusbarGrasp, NutPose
 from fms_interfaces.srv import GetBoltPair, GetGraspPose
 from geometry_msgs.msg import PoseStamped
 from rclpy.duration import Duration
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from sensor_msgs.msg import CameraInfo, Image
 from tf2_ros.buffer import Buffer
@@ -410,11 +411,15 @@ def main(args=None):
     node = PerceptionNode()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
-        node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            try:
+                node.destroy_node()
+                rclpy.shutdown()
+            except KeyboardInterrupt:
+                pass
 
 
 if __name__ == '__main__':

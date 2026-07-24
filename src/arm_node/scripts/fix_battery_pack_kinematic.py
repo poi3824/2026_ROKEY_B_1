@@ -22,7 +22,7 @@ simulation_app = SimulationApp({"headless": _HEADLESS})
 import omni.usd
 from pxr import UsdPhysics
 
-WORLD_USD = "/home/rokey/EV_combine/src/Collected_World0123/World0123.usd"
+WORLD_USD = "/home/rokey/EV_combine/src/Collected_World_0123/World0123.usd"
 TARGET_PRIM_PATH = "/World/battery_pack3"
 
 context = omni.usd.get_context()

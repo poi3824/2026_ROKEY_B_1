@@ -3,7 +3,7 @@
 파지+체결 시퀀스를 실행하면서, 매 스텝 관절값을 기록해 JSON으로 저장한다.
 
 arm_node.py는 실시간 IK 없이 이 기록된 궤적을 그대로 재생(publish)한다
-(대상 nut1/peg_0 -> bolt_2 위치가 고정돼 있으므로 오프라인 기록 재생 방식으로 충분).
+(선택한 너트와 볼트 위치가 고정돼 있으므로 오프라인 기록 재생 방식으로 충분).
 
 기록은 두 구간으로 나뉜다:
   APPROACH: 시작 ~ SEAT 판정 직전까지(너트 픽 + 볼트 위 정렬)
@@ -13,6 +13,10 @@ arm_node.py는 실시간 IK 없이 이 기록된 궤적을 그대로 재생(publ
 실행:
   /home/rokey/dev_ws/isaac_sim/isaacsim/_build/linux-x86_64/release/python.sh \
       /home/rokey/EV_combine/src/arm_node/scripts/record_nut_fasten_trajectory.py
+
+대상 선택:
+  NUT_TARGET_ID=nut1 BOLT_TARGET_ID=bolt_1 .../python.sh .../record_nut_fasten_trajectory.py
+  NUT_TARGET_ID=nut2 BOLT_TARGET_ID=bolt_2 .../python.sh .../record_nut_fasten_trajectory.py
 """
 import os
 from isaacsim import SimulationApp
@@ -40,8 +44,34 @@ sys.path.insert(0, str(_M0609_DIR / "rmpflow"))
 from m0609_pick_place_controller import PickPlaceController  # noqa: E402
 from m0609_rmpflow_controller import RMPFlowController  # noqa: E402
 
-WORLD_USD = "/home/rokey/EV_combine/src/Collected_World0123/World0123.usd"
-OUT_JSON = Path("/home/rokey/EV_combine/src/arm_node/arm_node/data/nut_fasten_trajectory.json")
+WORLD_USD = "/home/rokey/EV_combine/src/Collected_World_0123/World0123.usd"
+TARGET_NUT_ID = os.environ.get("NUT_TARGET_ID", "nut1")
+TARGET_BOLT_ID = os.environ.get("BOLT_TARGET_ID", "bolt_2")
+NUT_POLYSHAPE_PATHS = {
+    "nut1": "/World/nut1/geo/PolyShape",
+    "nut2": "/World/nut2/geo/PolyShape",
+}
+BOLT_POLYSHAPE_PATHS = {
+    "bolt_1": "/World/battery_pack3/_2_8V60Ah_BT/bolt_1/geo/PolyShape",
+    "bolt_2": "/World/battery_pack3/_2_8V60Ah_BT/bolt_2/geo/PolyShape",
+}
+if TARGET_NUT_ID not in NUT_POLYSHAPE_PATHS:
+    raise ValueError(
+        f"NUT_TARGET_ID must be one of {sorted(NUT_POLYSHAPE_PATHS)}, got {TARGET_NUT_ID!r}"
+    )
+if TARGET_BOLT_ID not in BOLT_POLYSHAPE_PATHS:
+    raise ValueError(
+        f"BOLT_TARGET_ID must be one of {sorted(BOLT_POLYSHAPE_PATHS)}, got {TARGET_BOLT_ID!r}"
+    )
+
+_DATA_DIR = Path("/home/rokey/EV_combine/src/arm_node/arm_node/data")
+# 기존 ROS 재생 경로는 기본 대상 nut1 -> bolt_2와 호환되게 유지한다. 다른 조합은
+# 별도 파일로 저장해 기본 궤적을 덮어쓰지 않는다.
+OUT_JSON = (
+    _DATA_DIR / "nut_fasten_trajectory.json"
+    if (TARGET_NUT_ID, TARGET_BOLT_ID) == ("nut1", "bolt_2")
+    else _DATA_DIR / f"nut_fasten_trajectory_{TARGET_NUT_ID}_to_{TARGET_BOLT_ID}.json"
+)
 LOG_PATH = Path("/home/rokey/EV_combine/src/arm_node/scripts/record_result.txt")
 
 _log_f = open(LOG_PATH, "w")
@@ -82,8 +112,6 @@ EVENTS_DT = [0.011, 0.006, 0.05, 1.0 / 150, 0.01, 0.013, 0.003, 1.0, 0.011, 0.08
 PICK_HOVER_HEIGHT = 0.15
 HOME_LIFT_Z = 0.30
 EE_OFFSET = np.array([0.0, 0.0, 0.185])
-NUT_REST_ORIENTATION = np.array([1.0, 0.0, 0.0, 0.0])
-
 SCREW_HOVER_CLEAR = 0.001
 ENGAGE_LEN = 0.020
 ENGAGE_XY_TOL_M = 0.006
@@ -225,17 +253,53 @@ def main():
     world = World(stage_units_in_meters=1.0, physics_dt=PHYSICS_DT, rendering_dt=1.0 / 60.0)
 
     stage = omni.usd.get_context().get_stage()
-    nut_prim = stage.GetPrimAtPath("/World/nut1")
-    bolt_prim = stage.GetPrimAtPath("/World/battery_pack3/_2_8V60Ah_BT/bolt_2")
+    nut_prims = {
+        nut_id: stage.GetPrimAtPath(path)
+        for nut_id, path in NUT_POLYSHAPE_PATHS.items()
+    }
+    invalid_nuts = [
+        nut_id for nut_id, prim in nut_prims.items() if not prim.IsValid()
+    ]
+    if invalid_nuts:
+        missing_paths = [NUT_POLYSHAPE_PATHS[nut_id] for nut_id in invalid_nuts]
+        raise RuntimeError(f"너트 PolyShape prim을 찾을 수 없음: {missing_paths}")
+    nut_prim = nut_prims[TARGET_NUT_ID]
+
+    bolt_prims = {
+        bolt_id: stage.GetPrimAtPath(path)
+        for bolt_id, path in BOLT_POLYSHAPE_PATHS.items()
+    }
+    invalid_bolts = [
+        bolt_id for bolt_id, prim in bolt_prims.items() if not prim.IsValid()
+    ]
+    if invalid_bolts:
+        missing_paths = [BOLT_POLYSHAPE_PATHS[bolt_id] for bolt_id in invalid_bolts]
+        raise RuntimeError(f"볼트 PolyShape prim을 찾을 수 없음: {missing_paths}")
+    bolt_prim = bolt_prims[TARGET_BOLT_ID]
 
     cache = UsdGeom.BBoxCache(Usd.TimeCode.Default(), [UsdGeom.Tokens.default_])
-    nut_bbox = cache.ComputeWorldBound(nut_prim).ComputeAlignedRange()
-    bolt_bbox = cache.ComputeWorldBound(bolt_prim).ComputeAlignedRange()
+    nut_bboxes = {
+        nut_id: cache.ComputeWorldBound(prim).ComputeAlignedRange()
+        for nut_id, prim in nut_prims.items()
+    }
+    nut_bbox = nut_bboxes[TARGET_NUT_ID]
+    bolt_bboxes = {
+        bolt_id: cache.ComputeWorldBound(prim).ComputeAlignedRange()
+        for bolt_id, prim in bolt_prims.items()
+    }
+    bolt_bbox = bolt_bboxes[TARGET_BOLT_ID]
 
     nut_bottom_z = float(nut_bbox.GetMin()[2])
     nut_cx = float((nut_bbox.GetMin()[0] + nut_bbox.GetMax()[0]) / 2.0)
     nut_cy = float((nut_bbox.GetMin()[1] + nut_bbox.GetMax()[1]) / 2.0)
     nut_height = float(nut_bbox.GetMax()[2] - nut_bbox.GetMin()[2])
+    nut_xform = SingleXFormPrim(
+        NUT_POLYSHAPE_PATHS[TARGET_NUT_ID], name=f"{TARGET_NUT_ID}_polyshape"
+    )
+    nut_rest_origin, nut_rest_orientation = nut_xform.get_world_pose()
+    nut_rest_origin = np.asarray(nut_rest_origin).copy()
+    nut_rest_orientation = np.asarray(nut_rest_orientation).copy()
+    nut_origin_to_bottom = float(nut_rest_origin[2] - nut_bottom_z)
 
     bolt_tip_z = float(bolt_bbox.GetMax()[2])
     bolt_cx = float((bolt_bbox.GetMin()[0] + bolt_bbox.GetMax()[0]) / 2.0)
@@ -251,10 +315,35 @@ def main():
     NUT_ALIGN_ROOT_Z = BOLT_TIP_Z + SCREW_HOVER_CLEAR
     PLACE_POS = np.array([BOLT_XY[0], BOLT_XY[1], NUT_ALIGN_ROOT_Z + NUT_GRASP_Z_LOCAL])
 
-    log(f"[측정] nut1 pick={np.round(PICK_POS,4)} (bottom_z={nut_bottom_z:.4f}, height={nut_height*1000:.2f}mm)")
-    log(f"[측정] bolt_2 place={np.round(PLACE_POS,4)} (tip_z={bolt_tip_z:.4f})")
-
-    nut_xform = SingleXFormPrim("/World/nut1", name="nut1")
+    for nut_id, bbox in nut_bboxes.items():
+        nut_center = np.array([
+            float((bbox.GetMin()[0] + bbox.GetMax()[0]) / 2.0),
+            float((bbox.GetMin()[1] + bbox.GetMax()[1]) / 2.0),
+        ])
+        log(
+            f"[측정] {nut_id} center_xy={np.round(nut_center,4)} "
+            f"bottom_z={float(bbox.GetMin()[2]):.4f} "
+            f"prim={NUT_POLYSHAPE_PATHS[nut_id]}"
+        )
+    log(
+        f"[대상] {TARGET_NUT_ID} pick={np.round(PICK_POS,4)} "
+        f"(bottom_z={nut_bottom_z:.4f}, height={nut_height*1000:.2f}mm, "
+        f"origin_to_bottom={nut_origin_to_bottom*1000:.2f}mm)"
+    )
+    for bolt_id, bbox in bolt_bboxes.items():
+        bolt_center = np.array([
+            float((bbox.GetMin()[0] + bbox.GetMax()[0]) / 2.0),
+            float((bbox.GetMin()[1] + bbox.GetMax()[1]) / 2.0),
+        ])
+        log(
+            f"[측정] {bolt_id} center_xy={np.round(bolt_center,4)} "
+            f"tip_z={float(bbox.GetMax()[2]):.4f} "
+            f"prim={BOLT_POLYSHAPE_PATHS[bolt_id]}"
+        )
+    log(
+        f"[대상] {TARGET_BOLT_ID} place={np.round(PLACE_POS,4)} "
+        f"(tip_z={bolt_tip_z:.4f})"
+    )
 
     log("[1] 물리 설정")
     set_all_drives(ARM_PRIM_PATH)
@@ -310,10 +399,10 @@ def main():
     def glue_nut_to_ee(blend):
         ee_pos, _ = robot.end_effector.get_world_pose()
         grasp_point_pos = np.asarray(ee_pos) - EE_OFFSET
-        target_pos = grasp_point_pos - np.array([0.0, 0.0, NUT_GRASP_Z_LOCAL])
-        rest_pos = np.array([float(NUT_PICK_XY[0]), float(NUT_PICK_XY[1]), float(NUT_REST_ROOT_Z)])
-        nut_pos = rest_pos + blend * (target_pos - rest_pos)
-        nut_xform.set_world_pose(position=nut_pos, orientation=NUT_REST_ORIENTATION)
+        target_bottom_pos = grasp_point_pos - np.array([0.0, 0.0, NUT_GRASP_Z_LOCAL])
+        target_origin_pos = target_bottom_pos + np.array([0.0, 0.0, nut_origin_to_bottom])
+        nut_pos = nut_rest_origin + blend * (target_origin_pos - nut_rest_origin)
+        nut_xform.set_world_pose(position=nut_pos, orientation=nut_rest_orientation)
 
     def apply_grip_hold():
         robot.apply_action(ArticulationAction(
@@ -331,7 +420,11 @@ def main():
                 phase["start_pos"] = np.asarray(sp).copy()
                 phase["start_quat"] = np.asarray(sq).copy()
                 nut_pos, nut_quat = nut_xform.get_world_pose()
-                seat_pos = np.array([float(BOLT_XY[0]), float(BOLT_XY[1]), float(BOLT_TIP_Z)])
+                seat_pos = np.array([
+                    float(BOLT_XY[0]),
+                    float(BOLT_XY[1]),
+                    float(BOLT_TIP_Z + nut_origin_to_bottom),
+                ])
                 seat_quat = np.asarray(nut_quat).copy()
                 nut_xform.set_world_pose(position=seat_pos, orientation=seat_quat)
                 phase["seat_pos"] = seat_pos
@@ -530,6 +623,10 @@ def main():
     OUT_JSON.parent.mkdir(parents=True, exist_ok=True)
     with open(OUT_JSON, "w") as f:
         json.dump({
+            "target_nut_id": TARGET_NUT_ID,
+            "target_nut_prim_path": NUT_POLYSHAPE_PATHS[TARGET_NUT_ID],
+            "target_bolt_id": TARGET_BOLT_ID,
+            "target_bolt_prim_path": BOLT_POLYSHAPE_PATHS[TARGET_BOLT_ID],
             "dof_names": dof_names,
             "gripper_dof_indices": gripper_dof_indices,
             "physics_dt": PHYSICS_DT,

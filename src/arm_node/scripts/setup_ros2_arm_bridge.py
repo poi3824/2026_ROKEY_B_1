@@ -29,7 +29,7 @@ import omni.usd
 import omni.kit.app
 import omni.graph.core as og
 
-WORLD_USD = "/home/rokey/EV_combine/src/Collected_World0123/World0123.usd"
+WORLD_USD = "/home/rokey/EV_combine/src/Collected_World_0123/World0123.usd"
 ARTICULATION_ROOT_PATH = "/World/Nova_Carter/chassis_link"
 GRAPH_PATH = "/World/ActionGraph"
 

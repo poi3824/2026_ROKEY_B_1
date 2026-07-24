@@ -10,6 +10,7 @@ SUB /amr/sim_pose  (geometry_msgs/Pose2D)       <- Isaac Sim (위치 상태)
 import math
 
 import rclpy
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
 
@@ -79,11 +80,15 @@ def main(args=None):
     node = AmrNode()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
-        node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            try:
+                node.destroy_node()
+                rclpy.shutdown()
+            except KeyboardInterrupt:
+                pass
 
 
 if __name__ == '__main__':

@@ -7,6 +7,7 @@ SUB /fleet/report   (fms_interfaces/FleetReport)
 import itertools
 
 import rclpy
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 
 from fms_interfaces.msg import FleetJob, FleetReport
@@ -80,11 +81,15 @@ def main(args=None):
     node = FleetManagerNode()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
-        node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            try:
+                node.destroy_node()
+                rclpy.shutdown()
+            except KeyboardInterrupt:
+                pass
 
 
 if __name__ == '__main__':

@@ -8,6 +8,8 @@
   <license>Apache-2.0</license>
 
   <depend>rclpy</depend>
+  <depend>ament_index_python</depend>
+  <depend>action_msgs</depend>
   <depend>fms_interfaces</depend>
   <depend>sensor_msgs</depend>
   <depend>geometry_msgs</depend>
