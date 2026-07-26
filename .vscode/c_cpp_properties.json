@@ -1,0 +1,26 @@
+{
+  "configurations": [
+    {
+      "browse": {
+        "databaseFilename": "${workspaceFolder}/.vscode/browse.vc.db",
+        "limitSymbolsToIncludedHeaders": false
+      },
+      "includePath": [
+        "/home/soo/cobot_ws/install/onrobot_rg_msgs/include/**",
+        "/home/soo/cobot_ws/install/dsr_realtime_control/include/**",
+        "/home/soo/cobot_ws/install/dsr_controller2/include/**",
+        "/home/soo/cobot_ws/install/dsr_msgs2/include/**",
+        "/home/soo/cobot_ws/install/dsr_hardware2/include/**",
+        "/home/soo/cobot_ws/install/dsr_common2/include/**",
+        "/opt/ros/humble/include/**",
+        "/usr/include/**"
+      ],
+      "name": "ros2",
+      "intelliSenseMode": "gcc-x64",
+      "compilerPath": "/usr/bin/gcc",
+      "cStandard": "gnu11",
+      "cppStandard": "c++17"
+    }
+  ],
+  "version": 4
+}
