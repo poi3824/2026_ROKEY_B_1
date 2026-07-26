@@ -6,8 +6,37 @@ import numpy as np
 
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import Image, CameraInfo
+from geometry_msgs.msg import Twist
 from cv_bridge import CvBridge
+from scipy.spatial.transform import Rotation as R
+
+# ──────────────────────────────────────────────────────────────────────────
+# ★ camera_bolt 고정 World Pose (Busbar.usd -> /World/Camera_bolt prim에서 추출) ★
+# 카메라가 로봇/AMR에 붙어있지 않고 /World에 고정 마운트된 탑다운(수직 아래) 카메라라서
+# 실행 중 갱신할 필요 없이 상수로 고정.
+# ──────────────────────────────────────────────────────────────────────────
+CAMERA_BOLT_WORLD_POS = np.array([1.259848, -0.005358, 1.218396])
+CAMERA_BOLT_WORLD_QUAT_WXYZ = np.array([0.7071067811865476, 0.0, 0.0, 0.7071067811865475])
+_CAMERA_BOLT_ROT = R.from_quat([
+    CAMERA_BOLT_WORLD_QUAT_WXYZ[1], CAMERA_BOLT_WORLD_QUAT_WXYZ[2],
+    CAMERA_BOLT_WORLD_QUAT_WXYZ[3], CAMERA_BOLT_WORLD_QUAT_WXYZ[0],
+])
+
+# ROS 카메라 광학 프레임(X:right, Y:down, Z:forward) -> USD 카메라 로컬 프레임(X:right, Y:up, Z:backward)
+_OPTICAL_TO_USD_CAM = np.diag([1.0, -1.0, -1.0])
+
+
+def pixel_depth_to_world(u, v, depth_m, fx, fy, cx, cy):
+    """픽셀 좌표(u,v) + depth(m)를 camera_bolt 고정 pose 기준 world 좌표(m)로 변환.
+    depth_m은 광축(Z) 방향 평면 depth(distance_to_image_plane)라고 가정.
+    """
+    x_opt = (u - cx) * depth_m / fx
+    y_opt = (v - cy) * depth_m / fy
+    z_opt = depth_m
+    p_cam_usd = _OPTICAL_TO_USD_CAM @ np.array([x_opt, y_opt, z_opt])
+    return _CAMERA_BOLT_ROT.apply(p_cam_usd) + CAMERA_BOLT_WORLD_POS
+
 
 class BatteryAssemblyVisionNode(Node):
     def __init__(self):
@@ -26,14 +55,30 @@ class BatteryAssemblyVisionNode(Node):
             10
         )
         self.depth_sub = self.create_subscription(
-            Image, 
-            '/camera_bolt/depth', 
-            self.depth_callback, 
+            Image,
+            '/camera_bolt/depth',
+            self.depth_callback,
+            10
+        )
+        self.caminfo_sub = self.create_subscription(
+            CameraInfo,
+            '/camera_bolt/camera_info',
+            self.caminfo_callback,
             10
         )
 
+        # world 좌표 보정값 퍼블리셔 (linear.xyz: world dx,dy,dz[m], angular.z: dTheta[rad])
+        self.alignment_pub = self.create_publisher(Twist, '/busbar_alignment_error', 10)
+
         # 최신 Depth 프레임 저장 변수
         self.current_depth_frame = None
+        self.current_depth_frame_resized = None  # RGB 해상도에 맞춰 정렬된 depth (world 변환용)
+
+        # 카메라 intrinsics (camera_info 최초 1회 수신 시 캐시, 고정 카메라라 갱신 불필요)
+        self.fx = None
+        self.fy = None
+        self.cx = None
+        self.cy = None
 
         # 비전 처리용 상태 변수
         self.fixed_bolt_coords = []
@@ -56,7 +101,22 @@ class BatteryAssemblyVisionNode(Node):
         self.busbar_missing_count = 0
         self.MAX_MISSING_FRAMES = 5
 
+        # world 좌표 보정값 (m, rad) - 픽셀 hold 값과 별도로 유지
+        self.last_valid_world_dx = 0.0
+        self.last_valid_world_dy = 0.0
+        self.last_valid_world_dz = 0.0
+
         self.get_logger().info("🚀 Depth 시각화 포함 Battery Assembly Vision Node가 시작되었습니다...")
+
+    def caminfo_callback(self, msg):
+        if self.fx is None:
+            self.fx = msg.k[0]
+            self.fy = msg.k[4]
+            self.cx = msg.k[2]
+            self.cy = msg.k[5]
+            self.get_logger().info(
+                f"✅ camera_bolt intrinsics 수신: fx={self.fx:.2f}, fy={self.fy:.2f}, cx={self.cx:.2f}, cy={self.cy:.2f}"
+            )
 
     def depth_callback(self, msg):
         try:
@@ -145,10 +205,34 @@ class BatteryAssemblyVisionNode(Node):
 
                     log_parts.append(f"Hole[{i}]->Bolt[{i}] dx:{dx:+3d}px, dy:{dy:+3d}px, Z:{hole_depth:.2f}")
 
+                    # ── world 좌표 보정값 계산 (intrinsics + depth 확보된 첫 pair만 사용) ──
+                    if i == 0 and self.fx is not None and self.current_depth_frame_resized is not None and hole_depth > 0.0:
+                        bolt_depth = float(self.current_depth_frame_resized[by, bx])
+                        if bolt_depth > 0.0:
+                            bolt_world = pixel_depth_to_world(bx, by, bolt_depth, self.fx, self.fy, self.cx, self.cy)
+                            hole_world = pixel_depth_to_world(hx, hy, hole_depth, self.fx, self.fy, self.cx, self.cy)
+                            world_err = hole_world - bolt_world
+
+                            self.last_valid_world_dx = float(world_err[0])
+                            self.last_valid_world_dy = float(world_err[1])
+                            self.last_valid_world_dz = float(world_err[2])
+
+                            log_parts.append(
+                                f"World dx:{world_err[0]*1000:+.1f}mm dy:{world_err[1]*1000:+.1f}mm dz:{world_err[2]*1000:+.1f}mm"
+                            )
+
                 angle_error = self.battery_angle - self.busbar_angle
                 self.last_valid_dtheta = angle_error
                 log_parts.append(f"dTheta:{angle_error:+.2f}deg")
-                
+
+                if self.fx is not None:
+                    twist = Twist()
+                    twist.linear.x = self.last_valid_world_dx
+                    twist.linear.y = self.last_valid_world_dy
+                    twist.linear.z = self.last_valid_world_dz
+                    twist.angular.z = math.radians(angle_error)
+                    self.alignment_pub.publish(twist)
+
                 status_line = " | ".join(log_parts)
                 sys.stdout.write(f"\r\033[K[Depth Tracking Status] {status_line}")
                 sys.stdout.flush()
@@ -316,6 +400,9 @@ class BatteryAssemblyVisionNode(Node):
             depth_img_resized = cv2.resize(depth_img, (w, h), interpolation=cv2.INTER_NEAREST)
         else:
             depth_img_resized = depth_img
+
+        # RGB 픽셀 좌표계와 정렬된 depth 프레임 (고정 볼트 depth 샘플링에 재사용)
+        self.current_depth_frame_resized = depth_img_resized
 
         # Depth 이미지 정규화 및 가우시안 블러
         depth_norm = cv2.normalize(depth_img_resized, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
