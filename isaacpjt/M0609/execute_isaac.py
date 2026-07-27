@@ -605,7 +605,7 @@ def main():
                     anchor_xy = np.array([anchor_pos.x, anchor_pos.y])
                     bolt_xy = resolve_bolt_target_from_anchor(nut_index, anchor_xy, BATTERY_CENTER_POS[:2])
                     bolt_target_pos = np.array([bolt_xy[0], bolt_xy[1], 0.0])
-                    bolt_touch_pos = np.array([bolt_target_pos[0], bolt_target_pos[1], 0.3695])
+                    bolt_touch_pos = np.array([bolt_target_pos[0]+0.007, bolt_target_pos[1]+0.02, 0.3695])
                     phase = "MOVE_TO_BOLT_NUT"
                     step_count = 0
                     print(f"\n>>> [{task}] 너트 {nut_index}번 -> 볼트 {nut_index}번 체결 시작 [카메라 실측] "
@@ -619,7 +619,7 @@ def main():
                     )
                     bolt_target_pos = compute_bolt_target_pos(nut_index, battery_center_ref)
                     bolt_touch_pos = np.array([
-                        bolt_target_pos[0], bolt_target_pos[1],
+                        bolt_target_pos[0]+0.007, bolt_target_pos[1]+0.02,
                         0.3695
                     ])
                     phase = "MOVE_TO_BOLT_NUT"
