@@ -881,6 +881,12 @@ def main():
             # [11단계] 너트 상공 접근
             elif phase == "NUT_APPROACH":
                 publish_progress("NUT_APPROACH", 20.0)
+                # ★ 그리퍼 장착 카메라(eye-in-hand) 대응: 팔이 움직이면서 시점이 계속
+                # 바뀌므로, arm_node가 재발행하는 최신 비전 좌표(XY)로 매 스텝 목표를
+                # 갱신한다. Z는 이 단계 고정값(NUT_APPROACH_Z) 그대로 유지.
+                if isaac_node.latest_target_pose is not None:
+                    vpos = isaac_node.latest_target_pose.pose.position
+                    nut_approach_pos = np.array([vpos.x, vpos.y, NUT_APPROACH_Z])
                 actions = arm_controller.forward(target_end_effector_position=nut_approach_pos, target_end_effector_orientation=quat_nut)
                 robot.apply_action(actions)
                 robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_OPEN))
@@ -897,6 +903,11 @@ def main():
             # [12단계] 너트 파지점 하강
             elif phase == "NUT_DESCEND":
                 publish_progress("NUT_DESCEND", 40.0)
+                # ★ NUT_APPROACH와 동일한 이유로 하강 중에도 XY를 매 스텝 갱신
+                # (Z는 이 단계 고정값 NUT_PICK_Z 그대로 유지).
+                if isaac_node.latest_target_pose is not None:
+                    vpos = isaac_node.latest_target_pose.pose.position
+                    nut_pick_pos = np.array([vpos.x, vpos.y, NUT_PICK_Z])
                 actions = arm_controller.forward(target_end_effector_position=nut_pick_pos, target_end_effector_orientation=quat_nut)
                 robot.apply_action(actions)
                 robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_OPEN))

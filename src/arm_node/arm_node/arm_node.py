@@ -428,7 +428,9 @@ class ArmNode(Node):
             cmd_msg.data = task_type
             self.pub_task_command.publish(cmd_msg)
 
-            success = self.wait_for_isaac_completion(goal_handle, feedback_msg)
+            # ★ 그리퍼 장착 카메라라 팔이 내려가는 동안 계속 재검출이 필요 -
+            # 대기하는 동안 최신 /vision/nut_pose를 계속 /target_pose로 재발행한다.
+            success = self.wait_for_isaac_completion(goal_handle, feedback_msg, track_vision_label="nut")
 
             if success:
                 result_msg.success = True
@@ -477,12 +479,23 @@ class ArmNode(Node):
             goal_handle.abort()
             return result_msg
 
-    def wait_for_isaac_completion(self, goal_handle, feedback_msg, timeout_sec: float = 30.0) -> bool:
+    def wait_for_isaac_completion(self, goal_handle, feedback_msg, timeout_sec: float = 30.0,
+                                   track_vision_label: str = None) -> bool:
+        """track_vision_label(예: "nut")을 주면, 대기하는 동안 계속 갱신되는 최신 비전
+        검출값(latest_nut_pose 등)을 매 폴링 주기(0.1s)마다 /target_pose로 재발행한다.
+        그리퍼 장착 카메라(eye-in-hand)처럼 팔이 움직이면서 시점이 계속 바뀌는 대상은
+        스캔 시점의 스냅샷 좌표 하나로는 하강 중 오차가 누적되기 때문 - Isaac Sim
+        쪽(execute_isaac.py)이 매 스텝 latest_target_pose를 다시 읽어 목표를 갱신한다.
+        고정 카메라 대상 태스크는 기본값(None)으로 두면 기존과 동일하게 동작한다.
+        """
         start_time = time.time()
         while rclpy.ok():
             feedback_msg.sub_phase = self.isaac_phase
             feedback_msg.progress_pct = float(self.isaac_progress)
             goal_handle.publish_feedback(feedback_msg)
+
+            if track_vision_label == "nut" and self.latest_nut_pose is not None:
+                self.pub_target_pose.publish(self.latest_nut_pose)
 
             if self.isaac_status is not None:
                 if self.isaac_status == "SUCCESS":
