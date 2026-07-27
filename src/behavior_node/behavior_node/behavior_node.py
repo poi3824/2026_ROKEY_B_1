@@ -16,10 +16,10 @@ class ProcessState(Enum):
     MOVE_BATTERY_CENTER = auto()    # 배터리 중점 상공으로 이동
     FINE_ALIGNMENT = auto()         # 비전 기반 1픽셀 미세 오차 보정
     ASSEMBLE_BUSBAR = auto()        # 버스바 체결 (하강 및 그리퍼 해제) - 추가됨
-    SCAN_NUT1 = auto()              # 너트 스캔 위치 이동 및 너트 1번 스캔 (신규)
+    # ★ 너트는 공급대 고정좌표를 쓰므로(assembly_nut_fraction1.py와 동일 방식) 스캔
+    # 단계 없이 바로 파지한다 - SCAN_NUT1/SCAN_NUT2는 더 이상 없음.
     PICK_NUT1 = auto()              # 너트 1번 물리 파지 (신규)
     ASSEMBLE_NUT1 = auto()          # 볼트 1번 위치로 이동 및 너트 1번 체결 (신규)
-    SCAN_NUT2 = auto()              # 너트 스캔 위치 재이동 및 너트 2번 스캔 (신규)
     PICK_NUT2 = auto()              # 너트 2번 물리 파지 (신규)
     ASSEMBLE_NUT2 = auto()          # 볼트 2번 위치로 이동 및 너트 2번 체결 (신규)
     SUCCESS = auto()                # 성공
@@ -106,52 +106,36 @@ class BehaviorNode(Node):
             self.get_logger().info("\n>>> [STEP 5] 버스바 체결 및 하강 (ASSEMBLE_BUSBAR) 요청")
             self.send_arm_goal(
                 task_type="ASSEMBLE_BUSBAR",
-                next_state=ProcessState.SCAN_NUT1
-            )
-
-        # [STEP 6] 너트 스캔 위치 이동 및 너트 1번 스캔 (신규)
-        elif self.state == ProcessState.SCAN_NUT1:
-            self.get_logger().info("\n>>> [STEP 6] 너트 스캔 위치 이동 및 너트 1번 스캔 (SCAN_NUT1) 요청")
-            self.send_arm_goal(
-                task_type="SCAN_NUT1",
                 next_state=ProcessState.PICK_NUT1
             )
 
-        # [STEP 7] 너트 1번 물리 파지 (신규)
+        # [STEP 6] 너트 1번 물리 파지 (공급대 고정좌표로 바로 접근/하강/파지)
         elif self.state == ProcessState.PICK_NUT1:
-            self.get_logger().info("\n>>> [STEP 7] 너트 1번 파지 (PICK_NUT1) 요청")
+            self.get_logger().info("\n>>> [STEP 6] 너트 1번 파지 (PICK_NUT1) 요청")
             self.send_arm_goal(
                 task_type="PICK_NUT1",
                 next_state=ProcessState.ASSEMBLE_NUT1
             )
 
-        # [STEP 8] 볼트 1번 위치로 이동 및 너트 1번 체결 (신규)
+        # [STEP 7] 볼트 1번 위치로 이동 및 너트 1번 체결 (신규)
         elif self.state == ProcessState.ASSEMBLE_NUT1:
-            self.get_logger().info("\n>>> [STEP 8] 볼트 1번 위치 이동 및 너트 1번 체결 (ASSEMBLE_NUT1) 요청")
+            self.get_logger().info("\n>>> [STEP 7] 볼트 1번 위치 이동 및 너트 1번 체결 (ASSEMBLE_NUT1) 요청")
             self.send_arm_goal(
                 task_type="ASSEMBLE_NUT1",
-                next_state=ProcessState.SCAN_NUT2
-            )
-
-        # [STEP 9] 너트 스캔 위치 재이동 및 너트 2번 스캔 (신규)
-        elif self.state == ProcessState.SCAN_NUT2:
-            self.get_logger().info("\n>>> [STEP 9] 너트 스캔 위치 재이동 및 너트 2번 스캔 (SCAN_NUT2) 요청")
-            self.send_arm_goal(
-                task_type="SCAN_NUT2",
                 next_state=ProcessState.PICK_NUT2
             )
 
-        # [STEP 10] 너트 2번 물리 파지 (신규)
+        # [STEP 8] 너트 2번 물리 파지 (공급대 고정좌표로 바로 접근/하강/파지)
         elif self.state == ProcessState.PICK_NUT2:
-            self.get_logger().info("\n>>> [STEP 10] 너트 2번 파지 (PICK_NUT2) 요청")
+            self.get_logger().info("\n>>> [STEP 8] 너트 2번 파지 (PICK_NUT2) 요청")
             self.send_arm_goal(
                 task_type="PICK_NUT2",
                 next_state=ProcessState.ASSEMBLE_NUT2
             )
 
-        # [STEP 11] 볼트 2번 위치로 이동 및 너트 2번 체결 (신규)
+        # [STEP 9] 볼트 2번 위치로 이동 및 너트 2번 체결 (신규)
         elif self.state == ProcessState.ASSEMBLE_NUT2:
-            self.get_logger().info("\n>>> [STEP 11] 볼트 2번 위치 이동 및 너트 2번 체결 (ASSEMBLE_NUT2) 요청")
+            self.get_logger().info("\n>>> [STEP 9] 볼트 2번 위치 이동 및 너트 2번 체결 (ASSEMBLE_NUT2) 요청")
             self.send_arm_goal(
                 task_type="ASSEMBLE_NUT2",
                 next_state=ProcessState.SUCCESS
