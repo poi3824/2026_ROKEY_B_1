@@ -36,10 +36,17 @@ class BehaviorNode(Node):
         # Arm Node 액션 클라이언트 생성
         self._action_client = ActionClient(self, ExecuteArmTask, '/execute_arm_task')
 
-        # FSM 상태 변수 
+        # FSM 상태 변수
         self.state = ProcessState.IDLE
         self.is_waiting_action = False
         self.next_state_on_success = ProcessState.IDLE
+
+        # ★ FINE_ALIGNMENT 실패 시 재시도 카운터 - 비전 정렬이 순간적으로 실패해도
+        # 바로 전체 공정을 FAILURE로 끝내지 않고 최대 2회까지 재시도한다.
+        # execute_isaac.py는 FINE_ALIGNMENT 명령이 다시 오면 언제든 깔끔하게
+        # 재시작하므로(phase 강제 리셋) 그냥 goal을 다시 보내기만 하면 된다.
+        self.FINE_ALIGNMENT_MAX_RETRIES = 2
+        self.fine_alignment_retry_count = 0
 
         # 메인 FSM 루프 실행 (10Hz)
         self.create_timer(0.1, self.fsm_loop)
@@ -54,6 +61,7 @@ class BehaviorNode(Node):
         if not self.has_started:
             self.has_started = True
             self.get_logger().info("\n[Behavior] 전체 공정 시퀀스를 시작합니다. (스캔 지점 이동 시작)")
+            self.fine_alignment_retry_count = 0
             self.state = ProcessState.SCAN_BATTERY
 
     def fsm_loop(self):
@@ -220,12 +228,23 @@ class BehaviorNode(Node):
 
         if result.success:
             self.get_logger().info(f" -> [{self.state.name}] 작업 성공 완료!")
+            if self.state == ProcessState.FINE_ALIGNMENT:
+                self.fine_alignment_retry_count = 0
             self.state = self.next_state_on_success
         else:
             self.get_logger().error(f" -> [{self.state.name}] 작업 실패!")
             self.get_logger().error(f"    [Error Code] : {result.error_code}")
             self.get_logger().error(f"    [Error Message]: {result.message}")
-            self.state = ProcessState.FAILURE
+
+            if (self.state == ProcessState.FINE_ALIGNMENT
+                    and self.fine_alignment_retry_count < self.FINE_ALIGNMENT_MAX_RETRIES):
+                self.fine_alignment_retry_count += 1
+                self.get_logger().warn(
+                    f" -> [FINE_ALIGNMENT] 재시도 {self.fine_alignment_retry_count}/{self.FINE_ALIGNMENT_MAX_RETRIES}"
+                )
+                self.state = ProcessState.FINE_ALIGNMENT  # fsm_loop가 다시 goal을 보냄
+            else:
+                self.state = ProcessState.FAILURE
 
 
 def main(args=None):
