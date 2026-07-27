@@ -40,7 +40,7 @@ sys.stdout.reconfigure(line_buffering=True)
 
 # 2. USD 및 Isaac Core Imports
 import omni.usd
-from pxr import Usd, UsdGeom, UsdPhysics, Gf
+from pxr import Usd, UsdGeom, UsdPhysics, Gf, Sdf
 from isaacsim.core.api import World
 from isaacsim.core.prims import SingleXFormPrim
 from isaacsim.robot.manipulators.grippers import ParallelGripper
@@ -66,6 +66,9 @@ USD_PATH = "/home/rokey/junhyeok_version/isaacpjt/M0609/Collected_Busbar_AMR/Bus
 NOVA_CARTER_ROOT = "/World/Nova_Carter/chassis_link"
 M0609_PATH       = "/World/m0609"
 EE_LINK_NAME     = "link_6"
+BOLT_CAMERA_PATH = "/World/Camera_bolt"  # 볼트쌍 인식용 고정 카메라 - 스테이션마다 위치가
+                                          # 달라서 작업 중인 스테이션의 2번 볼트 좌표로
+                                          # 옮겨줘야 한다
 GRIPPER_JOINTS   = ["finger_joint", "right_inner_knuckle_joint"]
 GRIPPER_ROOT_PATH = f"{M0609_PATH}/onrobot_rg2ft"
 
@@ -84,21 +87,23 @@ BUSBAR_ROOT_PATH      = "/World/Z_busbar3"
 BUSBAR_POLYSHAPE_PATH = "/World/Z_busbar3/Mesh"
 
 # 너트 Prim 경로 (체결에 실제로 쓰이는 건 nut1/nut2뿐이지만, 씬에는 여분 너트
-# nut1_01, nut2_01/02/03도 있고 이것들도 전부 AMR에 실린 부품 트레이 위 물체라
-# 이동 시 같이 옮겨줘야 한다)
+# nut3~nut6도 있고 이것들도 전부 AMR에 실린 부품 트레이 위 물체라 이동 시 같이
+# 옮겨줘야 한다). 예전엔 nut1_01/nut2_01/02/03이라는 이름이었는데 씬에서 nut3~nut6로
+# 순차 개명됨.
 NUT1_ROOT_PATH      = "/World/nut1"
 NUT2_ROOT_PATH      = "/World/nut2"
 NUT1_POLYSHAPE_PATH = "/World/nut1/geo/PolyShape"
 NUT2_POLYSHAPE_PATH = "/World/nut2/geo/PolyShape"
-EXTRA_NUT_ROOT_PATHS = ["/World/nut1_01", "/World/nut2_01", "/World/nut2_02", "/World/nut2_03"]
+EXTRA_NUT_ROOT_PATHS = ["/World/nut3", "/World/nut4", "/World/nut5", "/World/nut6"]
 EXTRA_NUT_POLYSHAPE_PATHS = [f"{p}/geo/PolyShape" for p in EXTRA_NUT_ROOT_PATHS]
 
 # 그리퍼 파라미터
 GRIPPER_OPEN      = np.array([0.0, 0.0])
 GRIPPER_CLOSE     = np.array([0.85, 0.85])
-GRIPPER_CLOSE_NUT = np.array([0.96, 0.96])
+GRIPPER_CLOSE_NUT = np.array([0.98, 0.98])
 GRIPPER_DELTA     = np.array([-0.5, -0.5])
 GRIP_CLOSE_RAMP_STEPS = 50
+NUT_GRIP_RELEASE_STEPS = 15  # FixedJoint 해제 후 손가락을 완전히 닫고 안정화하는 틱 수
 GRIP_SETTLE_STEPS = 15  # 손가락이 다 닫힌 뒤 FixedJoint를 만들기 전 안정화 대기 틱 수
 
 # Kinematic Pose-Glue 파라미터
@@ -149,12 +154,45 @@ NUT_HEIGHT         = 0.0095
 NUT_GRASP_Z_LOCAL  = NUT_HEIGHT + 0.023
 NUT_SUPPLY_TABLE_Z = 0.72                                   # 너트 공급대 높이
 NUT_PICK_Z         = NUT_SUPPLY_TABLE_Z - (NUT_GRASP_Z_LOCAL - 0.0395)
-NUT_APPROACH_Z     = 0.8                                     # 너트 파지 상공 고도
+NUT_APPROACH_Z     = 0.9                                     # 너트 파지 상공 고도 - 볼트 펙 위로
+                                                              # 완전히 빠져나올 여유를 더 주기 위해
+                                                              # 0.8->0.9로 올림(실측: 0.8은 부족해서
+                                                              # 들어올리다 펙에 걸려 놓쳤음)
 BOLT_APPROACH_Z    = 0.6                                     # 너트 체결 상공 고도
 
-# ★ 볼트 1/2번 실측 월드 좌표 (test_isaac 씬 고정 배치 기준) ★
-BOLT1_WORLD_POS = np.array([1.0552, 0.3722])
-BOLT2_WORLD_POS = np.array([1.2636, 0.0098])
+# ★ 스테이션별 볼트 1/2번 실측 월드 좌표 (test_isaac 씬 고정 배치 기준) ★
+# 딕셔너리 키(1,2)는 "이번 스테이션의 몇 번째 볼트인가"이지, 트레이의 물리적 nut_index가
+# 아니다(그건 STATION_NUT_INDICES가 따로 정한다).
+STATION_BOLT_WORLD_POS = {
+    3: {1: np.array([1.0552, 0.3722]), 2: np.array([1.2636, 0.0098])},
+    4: {1: np.array([1.0552, -0.2047]), 2: np.array([1.2636, -0.5671])},
+    5: {1: np.array([1.0552, -0.2047]), 2: np.array([1.2636, -1.0936])},
+}
+
+# 스테이션별로 6슬롯 너트 트레이 중 어느 물리적 너트(1~6)를 쓸지 - 배터리팩4는 3,4번,
+# 배터리팩5는 5,6번 너트를 쓴다.
+STATION_NUT_INDICES = {
+    3: (1, 2),
+    4: (3, 4),
+    5: (5, 6),
+}
+
+# 스테이션 4/5는 버스바 스캔 위치도 실측 절대좌표로 고정 (station 3은 기존처럼 현재
+# EE 위치 기준 상대 오프셋 계산을 그대로 쓴다).
+STATION_BUSBAR_SCAN_XY = {
+    4: np.array([-0.2271, 1.8945]),
+    5: np.array([-0.9586, 1.8945]),
+}
+
+# behavior_node.py의 AMR_STATION_POSES와 동일한 좌표 - /amr/goal_pose로 어느 스테이션에
+# 와있는지 자동 판별하는 데 쓴다(battery/busbar 두 지점 다 등록해서 어느 태스크
+# 시점이든 매칭되게 함).
+_Y_BUSBAR = (1.2392 + 1.205 + 1.2367) / 3.0
+STATION_AMR_POINTS = {
+    3: [(0.6667, -0.0382), (0.5867, 1.9078)],
+    4: [(0.6667, -0.6617), (-0.6606, _Y_BUSBAR)],
+    5: [(0.6667, -1.1964), (-1.1298, _Y_BUSBAR)],
+}
 
 # 너트 체결(Screwing) 파라미터
 ENGAGE_LEN           = 0.0125     # 체결 깊이 (12.5mm)
@@ -277,46 +315,115 @@ def enable_physics_recursively(stage, prim_path):
 NUT_AMR_JOINT_NAME = "PhysicsFixedJoint_AMR"
 
 
-def attach_nut_to_amr(stage, nut_root_path, nut_rigidbody_path, amr_link_path, joint_name=NUT_AMR_JOINT_NAME):
+def _quat_mul(q1, q2):
+    w1, x1, y1, z1 = q1
+    w2, x2, y2, z2 = q2
+    return np.array([
+        w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+        w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+        w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+        w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+    ])
+
+
+def _quat_conj(q):
+    w, x, y, z = q
+    return np.array([w, -x, -y, -z])
+
+
+def _quat_rotate_vec(q, v):
+    qv = np.array([0.0, v[0], v[1], v[2]])
+    return _quat_mul(_quat_mul(q, qv), _quat_conj(q))[1:]
+
+
+def find_rigidbody_ancestor(stage, start_path):
+    """start_path부터 위로 올라가며 실제 UsdPhysics.RigidBodyAPI가 적용된 조상 프림을 찾는다."""
+    prim = stage.GetPrimAtPath(start_path)
+    while prim.IsValid():
+        if prim.HasAPI(UsdPhysics.RigidBodyAPI):
+            return str(prim.GetPath())
+        if prim.GetPath() == Sdf.Path.absoluteRootPath:
+            break
+        prim = prim.GetParent()
+    return None
+
+
+def remove_nut_amr_joint(stage, nut_root_path, joint_name=NUT_AMR_JOINT_NAME):
+    """attach_nut_to_amr이 만든 조인트를 완전히 지운다 (비활성화만으로는 부족 - 남은 조인트
+    프림이 옛 상대위치를 들고 있다가 다음 attach 때 재사용되면 두 프레임이 어긋난다)."""
+    joint_path = f"{nut_root_path}/{joint_name}"
+    joint_prim = stage.GetPrimAtPath(joint_path)
+    if joint_prim.IsValid():
+        UsdPhysics.FixedJoint(joint_prim).GetJointEnabledAttr().Set(False)
+        stage.RemovePrim(joint_path)
+
+
+def attach_nut_to_amr(stage, nut_root_path, nut_rigidbody_path, amr_link_path, nut_xform, robot, joint_name=NUT_AMR_JOINT_NAME):
     """너트를 현재 위치 그대로 AMR 링크에 물리 FixedJoint로 고정한다 (순간이동 없이 그 자리에서 부착).
-    이미 만들어둔 조인트가 있으면 현재 상대위치로 갱신하고 다시 활성화한다 - 그 자리가 어디든
-    호출 시점 기준으로 새로 붙기 때문에, 그리퍼로 옮겨놓은 뒤에도 다시 이 함수를 부르면 재부착(재조인트)된다."""
+
+    "PhysicsUSD: CreateJoint - found a joint with disjointed body transforms" 경고가 계속
+    재현된 진짜 이유: 기존 조인트를 비활성화만 하고 지우지는 않은 채 재사용하고 있었다 -
+    너트 위치를 set_world_pose로 새로 옮긴 뒤에도 조인트 프림엔 예전 상대위치가 그대로
+    남아있어서 두 프레임이 어긋난 상태로 다시 활성화됐다(실측 지적 확인됨). 그래서 매번
+    완전히 지우고 새로 만든다. 추가로 두 프레임이 월드에서 실제로 일치하는지 계산해서
+    1mm 넘게 어긋나면 조인트 자체를 만들지 않고 에러를 낸다."""
     amr_prim = stage.GetPrimAtPath(amr_link_path)
     nut_prim = stage.GetPrimAtPath(nut_rigidbody_path)
     if not amr_prim.IsValid() or not nut_prim.IsValid():
         return None
 
-    joint_path = f"{nut_root_path}/{joint_name}"
-    joint_prim = stage.GetPrimAtPath(joint_path)
-    joint = UsdPhysics.FixedJoint(joint_prim) if joint_prim.IsValid() else UsdPhysics.FixedJoint.Define(stage, joint_path)
+    remove_nut_amr_joint(stage, nut_root_path, joint_name)
 
+    amr_pos, amr_quat = robot.get_world_pose()
+    amr_pos = np.asarray(amr_pos, dtype=float)
+    amr_quat = np.asarray(amr_quat, dtype=float)
+
+    nut_pos, nut_quat = nut_xform.get_world_pose()
+    nut_pos = np.asarray(nut_pos, dtype=float)
+    nut_quat = np.asarray(nut_quat, dtype=float)
+
+    amr_quat_conj = _quat_conj(amr_quat)
+    rel_pos = _quat_rotate_vec(amr_quat_conj, nut_pos - amr_pos)
+    rel_quat = _quat_mul(amr_quat_conj, nut_quat)
+
+    # 검증: local0을 다시 world로 복원했을 때 실제 너트 위치와 일치하는지 확인.
+    frame0_world_pos = amr_pos + _quat_rotate_vec(amr_quat, rel_pos)
+    frame_error = float(np.linalg.norm(frame0_world_pos - nut_pos))
+    joint_path = f"{nut_root_path}/{joint_name}"
+    if frame_error > 0.001:
+        print(f"[ERROR] {joint_path} FixedJoint frame 불일치 {frame_error*1000:.2f}mm -> 생성 취소")
+        return None
+
+    joint = UsdPhysics.FixedJoint.Define(stage, joint_path)
+    joint.CreateJointEnabledAttr(False)
     joint.CreateBody0Rel().SetTargets([amr_link_path])
     joint.CreateBody1Rel().SetTargets([nut_rigidbody_path])
-
-    # body0(AMR) 기준 상대 위치/자세를 계산해서 조인트 프레임으로 그대로 굳힌다.
-    amr_xf = UsdGeom.Xformable(amr_prim).ComputeLocalToWorldTransform(0)
-    nut_xf = UsdGeom.Xformable(nut_prim).ComputeLocalToWorldTransform(0)
-    rel_xf = nut_xf * amr_xf.GetInverse()
-    rel_pos = rel_xf.ExtractTranslation()
-    rel_quat = rel_xf.ExtractRotationQuat()
-
-    joint.CreateLocalPos0Attr().Set(Gf.Vec3f(rel_pos))
-    joint.CreateLocalRot0Attr().Set(Gf.Quatf(float(rel_quat.GetReal()), Gf.Vec3f(*[float(v) for v in rel_quat.GetImaginary()])))
+    joint.CreateLocalPos0Attr().Set(Gf.Vec3f(*[float(v) for v in rel_pos]))
+    joint.CreateLocalRot0Attr().Set(Gf.Quatf(float(rel_quat[0]), Gf.Vec3f(*[float(v) for v in rel_quat[1:]])))
     joint.CreateLocalPos1Attr().Set(Gf.Vec3f(0.0, 0.0, 0.0))
     joint.CreateLocalRot1Attr().Set(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
-    joint.CreateJointEnabledAttr().Set(True)
+    joint.GetJointEnabledAttr().Set(True)
+    print(f"[NUT JOINT ATTACH] {joint_path} frame_error={frame_error*1000:.3f}mm")
     return joint
 
 
 def detach_nut_from_amr(stage, nut_root_path, joint_name=NUT_AMR_JOINT_NAME):
     """attach_nut_to_amr으로 만든 조인트를 비활성화해서 너트를 AMR에서 풀어준다 - 그리퍼가
     물리적으로 붙잡아 들어올리기 직전(NUT_GRASP 완료 시점)에 호출한다."""
-    joint_prim = stage.GetPrimAtPath(f"{nut_root_path}/{joint_name}")
-    if joint_prim.IsValid():
-        UsdPhysics.FixedJoint(joint_prim).GetJointEnabledAttr().Set(False)
+    joint_path = f"{nut_root_path}/{joint_name}"
+    joint_prim = stage.GetPrimAtPath(joint_path)
+    if not joint_prim.IsValid():
+        print(f"[WARN] {joint_path} 조인트가 없습니다 (이미 해제됐거나 생성된 적 없음)")
+        return False
+    enabled_attr = UsdPhysics.FixedJoint(joint_prim).GetJointEnabledAttr()
+    if enabled_attr:
+        enabled_attr.Set(False)
+    print(f"[NUT JOINT DETACH] {joint_path}")
+    return True
 
 
 BUSBAR_GRIP_JOINT_NAME = "PhysicsFixedJoint_Gripper"
+NUT_GRIP_JOINT_NAME = "PhysicsFixedJoint_Gripper"
 
 
 def _quat_mul(q1, q2):
@@ -390,11 +497,65 @@ def detach_busbar_from_gripper(stage):
         UsdPhysics.FixedJoint(joint_prim).GetJointEnabledAttr().Set(False)
 
 
+def attach_nut_to_gripper(stage, nut_polyshape_path, gripper_link_path, robot, nut_xform):
+    """너트를 그리퍼(EE 링크)에 FixedJoint로 고정한다 - attach_busbar_to_gripper와 완전히
+    동일한 방식. 너트는 AMR에서 떼어낸 뒤 마찰(stiffen_gripper_grip)만으로 들고 있었는데,
+    볼트 펙에서 빼내는 데 필요한 힘을 마찰만으로는 못 이겨서 계속 놓쳤다(실측 확인됨) -
+    버스바처럼 실제 물리 조인트로 완전히 고정해야 한다. 트레이(tray)에서 들어올려 볼트
+    상공까지 옮기는 구간에서만 쓰고, 착좌/체결(Screwing, 재파지 반복)이 시작되기 전에는
+    반드시 detach_nut_from_gripper로 풀어줘야 한다 - 안 그러면 재파지를 위해 그리퍼를
+    벌려도 조인트가 계속 붙잡고 있어서 너트가 안 놓인다."""
+    gripper_prim = stage.GetPrimAtPath(gripper_link_path)
+    nut_prim = stage.GetPrimAtPath(nut_polyshape_path)
+    if not gripper_prim.IsValid() or not nut_prim.IsValid():
+        return None
+
+    ee_pos, ee_quat = robot.end_effector.get_world_pose()
+    real_pos, real_quat = nut_xform.get_world_pose()
+    ee_pos = np.asarray(ee_pos, dtype=float)
+    ee_quat = np.asarray(ee_quat, dtype=float)
+    real_pos = np.asarray(real_pos, dtype=float)
+    real_quat = np.asarray(real_quat, dtype=float)
+
+    ee_quat_conj = _quat_conj(ee_quat)
+    rel_pos = _quat_rotate_vec(ee_quat_conj, real_pos - ee_pos)
+    rel_quat = _quat_mul(ee_quat_conj, real_quat)
+
+    joint_path = f"{nut_polyshape_path}/{NUT_GRIP_JOINT_NAME}"
+    joint_prim = stage.GetPrimAtPath(joint_path)
+    if joint_prim.IsValid():
+        stage.RemovePrim(joint_path)
+    joint = UsdPhysics.FixedJoint.Define(stage, joint_path)
+
+    joint.CreateBody0Rel().SetTargets([gripper_link_path])
+    joint.CreateBody1Rel().SetTargets([nut_polyshape_path])
+
+    joint.CreateLocalPos0Attr().Set(Gf.Vec3f(*[float(v) for v in rel_pos]))
+    joint.CreateLocalRot0Attr().Set(Gf.Quatf(float(rel_quat[0]), Gf.Vec3f(*[float(v) for v in rel_quat[1:]])))
+    joint.CreateLocalPos1Attr().Set(Gf.Vec3f(0.0, 0.0, 0.0))
+    joint.CreateLocalRot1Attr().Set(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
+    joint.CreateJointEnabledAttr().Set(True)
+
+    print(f"[NUT GRIP ATTACH] {joint_path}")
+    return joint
+
+
+def detach_nut_from_gripper(stage, nut_polyshape_path):
+    joint_prim = stage.GetPrimAtPath(f"{nut_polyshape_path}/{NUT_GRIP_JOINT_NAME}")
+    if joint_prim.IsValid():
+        UsdPhysics.FixedJoint(joint_prim).GetJointEnabledAttr().Set(False)
+        print(f"[NUT GRIP DETACH] {nut_polyshape_path}/{NUT_GRIP_JOINT_NAME}")
+
+
 def nut_paths_for_index(nut_index):
-    """nut_index(1 또는 2)에 따라 (root_path, rigidbody_path) 반환"""
+    """nut_index(1~6)에 따라 (root_path, polyshape_path) 반환. 3~6번은 EXTRA_NUT_*
+    (스테이션4=3,4번 / 스테이션5=5,6번 너트) 목록에서 가져온다."""
     if nut_index == 1:
         return NUT1_ROOT_PATH, NUT1_POLYSHAPE_PATH
-    return NUT2_ROOT_PATH, NUT2_POLYSHAPE_PATH
+    if nut_index == 2:
+        return NUT2_ROOT_PATH, NUT2_POLYSHAPE_PATH
+    idx = nut_index - 3
+    return EXTRA_NUT_ROOT_PATHS[idx], EXTRA_NUT_POLYSHAPE_PATHS[idx]
 
 
 def world_xf(stage, path):
@@ -537,6 +698,22 @@ def quat_wxyz_to_yaw(quat_wxyz):
     return math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
 
 
+def resolve_station_from_amr_xy(x, y, tolerance=0.3):
+    """AMR 목표좌표(x,y)를 STATION_AMR_POINTS와 비교해 가장 가까운 스테이션 번호를 찾는다.
+    behavior_node.py가 station_id 문자열을 execute_isaac.py에 직접 전달하는 경로가 없어서,
+    대신 이미 받고 있는 /amr/goal_pose로 역추정한다. tolerance(m) 밖이면 매칭 실패로 본다."""
+    best_station, best_dist = None, None
+    for station, points in STATION_AMR_POINTS.items():
+        for px, py in points:
+            d = math.hypot(x - px, y - py)
+            if best_dist is None or d < best_dist:
+                best_dist = d
+                best_station = station
+    if best_dist is not None and best_dist <= tolerance:
+        return best_station
+    return None
+
+
 def yaw_rotated_quat(base_wxyz, delta_deg):
     """base_wxyz 오리엔테이션을 월드 Z축 기준으로 delta_deg 만큼 추가 회전시킨 쿼터니언 반환 (Screwing 회전용)"""
     base_q = Gf.Quatd(float(base_wxyz[0]), Gf.Vec3d(float(base_wxyz[1]), float(base_wxyz[2]), float(base_wxyz[3])))
@@ -547,11 +724,19 @@ def yaw_rotated_quat(base_wxyz, delta_deg):
     return np.array([q.GetReal(), *q.GetImaginary()])
 
 
-def resolve_nut_assets(nut_index, nut1_xform, nut2_xform):
-    """nut_index(1 또는 2)에 따라 대상 너트 Xform과 라벨을 반환"""
+def resolve_nut_assets(nut_index, nut1_xform, nut2_xform, extra_nut_xforms=None):
+    """nut_index(1~6)에 따라 대상 너트 Xform과 라벨을 반환. 3~6번은 extra_nut_xforms
+    (EXTRA_NUT_ROOT_PATHS와 같은 순서) 목록에서 가져온다 - 안 넘겨주면 라벨만 반환."""
     if nut_index == 1:
         return nut1_xform, "너트 1번"
-    return nut2_xform, "너트 2번"
+    if nut_index == 2:
+        return nut2_xform, "너트 2번"
+    xform = None
+    if extra_nut_xforms is not None:
+        idx = nut_index - 3
+        if 0 <= idx < len(extra_nut_xforms):
+            xform = extra_nut_xforms[idx]
+    return xform, f"너트 {nut_index}번"
 
 
 def update_target_positions(target_pose_msg: PoseStamped):
@@ -599,10 +784,21 @@ def main():
     busbar_xform = SingleXFormPrim(BUSBAR_POLYSHAPE_PATH, name="busbar_poly") if stage.GetPrimAtPath(BUSBAR_POLYSHAPE_PATH).IsValid() else None
     init_busbar_pos, init_busbar_quat = busbar_xform.get_world_pose() if busbar_xform else (None, None)
 
+    bolt_camera_xform = SingleXFormPrim(BOLT_CAMERA_PATH, name="bolt_camera") if stage.GetPrimAtPath(BOLT_CAMERA_PATH).IsValid() else None
+    bolt_camera_init_pos, bolt_camera_init_quat = bolt_camera_xform.get_world_pose() if bolt_camera_xform else (None, None)
+    if bolt_camera_xform is None:
+        print(f"[WARN] bolt_camera 프림을 못 찾았습니다: {BOLT_CAMERA_PATH} - 스테이션 4/5 볼트 인식이 이전 위치를 볼 수 있습니다.")
+
     nut1_xform = SingleXFormPrim(NUT1_POLYSHAPE_PATH, name="nut1_poly") if stage.GetPrimAtPath(NUT1_POLYSHAPE_PATH).IsValid() else None
     nut2_xform = SingleXFormPrim(NUT2_POLYSHAPE_PATH, name="nut2_poly") if stage.GetPrimAtPath(NUT2_POLYSHAPE_PATH).IsValid() else None
     init_nut1_pos, init_nut1_quat = nut1_xform.get_world_pose() if nut1_xform else (None, None)
     init_nut2_pos, init_nut2_quat = nut2_xform.get_world_pose() if nut2_xform else (None, None)
+
+    # 진단용: NUT1/2_POLYSHAPE_PATH에 실제 RigidBodyAPI가 있는지, 아니면 조상 프림에
+    # 있는지 확인 - 다르면 조인트 Body1 대상을 재검토해야 한다.
+    print(f"[PHYSICS BODY] AMR  = {find_rigidbody_ancestor(stage, NOVA_CARTER_ROOT)}")
+    print(f"[PHYSICS BODY] NUT1 = {find_rigidbody_ancestor(stage, NUT1_POLYSHAPE_PATH)} (used: {NUT1_POLYSHAPE_PATH})")
+    print(f"[PHYSICS BODY] NUT2 = {find_rigidbody_ancestor(stage, NUT2_POLYSHAPE_PATH)} (used: {NUT2_POLYSHAPE_PATH})")
 
     # 체결에 직접 쓰이진 않지만 AMR 부품 트레이 위 여분 너트들 - 이동 시 nut1/2와 똑같이 같이 옮겨야 한다.
     extra_nut_xforms = [
@@ -646,13 +842,13 @@ def main():
     # 수동으로 복사할 필요 없이 물리 솔버가 그대로 따라가게 한다 - 픽업 직전에 detach하고,
     # 다시 붙일 일이 있으면 attach_nut_to_amr을 재호출하면 된다).
     if nut1_xform is not None:
-        attach_nut_to_amr(stage, NUT1_ROOT_PATH, NUT1_POLYSHAPE_PATH, NOVA_CARTER_ROOT)
+        attach_nut_to_amr(stage, NUT1_ROOT_PATH, NUT1_POLYSHAPE_PATH, NOVA_CARTER_ROOT, nut1_xform, robot)
     if nut2_xform is not None:
-        attach_nut_to_amr(stage, NUT2_ROOT_PATH, NUT2_POLYSHAPE_PATH, NOVA_CARTER_ROOT)
+        attach_nut_to_amr(stage, NUT2_ROOT_PATH, NUT2_POLYSHAPE_PATH, NOVA_CARTER_ROOT, nut2_xform, robot)
     # 체결에 안 쓰이는 여분 너트 4개도 픽업 대상이 아니므로 detach 없이 계속 붙여둔다.
     for extra_xf, extra_root, extra_poly in zip(extra_nut_xforms, EXTRA_NUT_ROOT_PATHS, EXTRA_NUT_POLYSHAPE_PATHS):
         if extra_xf is not None:
-            attach_nut_to_amr(stage, extra_root, extra_poly, NOVA_CARTER_ROOT)
+            attach_nut_to_amr(stage, extra_root, extra_poly, NOVA_CARTER_ROOT, extra_xf, robot)
 
     quat_busbar = euler_to_quaternion_wxyz(0.0, 3.1415, 1.5708)
     quat_nut = euler_to_quaternion_wxyz(0.0, 3.1415, 0.0)
@@ -687,6 +883,7 @@ def main():
 
     step_count = 0
     grasp_timer = 0
+    nut_release_timer = 0
     was_playing = False
     phase = "IDLE"
     init_pose_only = False  # True면 INIT_POSE 완료 후 SCAN_APPROACH로 안 이어지고 바로 종료
@@ -698,6 +895,8 @@ def main():
     # ── 너트 조립(Nut Assembly) 상태 변수 ──
     nut_index      = 0        # 1: 너트 1번, 2: 너트 2번
     NUT_SCAN_POS   = None     # 너트 스캔 위치 (SCAN_NUT1/2마다 해당 너트 오프셋으로 새로 계산)
+    NUT_SCAN_LIFT_POS = None  # 방향 정렬용 중간 경유 위치 (현재 XY, 스캔 고도)
+    BUSBAR_SCAN_LIFT_POS = None  # 버스바 스캔용 방향 정렬 중간 경유 위치 (현재 XY, 스캔 고도)
     nut_pick_pos   = None     # 현재 너트의 물리 파지 좌표
     nut_approach_pos = None   # 현재 너트 파지 상공 접근 좌표
     bolt_target_pos  = None   # 체결 목표 좌표
@@ -719,6 +918,7 @@ def main():
     amr_moving = False
     amr_target_xy_theta = None
     amr_move_step = 0  # 이번 이동 시작 후 지난 스텝 수 (가속 램프용)
+    current_station = 3  # /amr/goal_pose로 자동 판별, 기본값은 station 3
     wheels_locked = True  # main() 시작 시 lock_amr_base() 이미 호출됨
 
     def publish_status(status_str: str):
@@ -745,24 +945,29 @@ def main():
             world.reset()
             enable_physics_recursively(stage, BUSBAR_ROOT_PATH)
             detach_busbar_from_gripper(stage)
+            detach_nut_from_gripper(stage, NUT1_POLYSHAPE_PATH)
+            detach_nut_from_gripper(stage, NUT2_POLYSHAPE_PATH)
             busbar_grasped = False
+            if bolt_camera_xform and bolt_camera_init_pos is not None:
+                bolt_camera_xform.set_world_pose(position=bolt_camera_init_pos, orientation=bolt_camera_init_quat)
             if busbar_xform and init_busbar_pos is not None:
                 busbar_xform.set_world_pose(position=init_busbar_pos, orientation=init_busbar_quat)
             if nut1_xform and init_nut1_pos is not None:
                 nut1_xform.set_world_pose(position=init_nut1_pos, orientation=init_nut1_quat)
-                attach_nut_to_amr(stage, NUT1_ROOT_PATH, NUT1_POLYSHAPE_PATH, NOVA_CARTER_ROOT)
+                attach_nut_to_amr(stage, NUT1_ROOT_PATH, NUT1_POLYSHAPE_PATH, NOVA_CARTER_ROOT, nut1_xform, robot)
             if nut2_xform and init_nut2_pos is not None:
                 nut2_xform.set_world_pose(position=init_nut2_pos, orientation=init_nut2_quat)
-                attach_nut_to_amr(stage, NUT2_ROOT_PATH, NUT2_POLYSHAPE_PATH, NOVA_CARTER_ROOT)
+                attach_nut_to_amr(stage, NUT2_ROOT_PATH, NUT2_POLYSHAPE_PATH, NOVA_CARTER_ROOT, nut2_xform, robot)
             for extra_xf, (extra_pos, extra_quat), extra_root, extra_poly in zip(
                 extra_nut_xforms, extra_nut_inits, EXTRA_NUT_ROOT_PATHS, EXTRA_NUT_POLYSHAPE_PATHS
             ):
                 if extra_xf and extra_pos is not None:
                     extra_xf.set_world_pose(position=extra_pos, orientation=extra_quat)
-                    attach_nut_to_amr(stage, extra_root, extra_poly, NOVA_CARTER_ROOT)
+                    attach_nut_to_amr(stage, extra_root, extra_poly, NOVA_CARTER_ROOT, extra_xf, robot)
 
             step_count = 0
             grasp_timer = 0
+            nut_release_timer = 0
 
             nut_index = 0
             NUT_SCAN_POS = None
@@ -803,6 +1008,12 @@ def main():
                 if wheels_locked:
                     unlock_amr_base(stage, NOVA_CARTER_ROOT, robot=robot)
                     wheels_locked = False
+                resolved_station = resolve_station_from_amr_xy(g_pos.x, g_pos.y)
+                if resolved_station is not None:
+                    current_station = resolved_station
+                    print(f"[STATION] 목표좌표로 스테이션 {current_station}번 인식")
+                else:
+                    print(f"[WARN] 목표좌표({g_pos.x:.4f},{g_pos.y:.4f})가 알려진 스테이션과 안 맞음 -> current_station={current_station} 유지")
                 print(f"\n>>> [AMR] 이동 목표 수신 (X={g_pos.x:.4f}, Y={g_pos.y:.4f}, "
                       f"Theta={g_theta:.4f}) -> 바퀴 잠금 해제, 이동 시작")
 
@@ -893,6 +1104,26 @@ def main():
                 sync_rmpflow_base_pose()
 
             if task == "SCAN_BATTERY":
+                # 볼트쌍 인식 카메라는 씬에 고정돼 있어서 스테이션마다 다른 볼트 위치를
+                # 못 본다 - 지금 작업 중인 스테이션의 2번 볼트 좌표 위로 옮겨준다(높이/자세는
+                # 원래 값 유지). 이후 Isaac이 SCAN_BATTERY 완료를 보고하면 arm_node가 평소처럼
+                # /perception/get_bolt_pair를 호출해서 이 새 위치 기준으로 볼트쌍을 인식한다.
+                #
+                # 카메라만 옮기는 걸로는 부족하다 - error_fix_node(error_fix.py)는 자기
+                # 프로세스 수명 중 딱 한 번만 고정 볼트를 검출하고(bolts_detected 플래그)
+                # 그 뒤로는 다시 검출을 안 해서, 카메라를 옮겨도 예전 스테이션에서 잡은
+                # 픽셀좌표를 계속 재사용하는 버그가 있었다(실측 확인됨) - 그래서 카메라를
+                # 옮긴 직후 RESET_BOLT_DETECTION 명령으로 강제 재탐색시킨다.
+                if bolt_camera_xform is not None:
+                    bolt2_xy = STATION_BOLT_WORLD_POS.get(current_station, STATION_BOLT_WORLD_POS[3])[2]
+                    bolt_camera_xform.set_world_pose(
+                        position=np.array([bolt2_xy[0], bolt2_xy[1], bolt_camera_init_pos[2]]),
+                        orientation=bolt_camera_init_quat,
+                    )
+                    reset_cmd = String()
+                    reset_cmd.data = "RESET_BOLT_DETECTION"
+                    isaac_node.pub_errorfix_command.publish(reset_cmd)
+                    print(f"[BOLT CAMERA] 스테이션{current_station} 2번 볼트 좌표로 이동: ({bolt2_xy[0]:.4f}, {bolt2_xy[1]:.4f}) -> 재탐색 명령 전송")
                 phase = "INIT_POSE"
                 init_pose_only = False
                 step_count = 0
@@ -908,11 +1139,23 @@ def main():
                 print(f"\n>>> [{task}] 초기 관절 자세 복귀 시작")
 
             elif task == "SCAN_BUSBAR":
+                if current_station in STATION_BUSBAR_SCAN_XY:
+                    # 스테이션 4/5는 실측 절대좌표 고정값을 그대로 쓴다.
+                    sxy = STATION_BUSBAR_SCAN_XY[current_station]
+                    BUSBAR_SCAN_POS = np.array([sxy[0], sxy[1], BUSBAR_SCAN_Z])
+                else:
+                    cur_pos = world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation()
+                    BUSBAR_SCAN_POS = np.array([cur_pos[0] - 0.5, cur_pos[1] + 0.5, BUSBAR_SCAN_Z])
+                # 너트1 때와 같은 문제 - XY 이동과 orientation 변경(quat_busbar)을 동시에
+                # 크게 시키면 RMPFlow가 팔꿈치/손목을 꼬아서 돌아가는 경로를 잡는다(스테이션4
+                # 버스바 스캔에서 실측 확인됨). 제자리에서 방향+고도만 먼저 맞추고
+                # (SCAN_BUSBAR_LIFT), 그 다음 같은 높이/방향을 유지한 채 옆으로만 이동
+                # (SCAN_BUSBAR_APPROACH)시켜서 회전과 이동을 분리한다.
                 cur_pos = world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation()
-                BUSBAR_SCAN_POS = np.array([cur_pos[0] - 0.5, cur_pos[1] + 0.5, BUSBAR_SCAN_Z])
-                phase = "SCAN_BUSBAR_APPROACH"
+                BUSBAR_SCAN_LIFT_POS = np.array([cur_pos[0], cur_pos[1], BUSBAR_SCAN_Z])
+                phase = "SCAN_BUSBAR_LIFT"
                 step_count = 0
-                print(f"\n>>> [{task}] 버스바 스캔 위치 이동 시작 (Target: X={BUSBAR_SCAN_POS[0]:.3f}, Y={BUSBAR_SCAN_POS[1]:.3f}, Z={BUSBAR_SCAN_POS[2]:.3f})")
+                print(f"\n>>> [{task}] 1) 방향 정렬 및 스캔 고도 상승 시작 (스테이션{current_station}, Target: X={BUSBAR_SCAN_LIFT_POS[0]:.3f}, Y={BUSBAR_SCAN_LIFT_POS[1]:.3f}, Z={BUSBAR_SCAN_LIFT_POS[2]:.3f})")
 
             elif task == "PICK_BUSBAR":
                 if isaac_node.latest_target_pose is not None:
@@ -960,7 +1203,8 @@ def main():
                 print(f"\n>>> [{task}] 버스바 수직 하강 안착 시작 (Target Mid Pos: X={target_mid_pos[0]:.4f}, Y={target_mid_pos[1]:.4f})")
 
             elif task in ("SCAN_NUT1", "SCAN_NUT2"):
-                nut_index = 1 if task == "SCAN_NUT1" else 2
+                nut_slot = 1 if task == "SCAN_NUT1" else 2
+                nut_index = STATION_NUT_INDICES.get(current_station, (1, 2))[nut_slot - 1]
                 if HOME_EE_POS is not None:
                     # 너트마다 HOME 기준 X,Y가 다르므로 스캔 위치도 매번 그 너트의
                     # 오프셋으로 새로 계산한다(이전엔 최초 1회만 계산해서 재사용하다보니
@@ -971,15 +1215,23 @@ def main():
                         HOME_EE_POS[1] + nut_offset[1],
                         NUT_SCAN_Z,
                     ])
-                    phase = "NUT_SCAN_APPROACH"
+                    # XY와 orientation을 동시에 크게 바꾸면 RMPFlow가 팔꿈치/손목을 꼬아서
+                    # 돌아가는 경로를 잡는 문제가 있었다(실측 확인됨) - 먼저 지금 있는
+                    # XY에서 방향만 quat_nut로 맞추고 높이를 스캔 고도로 올린 뒤(NUT_SCAN_LIFT),
+                    # 그 다음에 같은 높이/방향을 유지한 채 옆으로만 이동(NUT_SCAN_APPROACH)
+                    # 시켜서 회전과 이동을 분리한다.
+                    cur_pos = world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation()
+                    NUT_SCAN_LIFT_POS = np.array([cur_pos[0], cur_pos[1], NUT_SCAN_Z])
+                    phase = "NUT_SCAN_LIFT"
                     step_count = 0
-                    print(f"\n>>> [{task}] 너트 {nut_index}번 스캔 위치 이동 시작 (Target: X={NUT_SCAN_POS[0]:.3f}, Y={NUT_SCAN_POS[1]:.3f}, Z={NUT_SCAN_POS[2]:.3f})")
+                    print(f"\n>>> [{task}] 1) 방향 정렬 및 스캔 고도 상승 시작 (Target: X={NUT_SCAN_LIFT_POS[0]:.3f}, Y={NUT_SCAN_LIFT_POS[1]:.3f}, Z={NUT_SCAN_LIFT_POS[2]:.3f})")
                 else:
                     print(f"\n[ERROR] [{task}] 초기 위치(HOME_EE_POS)가 없습니다. 먼저 INIT_POSE가 수행되어야 합니다.")
                     publish_status("FAILURE:NO_HOME_POSE")
 
             elif task in ("PICK_NUT1", "PICK_NUT2"):
-                nut_index = 1 if task == "PICK_NUT1" else 2
+                nut_slot = 1 if task == "PICK_NUT1" else 2
+                nut_index = STATION_NUT_INDICES.get(current_station, (1, 2))[nut_slot - 1]
                 if HOME_EE_POS is not None:
                     nut_offset = NUT_OFFSET_FROM_HOME[nut_index]
                     pick_x = HOME_EE_POS[0] + nut_offset[0]
@@ -994,13 +1246,14 @@ def main():
                     publish_status("FAILURE:NO_HOME_POSE")
 
             elif task in ("ASSEMBLE_NUT1", "ASSEMBLE_NUT2"):
-                nut_index = 1 if task == "ASSEMBLE_NUT1" else 2
-                bolt_world_xy = BOLT1_WORLD_POS if nut_index == 1 else BOLT2_WORLD_POS
+                nut_slot = 1 if task == "ASSEMBLE_NUT1" else 2
+                nut_index = STATION_NUT_INDICES.get(current_station, (1, 2))[nut_slot - 1]
+                bolt_world_xy = STATION_BOLT_WORLD_POS.get(current_station, STATION_BOLT_WORLD_POS[3])[nut_slot]
                 bolt_target_pos = np.array([bolt_world_xy[0], bolt_world_xy[1], 0.0])
                 bolt_touch_pos = np.array([bolt_target_pos[0], bolt_target_pos[1], 0.3697])
                 phase = "MOVE_TO_BOLT_NUT"
                 step_count = 0
-                print(f"\n>>> [{task}] 너트 {nut_index}번 -> 볼트 {nut_index}번 체결 시작 [하드코딩 월드 좌표] "
+                print(f"\n>>> [{task}] 너트 {nut_index}번(스테이션{current_station} 슬롯{nut_slot}) -> 볼트 {nut_slot}번 체결 시작 "
                       f"(Target: X={bolt_target_pos[0]:.4f}, Y={bolt_target_pos[1]:.4f})")
 
         # 3. FSM 제어 루프
@@ -1093,6 +1346,23 @@ def main():
                     print(f"\n[ERROR] SCAN_APPROACH Timeout | XY err={xy_err*1000:.1f}mm, Z err={z_err*1000:.1f}mm")
                     publish_status("FAILURE:SCAN_APPROACH_TIMEOUT")
                     phase = "IDLE"
+
+            # [STEP 0.5] 방향 정렬 + 버스바 스캔 고도 상승 (제자리에서 quat_busbar로 회전, XY는 그대로)
+            elif phase == "SCAN_BUSBAR_LIFT":
+                publish_progress("SCAN_BUSBAR_LIFT", 30.0)
+                cur_pos = world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation()
+                actions = arm_controller.forward(
+                    target_end_effector_position=BUSBAR_SCAN_LIFT_POS,
+                    target_end_effector_orientation=quat_busbar
+                )
+                robot.apply_action(actions)
+                robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_OPEN))
+
+                err = math.dist(cur_pos, tuple(BUSBAR_SCAN_LIFT_POS))
+                if err < 0.02 or step_count > 300:
+                    print("[OK] 방향 정렬 및 고도 상승 완료 -> 버스바 스캔 위치로 수평 이동")
+                    phase = "SCAN_BUSBAR_APPROACH"
+                    step_count = 0
 
             # [STEP 1] 버스바 스캔 위치 이동
             elif phase == "SCAN_BUSBAR_APPROACH":
@@ -1332,6 +1602,20 @@ def main():
             # ════════════════════════════════════════════════════════════════
             # 너트 조립(Nut Assembly) 공용 Phase
             # ════════════════════════════════════════════════════════════════
+            # [9.5단계] 방향 정렬 + 스캔 고도 상승 (제자리에서 quat_nut로 회전, XY는 그대로)
+            elif phase == "NUT_SCAN_LIFT":
+                publish_progress("NUT_SCAN_LIFT", 30.0)
+                cur_pos = world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation()
+                actions = arm_controller.forward(target_end_effector_position=NUT_SCAN_LIFT_POS, target_end_effector_orientation=quat_nut)
+                robot.apply_action(actions)
+                robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_OPEN))
+
+                err = math.dist(cur_pos, tuple(NUT_SCAN_LIFT_POS))
+                if err < 0.02 or step_count > 300:
+                    print(f"[OK] 방향 정렬 및 고도 상승 완료 -> 너트 스캔 위치로 수평 이동")
+                    phase = "NUT_SCAN_APPROACH"
+                    step_count = 0
+
             # [10단계] 너트 스캔 위치 이동
             elif phase == "NUT_SCAN_APPROACH":
                 publish_progress("NUT_SCAN_NAV", 50.0)
@@ -1397,17 +1681,41 @@ def main():
                 robot.apply_action(actions)
 
                 grasp_timer += 1
-                ramp_frac = min(grasp_timer / GRIP_CLOSE_RAMP_STEPS, 1.0)
+                # 처음부터 100%까지 닫아버리면 아직 AMR에 FixedJoint로 고정된 너트를 세게
+                # 밀어붙이게 된다 - 80%까지만 닫아 살짝 접촉만 시켜두고, 조인트를 해제한
+                # 뒤에(NUT_GRASP_SETTLE) 마저 완전히 닫는다.
+                ramp_frac = min(grasp_timer / GRIP_CLOSE_RAMP_STEPS, 0.80)
                 grip_target = ramp_frac * GRIPPER_CLOSE_NUT
                 robot.gripper.apply_action(ArticulationAction(joint_positions=grip_target))
 
                 if grasp_timer >= GRIP_CLOSE_RAMP_STEPS:
-                    nut_label = resolve_nut_assets(nut_index, nut1_xform, nut2_xform)[1]
-                    # 그리퍼가 물리적으로 붙잡은 뒤에야 AMR과의 FixedJoint를 풀어준다 -
-                    # 안 그러면 AMR에 묶인 채라 팔이 들어올릴 수 없다.
                     nut_root_path, _ = nut_paths_for_index(nut_index)
                     detach_nut_from_amr(stage, nut_root_path)
-                    print(f"[OK] {nut_label} 물리 파지 완료! -> AMR 조인트 해제 -> 상공({NUT_APPROACH_Z}m)으로 상승")
+                    nut_release_timer = 0
+                    print("[NUT] 손가락 접촉 상태에서 AMR FixedJoint 해제 -> 안정화")
+                    phase = "NUT_GRASP_SETTLE"
+
+            # [13.5단계] FixedJoint 해제 후 손가락을 마저 닫고 안정화
+            elif phase == "NUT_GRASP_SETTLE":
+                publish_progress("NUT_GRASP_SETTLE", 70.0)
+                actions = arm_controller.forward(target_end_effector_position=nut_pick_pos, target_end_effector_orientation=quat_nut)
+                robot.apply_action(actions)
+                robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_CLOSE_NUT))
+
+                nut_release_timer += 1
+                if nut_release_timer >= NUT_GRIP_RELEASE_STEPS:
+                    nut_label = resolve_nut_assets(nut_index, nut1_xform, nut2_xform)[1]
+                    nut_xf_cur = resolve_nut_assets(nut_index, nut1_xform, nut2_xform, extra_nut_xforms)[0]
+                    stiffen_gripper_grip(robot)
+                    # 너트가 볼트 펙에 꽂힌 채라 마찰만으로는 빼내는 힘을 못 이겨서 계속
+                    # 놓쳤다(실측 확인됨) - 버스바(attach_busbar_to_gripper)와 완전히 같은
+                    # 방식으로 그리퍼-너트 사이에 실제 FixedJoint를 걸어서 확실히 고정한다.
+                    # 이 조인트는 트레이->볼트 상공까지 운반하는 동안만 유지하고, 착좌/체결
+                    # (재파지 반복)이 시작되기 전에 NUT_DESCEND_TO_BOLT에서 detach한다.
+                    if nut_xf_cur is not None:
+                        _, nut_poly_path = nut_paths_for_index(nut_index)
+                        attach_nut_to_gripper(stage, nut_poly_path, ee_path, robot, nut_xf_cur)
+                    print(f"[OK] {nut_label} 물리 파지 완료 및 안정화 -> 상공({NUT_APPROACH_Z}m)으로 상승")
                     phase = "NUT_LIFT"
                     step_count = 0
 
@@ -1441,6 +1749,10 @@ def main():
 
                 if current_err < PICK_TOLERANCE_STRICT or (current_err < PICK_TOLERANCE_LOOSE_VAL and step_count > MAX_STUCK_STEPS):
                     nut_label = resolve_nut_assets(nut_index, nut1_xform, nut2_xform)[1]
+                    # 착좌/체결부터는 재파지(regrasp)를 반복해야 하므로, 그리퍼를 벌려도
+                    # 계속 붙잡고 있을 FixedJoint는 여기서 미리 풀어준다.
+                    _, nut_poly_path = nut_paths_for_index(nut_index)
+                    detach_nut_from_gripper(stage, nut_poly_path)
                     print(f"[OK] 볼트 {nut_index}번 상공 도착! ({nut_label}) -> 착좌 하강 시작")
                     phase = "NUT_DESCEND_TO_BOLT"
                     step_count = 0

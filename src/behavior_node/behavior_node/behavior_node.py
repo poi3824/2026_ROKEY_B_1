@@ -11,21 +11,21 @@ from fms_interfaces.msg import AmrGoal, AmrStatus, FleetJob, FleetReport
 
 
 X_BATTERY = 0.6667
-Y_BUSBAR = (1.2392 + 1.205 + 1.2367) / 3
+Y_BUSBAR = 1.9078
 
 # amr_node의 amr_baseline 좌표계 기준 접근 지점.
 AMR_STATION_POSES = {
     "station_5": {
         "battery": ("battery5", X_BATTERY, -1.1964, -1.5707),
-        "busbar": ("busbar5", -1.1298, Y_BUSBAR, -1.5707),
+        "busbar": ("busbar5", -0.9586, Y_BUSBAR, -1.5707),
     },
     "station_4": {
         "battery": ("battery4", X_BATTERY, -0.6617, -1.5707),
-        "busbar": ("busbar4", -0.6606, Y_BUSBAR, -1.5707),
+        "busbar": ("busbar4", -0.2271, Y_BUSBAR, -1.5707),
     },
     "station_3": {
         "battery": ("battery3", X_BATTERY, -0.0382, -1.5707),
-        "busbar": ("busbar3", 0.5867, 1.9078, -1.5707),
+        "busbar": ("busbar3", 0.5867, Y_BUSBAR, -1.5707),
     },
 }
 

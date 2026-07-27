@@ -58,6 +58,7 @@ class BatteryAssemblyVisionNode(Node):
         # 시작 제어 플래그
         self.is_active = False          # 트리거 수신 전까지는 False
         self.bolts_detected = False     # 노드 실행 직후 백그라운드에서 검출 진행
+        self._roi_logged = False        # ROI 크기를 한 번만 로그로 찍기 위한 플래그
 
         # 버스바 미검출 시 Hold 처리용 (픽셀 좌표 차이)
         self.last_valid_dx_px = 0       # hx - bx (양수: 구멍이 오른쪽, 음수: 구멍이 왼쪽)
@@ -80,6 +81,18 @@ class BatteryAssemblyVisionNode(Node):
             self.get_logger().info(f"\n>>> [Vision Correction] 오차 보정 시작 신호 수신 ({cmd})!")
             self.is_active = True
             self.hold_count = 0  # 새로 시작 시 연속 카운터 초기화
+        elif cmd == "RESET_BOLT_DETECTION":
+            # bolt_camera가 다른 스테이션 좌표로 순간이동한 직후 호출된다. bolts_detected는
+            # 노드 켜진 뒤 딱 한 번만 True가 되고 그 뒤로는 절대 다시 검출을 안 하므로(다음
+            # rgb_callback의 [STEP 1]이 건너뛰어짐), 카메라를 옮겨도 예전 스테이션에서 잡은
+            # 픽셀좌표를 계속 재사용하는 버그가 있었다 - 여기서 강제로 재검출시킨다.
+            self.is_active = False
+            self.bolts_detected = False
+            self.fixed_bolt_coords = []
+            self.has_valid_tracking = False
+            self.hold_count = 0
+            self._roi_logged = False
+            self.get_logger().info(">>> [Vision Node] 카메라 이동 감지 -> 고정 볼트 위치 재탐색 시작")
 
     def depth_callback(self, msg):
         try:
@@ -245,10 +258,24 @@ class BatteryAssemblyVisionNode(Node):
     # --------------------------------------------------------------------------
     def detect_static_bolts_hough(self, frame):
         h, w = frame.shape[:2]
-        x_start, y_start = int(w * 0.45), int(h * 0.25)
-        roi_w, roi_h = int(w * 0.40), int(h * 0.30)
+        # bolt_camera가 이제 매 스테이션마다 그 스테이션의 볼트2 바로 위(world XY)로
+        # 옮겨진 뒤 이 함수가 호출되므로, 볼트는 항상 화면 중앙 부근에 잡힌다 - 예전엔
+        # 스테이션3 한 곳에 고정된 카메라 기준으로 오프셋을 맞춘 ROI였는데, 그걸 그대로
+        # 쓰면 다른 스테이션에서는 화면 중앙(=진짜 볼트)이 아니라 ROI가 가리키는 엉뚱한
+        # 자리를 보게 된다. 중앙 기준 ROI로 통일한다.
+        roi_frac_w, roi_frac_h = 0.22, 0.22
+        roi_w, roi_h = int(w * roi_frac_w), int(h * roi_frac_h)
+        x_start, y_start = int((w - roi_w) / 2), int((h - roi_h) / 2)
         self.roi_rect = (x_start, y_start, roi_w, roi_h)
-        
+
+        if not self._roi_logged:
+            self.get_logger().info(
+                f"[ROI] {roi_w}x{roi_h}px (면적={roi_w * roi_h}px², "
+                f"전체 프레임({w}x{h}) 대비 {roi_frac_w * roi_frac_h * 100:.1f}%)"
+            )
+            self._roi_logged = True
+
+
         # 1. 고정 볼트 ROI 추출
         roi = frame[y_start:y_start + roi_h, x_start:x_start + roi_w]
 
