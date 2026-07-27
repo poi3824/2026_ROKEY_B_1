@@ -122,7 +122,7 @@ NUT_GRASP_Z_LOCAL  = NUT_HEIGHT + 0.023
 NUT_SUPPLY_TABLE_Z = 0.72                                   # 너트 공급대 높이
 NUT_PICK_Z         = NUT_SUPPLY_TABLE_Z - (NUT_GRASP_Z_LOCAL - 0.0395)
 NUT_APPROACH_Z     = 0.8                                     # 너트 파지 상공 고도
-BOLT_APPROACH_Z    = 0.6                                     # 볼트 체결 상공 고도
+BOLT_APPROACH_Z    = 0.6                                     # 너트 체결 상공 고도
 
 # ★ 볼트 1/2번 참고 좌표 (절대좌표로 직접 이동에 사용 금지!) ★
 # 아래 두 좌표는 배터리 중심 좌표 대비 상대 오프셋(Offset)을 미리 계산해 두기 위한 참고값일
@@ -577,7 +577,7 @@ def main():
                     bolt_target_pos = compute_bolt_target_pos(nut_index, battery_center_ref)
                     bolt_touch_pos = np.array([
                         bolt_target_pos[0], bolt_target_pos[1],
-                        bolt_target_pos[2] + EE_OFFSET[2] + NUT_GRASP_Z_LOCAL
+                        0.3695
                     ])
                     phase = "MOVE_TO_BOLT_NUT"
                     step_count = 0
