@@ -141,15 +141,19 @@ class BatteryAssemblyVisionNode(Node):
         # ★ out_limit=0.002(2mm)로 클램프 - execute_isaac.py의 FINE_ALIGNMENT가
         # abs(offset.x) <= 0.0025(2.5mm)를 넘으면 그 스텝을 통째로 버리기 때문에,
         # 그보다 작게 유지해야 큰 오차에서도 스텝이 누락되지 않는다.
-        self.pi_x = IncrementalPI(kp=0.15, ki=0.35, out_limit=0.002)   # m/cycle
-        self.pi_y = IncrementalPI(kp=0.15, ki=0.35, out_limit=0.002)   # m/cycle
+        # ★ Kp를 더 낮춤(2026-07-27, 노이즈 증폭 완화): Kp*(error-prev_error)항이 픽셀
+        # 노이즈를 그대로 증폭시키는 게 확인돼서 0.15->0.075로 절반 인하. Ki(적분/수렴
+        # 속도)는 그대로 유지.
+        self.pi_x = IncrementalPI(kp=0.075, ki=0.35, out_limit=0.002)   # m/cycle
+        self.pi_y = IncrementalPI(kp=0.075, ki=0.35, out_limit=0.002)   # m/cycle
         # ★ yaw 오실레이션 튜닝(2026-07-27): assembly_nut_fraction1.py의 Kp=1.0/Ki=0.0589는
         # RMPFlow 플랜트(τ≈0.283s)만 실측하고 비전 왕복지연 θ=0으로 가정한 λ=τ 값인데,
         # 여기 dtheta는 그 소스(/busbar_alignment_error, 스무딩됨)가 아니라 매 프레임 Hough
         # 라인 재피팅 raw 값이라 노이즈가 훨씬 크고, θ도 더 길 가능성이 높음 - 원래 문서에
         # "θ=0 가정하고 밀어붙이면 진동"이라 경고된 상황이 재현됨. 대역폭을 절반(λ=2τ)으로
-        # 낮춤: Kp=0.5, Ki=0.0295. 그래도 진동하면 더 낮추거나 dtheta에 스무딩을 추가할 것.
-        self.pi_yaw = IncrementalPI(kp=0.5, ki=0.0295, out_limit=0.5)  # deg/cycle
+        # 낮췄었으나(Kp=0.5) 스무딩 추가 후에도 노이즈 증폭이 남아 Kp만 추가로 절반 인하.
+        # Ki(수렴 속도)는 유지.
+        self.pi_yaw = IncrementalPI(kp=0.25, ki=0.0295, out_limit=0.5)  # deg/cycle
 
         # 연속 30 Step 유지 카운터
         self.hold_count = 0
