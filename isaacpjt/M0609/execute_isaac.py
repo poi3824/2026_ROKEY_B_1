@@ -13,9 +13,8 @@ BehaviorNode (FSM) 및 ArmNode, Vision Correction Node 통신 연동 버전
 6. ASSEMBLE_BUSBAR      : 정렬된 XY 상태를 유지하며 수직 하강 안착, 버스바 고정 해제, 그리퍼 개방 및 상공 이탈
 7. SCAN_NUT1 / SCAN_NUT2   : 너트 스캔 위치(버스바 체결 위치 기준 상대 이동)로 이동
 8. PICK_NUT1 / PICK_NUT2   : 비전으로 검출된 너트 좌표로 접근, 물리 파지(Gripper Close) 및 상승
-9. ASSEMBLE_NUT1 / ASSEMBLE_NUT2 : 최초 SCAN_BATTERY 스캔 좌표(BATTERY_CENTER_POS, 버스바
-   grasp offset 영향 없음) 기준 사전 계산된 상대 오프셋을 적용해 산출한 볼트 목표 좌표로
-   이동, 착좌 및 Screwing 체결(Regrasp 포함)
+9. ASSEMBLE_NUT1 / ASSEMBLE_NUT2 : 실시간 배터리 중심 좌표(target_mid_pos) 기준 사전 계산된
+   상대 오프셋을 적용해 산출한 볼트 목표 좌표로 이동, 착좌 및 Screwing 체결(Regrasp 포함)
 """
 
 import os
@@ -119,10 +118,9 @@ NUT_APPROACH_Z     = 0.8                                     # 너트 파지 상
 BOLT_APPROACH_Z    = 0.6                                     # 볼트 체결 상공 고도
 
 # ★ 볼트 1/2번 참고 좌표 (절대좌표로 직접 이동에 사용 금지!) ★
-# 아래 두 좌표는 배터리 중심 좌표 대비 상대 오프셋(Offset)을 미리 계산해 두기 위한 참고값일
-# 뿐이며, 실제 체결 시에는 최초 SCAN_BATTERY 스캔 좌표(BATTERY_CENTER_POS)에 이 오프셋을
-# 더해 동적으로 목표 좌표를 산출한다. target_mid_pos(버스바 체결 TCP 위치)는 버스바를
-# YOLO로 인식해 파지하는 grasp point가 매번 달라져 오차가 섞이므로 기준으로 쓰지 않는다.
+# 아래 두 좌표는 버스바 체결 시 사용되는 기준 배터리 중심 좌표(_REF_BATTERY_CENTER_POS) 대비
+# 상대 오프셋(Offset)을 미리 계산해 두기 위한 참고값일 뿐이며, 실제 체결 시에는
+# 실시간 배터리 중심 좌표(target_mid_pos)에 이 오프셋을 더해 동적으로 목표 좌표를 산출한다.
 BOLT1_OFFSET_FROM_CENTER = np.array([-0.1042, 0.1812, 0.0])
 BOLT2_OFFSET_FROM_CENTER = np.array([0.1042, -0.1812, 0.0])
 
@@ -152,7 +150,7 @@ target_fine_pos      = None
 PICK_TOLERANCE_STRICT    = 0.01     # 10mm
 JOINT_TOLERANCE          = 0.02     # 관절 오차 허용범위 (rad)
 PICK_TOLERANCE_LOOSE_VAL = 0.015
-MAX_STUCK_STEPS          = 18000      # Phase 타임아웃 기준
+MAX_STUCK_STEPS          = 1000000      # Phase 타임아웃 기준
 PHYSICS_DT               = 1.0 / 60.0
 
 URDF_PATH        = str(_THIS_DIR / "doosan-robot2/urdf/m0609_isaac_sim.urdf")
@@ -559,13 +557,16 @@ def main():
 
             elif task in ("ASSEMBLE_NUT1", "ASSEMBLE_NUT2"):
                 nut_index = 1 if task == "ASSEMBLE_NUT1" else 2
-                if target_mid_pos is not None and BATTERY_CENTER_POS is not None:
-                    # 볼트는 버스바 grasp offset의 영향을 받지 않는 최초 SCAN_BATTERY 스캔 좌표
-                    # (BATTERY_CENTER_POS)의 XY를 기준으로 계산한다. Z는 버스바 체결 높이(target_mid_pos)를 유지.
-                    battery_center_ref = np.array(
-                        [BATTERY_CENTER_POS[0], BATTERY_CENTER_POS[1], target_mid_pos[2]]
-                    )
-                    bolt_target_pos = compute_bolt_target_pos(nut_index, battery_center_ref)
+                if target_mid_pos is not None:
+                    bolt_target_pos = compute_bolt_target_pos(nut_index, target_mid_pos)
+                    # ★ arm_node가 착좌 진입 직전 get_bolt_pair 실측값을 /target_pose로
+                    # 먼저 보내뒀으면 그 XY로 대체 (Z는 기존 고정 오프셋 계산값 유지 -
+                    # depth/체결 깊이 계산은 별도로 튜닝된 값이라 그대로 둔다). 못 받았으면
+                    # 기존처럼 고정 오프셋 계산값 그대로 사용.
+                    if isaac_node.latest_target_pose is not None:
+                        vpos = isaac_node.latest_target_pose.pose.position
+                        bolt_target_pos = np.array([vpos.x, vpos.y, bolt_target_pos[2]])
+                        print(f"    [Vision] get_bolt_pair 실측 좌표로 대체 -> X={vpos.x:.4f}, Y={vpos.y:.4f}")
                     bolt_touch_pos = np.array([
                         bolt_target_pos[0], bolt_target_pos[1],
                         bolt_target_pos[2] + EE_OFFSET[2] + NUT_GRASP_Z_LOCAL
@@ -574,7 +575,7 @@ def main():
                     step_count = 0
                     print(f"\n>>> [{task}] 너트 {nut_index}번 -> 볼트 {nut_index}번 체결 시작 (Target: X={bolt_target_pos[0]:.4f}, Y={bolt_target_pos[1]:.4f})")
                 else:
-                    print(f"\n[ERROR] [{task}] 배터리 중심 좌표가 없습니다. 먼저 SCAN_BATTERY(MOVE_BATTERY_CENTER)/ASSEMBLE_BUSBAR가 수행되어야 합니다.")
+                    print(f"\n[ERROR] [{task}] 배터리 중심 좌표(target_mid_pos)가 없습니다. 먼저 ASSEMBLE_BUSBAR가 수행되어야 합니다.")
                     publish_status("FAILURE:NO_BATTERY_CENTER")
 
         # 3. FSM 제어 루프
@@ -823,17 +824,15 @@ def main():
                     # 🔥 [추가 필요] 너트 조립용 기준 좌표(Anchor) 저장 및 볼트 3D 좌표 산출
                     # -------------------------------------------------------------
                     global assembled_battery_center, calculated_bolt1_pos, calculated_bolt2_pos
-
-                    # 버스바는 YOLO 인식으로 파지하므로 grasp point가 매번 달라져 target_mid_pos(TCP
-                    # 기준 체결 좌표)의 XY에는 grasp offset 오차가 섞여 있다. 볼트는 버스바를 얹기
-                    # 전부터 이미 고정돼 있으므로, 볼트 좌표 산출 기준은 그 오차와 무관한 최초
-                    # SCAN_BATTERY 스캔 좌표(BATTERY_CENTER_POS, get_bolt_pair 기반)의 XY를 쓴다.
-                    assembled_battery_center = np.array(
-                        [BATTERY_CENTER_POS[0], BATTERY_CENTER_POS[1], target_mid_pos[2]], dtype=float
-                    )
-
-                    calculated_bolt1_pos = assembled_battery_center + BOLT1_OFFSET_FROM_CENTER
-                    calculated_bolt2_pos = assembled_battery_center + BOLT2_OFFSET_FROM_CENTER
+                    
+                    # 1) 실제 안착된 배터리 중심 좌표 확정 저장
+                    assembled_battery_center = np.array(target_mid_pos, dtype=float)
+                    
+                    # 2) 볼트 1, 2의 오프셋 벡터 (미리 정의된 상대 거리 오프셋)
+                    # 예: BOLT1_OFFSET = np.array([-0.1042, 0.1812, 0.0])
+                    #     BOLT2_OFFSET = np.array([0.1042, -0.1812, 0.0])
+                    calculated_bolt1_pos = assembled_battery_center + BOLT1_OFFSET_FROM_CENTER 
+                    calculated_bolt2_pos = assembled_battery_center + BOLT2_OFFSET_FROM_CENTER 
                     
                     print(f"\n[OK] 버스바 안착 체결 완료 (EE Z: {cur_pos[2]:.4f}m)!")
                     print(f" -> 기준 안착 좌표 저장: {assembled_battery_center}")
@@ -890,6 +889,12 @@ def main():
             # [11단계] 너트 상공 접근
             elif phase == "NUT_APPROACH":
                 publish_progress("NUT_APPROACH", 20.0)
+                # ★ 그리퍼 장착 카메라(eye-in-hand) 대응: 팔이 움직이면서 시점이 계속
+                # 바뀌므로, arm_node가 재발행하는 최신 비전 좌표(XY)로 매 스텝 목표를
+                # 갱신한다. Z는 이 단계 고정값(NUT_APPROACH_Z) 그대로 유지.
+                if isaac_node.latest_target_pose is not None:
+                    vpos = isaac_node.latest_target_pose.pose.position
+                    nut_approach_pos = np.array([vpos.x, vpos.y, NUT_APPROACH_Z])
                 actions = arm_controller.forward(target_end_effector_position=nut_approach_pos, target_end_effector_orientation=quat_nut)
                 robot.apply_action(actions)
                 robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_OPEN))
@@ -906,6 +911,11 @@ def main():
             # [12단계] 너트 파지점 하강
             elif phase == "NUT_DESCEND":
                 publish_progress("NUT_DESCEND", 40.0)
+                # ★ NUT_APPROACH와 동일한 이유로 하강 중에도 XY를 매 스텝 갱신
+                # (Z는 이 단계 고정값 NUT_PICK_Z 그대로 유지).
+                if isaac_node.latest_target_pose is not None:
+                    vpos = isaac_node.latest_target_pose.pose.position
+                    nut_pick_pos = np.array([vpos.x, vpos.y, NUT_PICK_Z])
                 actions = arm_controller.forward(target_end_effector_position=nut_pick_pos, target_end_effector_orientation=quat_nut)
                 robot.apply_action(actions)
                 robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_OPEN))
