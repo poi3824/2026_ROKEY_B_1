@@ -241,6 +241,26 @@ def set_physx_scene_limits(stage):
     print("[INFO] PhysX Scene 연산 한계 확장 완료 (MaxFrictionPatches: 128, GPU Buffers Expanded)")
 
 
+def set_sdf_mesh_collision(stage, root_path, sdf_resolution=256):
+    """나사산처럼 작은 디테일이 많은 형상은 SDF mesh collision resolution을 낮게
+    쓰면 접촉이 부정확해진다 - Factory 논문(NVIDIA, RSS 2022, arXiv:2205.03532
+    Sec.III-A "SDF Collisions")에서 이런 형상엔 256^3 이상을 쓴다고 명시돼 있어서
+    (기본값은 그보다 낮을 수 있음) 너트/볼트 콜리전 메시에 명시적으로 지정한다."""
+    root = stage.GetPrimAtPath(root_path)
+    if not root.IsValid():
+        return
+    count = 0
+    for prim in Usd.PrimRange(root):
+        if prim.IsA(UsdGeom.Mesh) and prim.HasAPI(UsdPhysics.CollisionAPI):
+            mesh_collision_api = UsdPhysics.MeshCollisionAPI.Apply(prim)
+            mesh_collision_api.CreateApproximationAttr("sdf")
+            sdf_api = PhysxSchema.PhysxSDFMeshCollisionAPI.Apply(prim)
+            sdf_api.CreateSdfResolutionAttr(sdf_resolution)
+            count += 1
+    if count > 0:
+        print(f"[INFO] SDF mesh collision 설정 완료 -> {root_path} ({count}개 메시, resolution={sdf_resolution})")
+
+
 def set_friction_material(stage, material_path, target_prim_path, static_friction, dynamic_friction, restitution):
     target_prim = stage.GetPrimAtPath(target_prim_path)
     if not target_prim.IsValid():
@@ -510,6 +530,10 @@ def main():
 
     set_physx_scene_limits(stage)
     lock_amr_base(stage, NOVA_CARTER_ROOT)
+
+    # ★ 나사산 접촉 정밀도(Factory 논문 권장 SDF resolution 256^3) 적용
+    for target_path in [NUT1_ROOT_PATH, NUT2_ROOT_PATH, BOLT1_ROOT_PATH, BOLT2_ROOT_PATH]:
+        set_sdf_mesh_collision(stage, target_path, sdf_resolution=256)
 
     mat_path = "/World/Looks/BoltNutMaterial"
     # 버스바(BUSBAR_ROOT_PATH) 포함 마찰 재질 적용

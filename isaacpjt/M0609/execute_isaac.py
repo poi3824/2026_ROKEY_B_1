@@ -39,7 +39,7 @@ sys.stdout.reconfigure(line_buffering=True)
 
 # 2. USD 및 Isaac Core Imports
 import omni.usd
-from pxr import Usd, UsdGeom, UsdPhysics, Gf
+from pxr import Usd, UsdGeom, UsdPhysics, PhysxSchema, Gf
 from isaacsim.core.api import World
 from isaacsim.core.prims import SingleXFormPrim
 from isaacsim.robot.manipulators.grippers import ParallelGripper
@@ -286,6 +286,26 @@ def lock_amr_base(stage, amr_root_path):
                     drive.GetTargetVelocityAttr().Set(0.0)
 
 
+def set_sdf_mesh_collision(stage, root_path, sdf_resolution=256):
+    """나사산처럼 작은 디테일이 많은 형상은 SDF mesh collision resolution을 낮게
+    쓰면 접촉이 부정확해진다 - Factory 논문(NVIDIA, RSS 2022, arXiv:2205.03532
+    Sec.III-A "SDF Collisions")에서 이런 형상엔 256^3 이상을 쓴다고 명시돼 있어서
+    (기본값은 그보다 낮을 수 있음) 너트/볼트 콜리전 메시에 명시적으로 지정한다."""
+    root = stage.GetPrimAtPath(root_path)
+    if not root.IsValid():
+        return
+    count = 0
+    for prim in Usd.PrimRange(root):
+        if prim.IsA(UsdGeom.Mesh) and prim.HasAPI(UsdPhysics.CollisionAPI):
+            mesh_collision_api = UsdPhysics.MeshCollisionAPI.Apply(prim)
+            mesh_collision_api.CreateApproximationAttr("sdf")
+            sdf_api = PhysxSchema.PhysxSDFMeshCollisionAPI.Apply(prim)
+            sdf_api.CreateSdfResolutionAttr(sdf_resolution)
+            count += 1
+    if count > 0:
+        print(f"[INFO] SDF mesh collision 설정 완료 -> {root_path} ({count}개 메시, resolution={sdf_resolution})")
+
+
 def glue_busbar_to_ee(robot, busbar_xform, rest_pick_pos, blend):
     if busbar_xform is None or rest_pick_pos is None:
         return
@@ -401,6 +421,10 @@ def main():
 
     world = World(stage_units_in_meters=1.0, physics_dt=PHYSICS_DT)
     lock_amr_base(stage, NOVA_CARTER_ROOT)
+
+    # ★ 나사산 접촉 정밀도(Factory 논문 권장 SDF resolution 256^3) 적용
+    for target_path in [NUT1_ROOT_PATH, NUT2_ROOT_PATH]:
+        set_sdf_mesh_collision(stage, target_path, sdf_resolution=256)
 
     busbar_xform = SingleXFormPrim(BUSBAR_POLYSHAPE_PATH, name="busbar_poly") if stage.GetPrimAtPath(BUSBAR_POLYSHAPE_PATH).IsValid() else None
     init_busbar_pos, init_busbar_quat = busbar_xform.get_world_pose() if busbar_xform else (None, None)
