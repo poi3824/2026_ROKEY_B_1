@@ -134,7 +134,7 @@ ENGAGE_LEN           = 0.0125     # 체결 깊이 (12.5mm)
 SCREW_TURNS_DEG      = 350.0      # 1회전당 350도
 REGRASP_CYCLES       = 1          # 총 2회전 (Regrasp 1회)
 SCREW_OMEGA_DEG_S    = 120.0      # 초당 120도 회전
-REGRASP_LIFT_HEIGHT  = 0.05       # Regrasp 시 수직 상승 높이 (5cm)
+REGRASP_LIFT_HEIGHT  = 0.06       # Regrasp 시 수직 상승 높이 (6cm)
 REGRASP_Z_OFFSET     = 0.005      # Regrasp 하강/재파지 시 높이 보정
 
 TOTAL_REV   = (SCREW_TURNS_DEG / 360.0) * (1 + REGRASP_CYCLES)
