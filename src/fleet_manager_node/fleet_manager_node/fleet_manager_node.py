@@ -24,7 +24,8 @@ class FleetManagerNode(Node):
 
         self._job_id_gen = itertools.count(1)
         self._pending_jobs = []
-        self._job_in_progress = False
+        self._active_job_id = None
+        self._jobs_initialized = False
 
         self.declare_parameter('job_dispatch_period_sec', 5.0)
         period = self.get_parameter('job_dispatch_period_sec').value
@@ -39,17 +40,19 @@ class FleetManagerNode(Node):
         TODO: 비전 스캔 결과(전체 스테이션 상태)를 받아 실제 빈 단자를 판단.
         지금은 데모용으로 station_1~3에 순차적으로 ASSEMBLE job을 채워 넣는다.
         """
-        if not self._pending_jobs and not self._job_in_progress:
-            for station_id in ('station_1', 'station_2', 'station_3'):
-                self._pending_jobs.append({
-                    'station_id': station_id,
-                    'job_type': 'ASSEMBLE',
-                    'target': 'busbar_and_nut',
-                })
+        if self._jobs_initialized:
+            return
+        self._jobs_initialized = True
+        for station_id in ('station_1', 'station_2', 'station_3'):
+            self._pending_jobs.append({
+                'station_id': station_id,
+                'job_type': 'ASSEMBLE',
+                'target': 'busbar_and_nut',
+            })
 
     # --- job 생성 · 작업 할당 ---------------------------------------------
     def _tick(self):
-        if self._job_in_progress:
+        if self._active_job_id is not None:
             return
 
         self._refresh_pending_jobs()
@@ -64,16 +67,21 @@ class FleetManagerNode(Node):
         msg.target = job_spec['target']
         msg.stamp = self.get_clock().now().to_msg()
 
-        self._job_in_progress = True
+        self._active_job_id = msg.job_id
         self._job_pub.publish(msg)
         self.get_logger().info(
             f'PUB /fleet/job -> {msg.job_id} ({msg.station_id}, {msg.job_type})')
 
     def _on_report(self, msg: FleetReport):
+        if msg.job_id != self._active_job_id:
+            self.get_logger().warn(
+                f'현재 작업({self._active_job_id})과 다른 report 무시: '
+                f'{msg.job_id}')
+            return
         status = 'SUCCESS' if msg.success else 'FAILED'
         self.get_logger().info(
             f'SUB /fleet/report <- {msg.job_id} {status}: {msg.message}')
-        self._job_in_progress = False
+        self._active_job_id = None
 
 
 def main(args=None):

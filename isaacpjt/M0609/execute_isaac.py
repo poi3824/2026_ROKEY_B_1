@@ -19,6 +19,7 @@ BehaviorNode (FSM) 및 ArmNode, Vision Correction Node 통신 연동 버전
 
 import os
 import sys
+import json
 import math
 import time
 import numpy as np
@@ -48,7 +49,7 @@ from isaacsim.core.utils.types import ArticulationAction
 # 3. ROS 2 Imports
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import Pose2D, PoseStamped
 from std_msgs.msg import String, Float32
 
 # RMPFlow Controller 경로 설정
@@ -59,7 +60,10 @@ from m0609_rmpflow_controller import RMPFlowController
 # ══════════════════════════════════════════════════════════════════════════
 #  [A] 설정 및 파라미터
 # ══════════════════════════════════════════════════════════════════════════
-USD_PATH = "/home/rokey/junhyeok_version/isaacpjt/M0609/Collected_Busbar/Busbar.usd"
+USD_PATH = os.environ.get(
+    "INTEGRATED_USD_PATH",
+    str(_THIS_DIR.parents[1] / "src/Collected_Busbar_amr/Busbar.usd"),
+)
 
 NOVA_CARTER_ROOT = "/World/Nova_Carter/chassis_link"
 M0609_PATH       = "/World/m0609"
@@ -74,6 +78,25 @@ NUT1_ROOT_PATH      = "/World/nut1"
 NUT2_ROOT_PATH      = "/World/nut2"
 NUT1_POLYSHAPE_PATH = "/World/nut1/geo/PolyShape"
 NUT2_POLYSHAPE_PATH = "/World/nut2/geo/PolyShape"
+
+# AMR 목표 좌표는 아래 원본 배치 대비 delta다. 별도 AMR SimulationApp을 띄우지
+# 않고 이 executor의 live stage 안에서 mobile manipulator 그룹을 함께 이동한다.
+AMR_GROUP_BASELINE = {
+    "/World/Nova_Carter": Gf.Vec3d(
+        0.6659430917711248, -0.045551821646005186,
+        2.1389568693498673e-8),
+    "/World/m0609": Gf.Vec3d(
+        0.6695317489356534, 0.191648535280057,
+        0.4316854793539975),
+    "/World/nut1": Gf.Vec3d(
+        0.3812361672997574, -0.30126815314508776,
+        0.9711037512121846),
+    "/World/nut2": Gf.Vec3d(
+        0.47100575524334387, -0.3012513976789413,
+        0.9711038761801655),
+}
+AMR_DRIVE_SPEED_MPS = 0.5
+AMR_ANIMATION_HZ = 30.0
 
 # 그리퍼 파라미터
 GRIPPER_OPEN      = np.array([0.0, 0.0])
@@ -160,13 +183,25 @@ RMPFLOW_CFG_PATH = str(_THIS_DIR / "rmpflow/m0609_rmpflow_common.yaml")
 # ══════════════════════════════════════════════════════════════════════════
 #  [B] 비전 브릿지 및 유틸리티 함수
 # ══════════════════════════════════════════════════════════════════════════
+def _get_translate_op(stage, path):
+    prim = stage.GetPrimAtPath(path)
+    if not prim.IsValid():
+        raise RuntimeError(f"AMR 이동 prim을 찾을 수 없습니다: {path}")
+    for op in UsdGeom.Xformable(prim).GetOrderedXformOps():
+        if op.GetOpType() == UsdGeom.XformOp.TypeTranslate:
+            return op
+    raise RuntimeError(f"AMR 이동 translate op가 없습니다: {path}")
+
+
 class Execute_Isaac_Busar(Node):
     """ArmNode / BehaviorNode / VisionNode 통신 브릿지"""
-    def __init__(self):
+    def __init__(self, stage):
         super().__init__("execute_isaac_busar")
+        self._stage = stage
         self.latest_target_pose = None
         self.requested_task = None
         self.alignment_success = False
+        self.pending_amr_goal = None
 
         self.sub_target_pose = self.create_subscription(
             PoseStamped, '/target_pose', self._on_target_pose, 10
@@ -174,11 +209,18 @@ class Execute_Isaac_Busar(Node):
         self.sub_task_cmd = self.create_subscription(
             String, '/task_command', self._on_task_command, 10
         )
+        self.sub_amr_goal = self.create_subscription(
+            PoseStamped, '/amr/goal_pose', self._on_amr_goal, 10
+        )
 
         self.pub_phase = self.create_publisher(String, '/isaac_phase', 10)
         self.pub_progress = self.create_publisher(Float32, '/isaac_progress', 10)
         self.pub_status = self.create_publisher(String, '/isaac_status', 10)
         self.pub_errorfix_command = self.create_publisher(String, '/errorfix_command', 10)
+        self.pub_amr_pose = self.create_publisher(
+            Pose2D, '/amr/sim_pose', 10)
+        self.pub_amr_drive_state = self.create_publisher(
+            String, '/amr/drive_state', 10)
 
     def _on_target_pose(self, msg: PoseStamped):
         self.latest_target_pose = msg
@@ -189,6 +231,91 @@ class Execute_Isaac_Busar(Node):
             self.alignment_success = True
         else:
             self.requested_task = msg.data
+
+    def _on_amr_goal(self, msg: PoseStamped):
+        self.pending_amr_goal = msg
+        self.get_logger().info(
+            "SUB /amr/goal_pose <- "
+            f"({msg.pose.position.x:.4f}, {msg.pose.position.y:.4f})")
+
+    @staticmethod
+    def _goal_stamp(msg: PoseStamped):
+        return f"{int(msg.header.stamp.sec)}:{int(msg.header.stamp.nanosec)}"
+
+    def _publish_amr_drive_state(
+        self, goal: PoseStamped, state: str, message: str
+    ):
+        msg = String()
+        msg.data = json.dumps({
+            "goal_stamp": self._goal_stamp(goal),
+            "state": state,
+            "message": message,
+        })
+        self.pub_amr_drive_state.publish(msg)
+
+    def execute_pending_amr_move(self):
+        """Arm phase가 IDLE일 때 호출해 mobile manipulator 그룹을 이동한다."""
+        goal = self.pending_amr_goal
+        if goal is None:
+            return False
+        self.pending_amr_goal = None
+
+        target = Gf.Vec3d(
+            float(goal.pose.position.x),
+            float(goal.pose.position.y),
+            0.0,
+        )
+        try:
+            nova_op = _get_translate_op(
+                self._stage, "/World/Nova_Carter")
+            start = (
+                Gf.Vec3d(nova_op.Get())
+                - AMR_GROUP_BASELINE["/World/Nova_Carter"]
+            )
+            distance = (target - start).GetLength()
+            steps = max(
+                1,
+                int(math.ceil(
+                    distance / AMR_DRIVE_SPEED_MPS
+                    * AMR_ANIMATION_HZ)),
+            )
+            self._publish_amr_drive_state(
+                goal, "ACTIVE", "통합 Isaac executor에서 AMR 이동 시작")
+
+            frame_sec = 1.0 / AMR_ANIMATION_HZ
+            for index in range(1, steps + 1):
+                frame_started = time.monotonic()
+                ratio = index / steps
+                current = start + (target - start) * ratio
+                for path, baseline in AMR_GROUP_BASELINE.items():
+                    _get_translate_op(self._stage, path).Set(
+                        Gf.Vec3d(baseline) + current)
+
+                pose = Pose2D()
+                pose.x = float(current[0])
+                pose.y = float(current[1])
+                self.pub_amr_pose.publish(pose)
+                simulation_app.update()
+                time.sleep(max(
+                    0.0,
+                    frame_sec - (time.monotonic() - frame_started),
+                ))
+
+            pose = Pose2D()
+            pose.x = float(target[0])
+            pose.y = float(target[1])
+            self.pub_amr_pose.publish(pose)
+            self._publish_amr_drive_state(
+                goal, "ARRIVED", "통합 Isaac executor AMR 이동 완료")
+            self.get_logger().info(
+                "PUB /amr/sim_pose -> "
+                f"({target[0]:.4f}, {target[1]:.4f}) 도착")
+            return True
+        except Exception as exc:
+            self.get_logger().error(f"AMR 그룹 이동 실패: {exc}")
+            self._publish_amr_drive_state(
+                goal, "FAILED", f"AMR 그룹 이동 실패: {exc}")
+            return False
 
 
 def euler_to_quaternion_wxyz(roll, pitch, yaw):
@@ -374,7 +501,7 @@ def main():
     quat_nut = euler_to_quaternion_wxyz(0.0, 3.1415, 0.0)
 
     rclpy.init()
-    isaac_node = Execute_Isaac_Busar()
+    isaac_node = Execute_Isaac_Busar(stage)
 
     arm_controller = RMPFlowController(
         name="m0609_busbar_controller",
@@ -470,6 +597,21 @@ def main():
             stuck_counter = 0
 
         # 2. BehaviorNode / ArmNode 명령 분기 처리
+        if playing and phase == "IDLE" and isaac_node.pending_amr_goal:
+            if isaac_node.execute_pending_amr_move():
+                # mobile base 이동 후 RMPFlow의 world 기준 base pose를 갱신한다.
+                base_link_xf = world_xf(stage, f"{M0609_PATH}/base_link")
+                base_pos = base_link_xf.ExtractTranslation()
+                base_quat = base_link_xf.ExtractRotationQuat()
+                arm_controller._motion_policy.set_robot_base_pose(
+                    robot_position=np.array([
+                        base_pos[0], base_pos[1], base_pos[2]]),
+                    robot_orientation=np.array([
+                        base_quat.GetReal(),
+                        *[float(x) for x in base_quat.GetImaginary()],
+                    ]),
+                )
+
         if playing and isaac_node.requested_task:
             task = isaac_node.requested_task
             isaac_node.requested_task = None
