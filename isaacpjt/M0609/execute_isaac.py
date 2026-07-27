@@ -376,6 +376,10 @@ def update_target_positions(target_pose_msg: PoseStamped):
 def main():
     global BUSBAR_APPROACH_POS, BUSBAR_PICK_POS, BUSBAR_LIFT_MOVE_POS, SCAN_POS, HOME_EE_POS, BUSBAR_SCAN_POS, BATTERY_CENTER_POS, target_fine_pos
 
+    print("=" * 60)
+    print("  [PI_bus] execute_isaac.py 실행 중 (버스바 yaw PI 누적 + 고정좌표 너트 파지 버전)")
+    print("=" * 60)
+
     usd_file_path = Path(USD_PATH).resolve()
     if not usd_file_path.is_file():
         raise FileNotFoundError(f"[ERROR] USD 파일을 찾을 수 없습니다: {usd_file_path}")
