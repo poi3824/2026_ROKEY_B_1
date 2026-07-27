@@ -167,6 +167,18 @@ class BatteryAssemblyVisionNode(Node):
                     status_line = f"dx:{dx_px:+2d}px, dy:{dy_px:+2d}px, dTheta:{angle_error:+.2f}deg [{self.hold_count}/30]"
                     sys.stdout.write(f"\r\033[K[Tracking Status] {status_line}")
                     sys.stdout.flush()
+            else:
+                # ★ 구멍 검출 실패(재탐지 대기) - has_valid_tracking을 명시적으로 꺼야 한다.
+                # 안 그러면 이전 프레임의 True값이 그대로 남고, control_loop가
+                # busbar_hole_coords가 비었을 때 hx,hy를 (bx,by)로 대체해서 오차 0(완벽
+                # 정렬)으로 착각해버린다 - 실제로는 그냥 이번 프레임에 못 찾은 것뿐인데
+                # 정렬 성공(hold_count 누적)으로 오판하는 버그였다. 다음 프레임에서
+                # detect_yellow_busbar_holes_depth가 다시 시도하므로(10Hz+ 루프) 별도
+                # 재시도 트리거 없이 자동으로 재탐지된다.
+                self.has_valid_tracking = False
+                self.hold_count = 0
+                sys.stdout.write("\r\033[K[Tracking Status] 버스바 구멍 검출 실패 - 재탐지 대기 중...")
+                sys.stdout.flush()
 
         cv2.imshow("Battery Assembly Vision - RGB Tracking", display_img)
         cv2.waitKey(1)
