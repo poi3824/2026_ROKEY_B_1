@@ -17,15 +17,15 @@ Y_BUSBAR = (1.2392 + 1.205 + 1.2367) / 3
 AMR_STATION_POSES = {
     "station_5": {
         "battery": ("battery5", X_BATTERY, -1.1964, -1.5707),
-        "busbar": ("busbar5", -1.1298, Y_BUSBAR, 0.0),
+        "busbar": ("busbar5", -1.1298, Y_BUSBAR, -1.5707),
     },
     "station_4": {
         "battery": ("battery4", X_BATTERY, -0.6617, -1.5707),
-        "busbar": ("busbar4", -0.6606, Y_BUSBAR, 0.0),
+        "busbar": ("busbar4", -0.6606, Y_BUSBAR, -1.5707),
     },
     "station_3": {
         "battery": ("battery3", X_BATTERY, -0.0382, -1.5707),
-        "busbar": ("busbar3", -0.1911, Y_BUSBAR, 0.0),
+        "busbar": ("busbar3", 0.5867, 1.9078, -1.5707),
     },
 }
 

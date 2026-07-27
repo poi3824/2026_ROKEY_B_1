@@ -491,60 +491,74 @@ class ArmNode(Node):
         return False
 
     def request_bolt_pair_midpoint_async(self):
-        """Perception 노드의 /perception/get_bolt_pair 서비스 준비 및 비동기 호출 무제한 대기"""
+        """Perception 노드의 /perception/get_bolt_pair 서비스 준비 및 비동기 호출 무제한 대기.
+        도착 직후에는 perception_node가 아직 안정적인 표본(SMOOTHING_MIN_SAMPLES개, 최근
+        SMOOTHING_WINDOW_SEC초 이내)을 못 모았을 수 있어 found=False가 정상적으로도 나올 수
+        있다 - 그래서 한 번만 물어보고 실패 처리하지 않고 found=True가 나올 때까지 재시도한다."""
         while not self.client_get_bolt_pair.wait_for_service(timeout_sec=1.0):
             self.get_logger().warn("GetBoltPair 서비스 준비 대기 중...", throttle_duration_sec=2.0)
 
-        req = GetBoltPair.Request()
-        future = self.client_get_bolt_pair.call_async(req)
+        while rclpy.ok():
+            req = GetBoltPair.Request()
+            future = self.client_get_bolt_pair.call_async(req)
 
-        while not future.done():
-            time.sleep(0.05)
+            while not future.done():
+                time.sleep(0.05)
 
-        res = future.result()
-        if res is not None and res.found:
-            pose_a = res.pose_a.pose.position
-            pose_b = res.pose_b.pose.position
+            res = future.result()
+            if res is not None and res.found:
+                pose_a = res.pose_a.pose.position
+                pose_b = res.pose_b.pose.position
 
-            # 두 볼트의 3D 중앙 좌표 연산
-            midpoint_pose = PoseStamped()
-            midpoint_pose.header = res.pose_a.header
-            midpoint_pose.pose.position.x = (pose_a.x + pose_b.x) / 2.0
-            midpoint_pose.pose.position.y = (pose_a.y + pose_b.y) / 2.0
-            midpoint_pose.pose.position.z = (pose_a.z + pose_b.z) / 2.0
+                # 두 볼트의 3D 중앙 좌표 연산
+                midpoint_pose = PoseStamped()
+                midpoint_pose.header = res.pose_a.header
+                midpoint_pose.pose.position.x = (pose_a.x + pose_b.x) / 2.0
+                midpoint_pose.pose.position.y = (pose_a.y + pose_b.y) / 2.0
+                midpoint_pose.pose.position.z = (pose_a.z + pose_b.z) / 2.0
 
-            # Orientation은 기본 세팅 사용
-            midpoint_pose.pose.orientation = res.pose_a.pose.orientation
+                # Orientation은 기본 세팅 사용
+                midpoint_pose.pose.orientation = res.pose_a.pose.orientation
 
-            return True, midpoint_pose, res.message
+                return True, midpoint_pose, res.message
 
-        return False, None, res.message if res else "GetBoltPair 수신 결과 없음"
+            self.get_logger().warn(
+                f"GetBoltPair found=False ({res.message if res else '응답 없음'}) - 재시도",
+                throttle_duration_sec=2.0)
+            time.sleep(0.2)
+
+        return False, None, "노드 종료로 GetBoltPair 재시도 중단"
 
     def request_vision_pose_async(self, target_label: str):
-        """GetGraspPose 서비스 무제한 대기 호출"""
+        """GetGraspPose 서비스 무제한 대기 호출. found=True가 나올 때까지 재시도한다
+        (request_bolt_pair_midpoint_async와 동일한 이유)."""
         if target_label in ["busbar", "nut"]:
             while not self.client_get_grasp_pose.wait_for_service(timeout_sec=1.0):
                 self.get_logger().warn(f"'{target_label}' GetGraspPose 서비스 준비 대기 중...", throttle_duration_sec=2.0)
 
-            req = GetGraspPose.Request()
-            req.label = target_label
-            future = self.client_get_grasp_pose.call_async(req)
-            
-            while not future.done():
-                time.sleep(0.05)
+            while rclpy.ok():
+                req = GetGraspPose.Request()
+                req.label = target_label
+                future = self.client_get_grasp_pose.call_async(req)
 
-            if future.done() and future.result() is not None:
+                while not future.done():
+                    time.sleep(0.05)
+
                 res = future.result()
-                if res.found:
+                if res is not None and res.found:
                     return True, res.pose, res.message
 
-            # Fallback 토픽 사용
-            if target_label == "busbar" and self.latest_busbar_grasp is not None:
-                return True, self.latest_busbar_grasp, "토픽 데이터 사용"
-            elif target_label == "nut" and self.latest_nut_pose is not None:
-                return True, self.latest_nut_pose, "토픽 데이터 사용"
+                # Fallback 토픽 사용
+                if target_label == "busbar" and self.latest_busbar_grasp is not None:
+                    return True, self.latest_busbar_grasp, "토픽 데이터 사용"
+                elif target_label == "nut" and self.latest_nut_pose is not None:
+                    return True, self.latest_nut_pose, "토픽 데이터 사용"
 
-            return False, None, f"'{target_label}' 검출 실패 (서비스/토픽 모두 없음)"
+                self.get_logger().warn(
+                    f"'{target_label}' GetGraspPose found=False - 재시도", throttle_duration_sec=2.0)
+                time.sleep(0.2)
+
+            return False, None, f"노드 종료로 '{target_label}' 검출 재시도 중단"
 
         return False, None, "알 수 없는 타겟 라벨"
 

@@ -105,7 +105,7 @@ class PerceptionNode(Node):
         self.declare_parameter('use_bolt_roi', True)
         self.declare_parameter('bolt_roi_x_min', 150)
         self.declare_parameter('bolt_roi_x_max', 490)
-        self.declare_parameter('bolt_roi_y_min', 150)
+        self.declare_parameter('bolt_roi_y_min', 180)
         self.declare_parameter('bolt_roi_y_max', 450)
 
         rgb_topic = self.get_parameter('rgb_topic').value
@@ -239,7 +239,11 @@ class PerceptionNode(Node):
                 if label not in best_this_tick or score > best_this_tick[label][0]:
                     best_this_tick[label] = (score, world_point)
                 if label == BOLT_LABEL:
-                    bolt_this_tick.append((score, world_point))
+                    bolt_this_tick.append((score, world_point, (px_x, px_y)))
+            elif label == BOLT_LABEL:
+                self.get_logger().warn(
+                    f"[bolt] YOLO 검출됐지만 world 좌표 변환 실패 pixel=({px_x},{px_y}), status={status}",
+                    throttle_duration_sec=2.0)
 
         now = self.get_clock().now()
         for label, (score, world_point) in best_this_tick.items():
@@ -249,7 +253,7 @@ class PerceptionNode(Node):
             self._latest_by_label[label] = (score, mean_point, now)
             self._publish_vision_topic(label, mean_point, header.stamp)
 
-        self._update_bolt_pair(bolt_this_tick, now)
+        self._update_bolt_pair(bolt_this_tick, now, rgb.shape[1], rgb.shape[0])
 
         self._detections_pub.publish(array_msg)
 
@@ -308,17 +312,23 @@ class PerceptionNode(Node):
             )
         return tuple(mean), n
 
-    def _update_bolt_pair(self, bolt_candidates, now):
+    def _update_bolt_pair(self, bolt_candidates, now, image_w=None, image_h=None):
         if len(bolt_candidates) < 2:
+            if bolt_candidates:
+                self.get_logger().warn(
+                    f"[bolt-pair] 유효한 world 좌표 볼트 부족: {len(bolt_candidates)}/2",
+                    throttle_duration_sec=2.0)
             return
 
-        # 점수 기준 정렬에서 화면 중앙(카메라 축) 근처 우선 정렬로 보정
+        # 점수 기준 정렬 대신 화면 중앙(이미지 픽셀 중심) 근처 우선 정렬로 보정
+        image_cx = (image_w or 0) / 2.0
+        image_cy = (image_h or 0) / 2.0
         bolt_candidates = sorted(
-            bolt_candidates, 
-            key=lambda c: np.hypot(c[1][0], c[1][1])
+            bolt_candidates,
+            key=lambda c: np.hypot(c[2][0] - image_cx, c[2][1] - image_cy)
         )[:2]
 
-        points = [np.asarray(wp, dtype=float) for _, wp in bolt_candidates]
+        points = [np.asarray(wp, dtype=float) for _, wp, _px in bolt_candidates]
 
         prev_a = self._recent_bolt_a[-1][0] if self._recent_bolt_a else None
         prev_b = self._recent_bolt_b[-1][0] if self._recent_bolt_b else None
