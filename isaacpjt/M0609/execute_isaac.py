@@ -38,6 +38,33 @@ simulation_app.update()
 
 sys.stdout.reconfigure(line_buffering=True)
 
+
+class _Tee:
+    """print()/stdout 출력을 원본 스트림과 로그 파일에 동시에 기록한다."""
+
+    def __init__(self, *streams):
+        self._streams = streams
+
+    def write(self, data):
+        for s in self._streams:
+            s.write(data)
+            s.flush()
+
+    def flush(self):
+        for s in self._streams:
+            s.flush()
+
+
+# 매 실행마다 콘솔 출력(단계별 phase, [Dynamic Target Set] 등)을 로그 파일에도
+# 자동 기록한다 - 별도로 `| tee`를 붙이지 않아도 사후 디버깅에 사용할 수 있다.
+_LOG_DIR = Path(__file__).resolve().parent / "logs"
+_LOG_DIR.mkdir(exist_ok=True)
+_LOG_PATH = _LOG_DIR / f"isaac_run_{time.strftime('%Y%m%d_%H%M%S')}.log"
+_log_file = open(_LOG_PATH, "a", buffering=1)
+sys.stdout = _Tee(sys.stdout, _log_file)
+sys.stderr = _Tee(sys.stderr, _log_file)
+print(f"[Log] 콘솔 출력을 다음 파일에도 기록합니다: {_LOG_PATH}")
+
 # 2. USD 및 Isaac Core Imports
 import omni.usd
 from pxr import Usd, UsdGeom, UsdPhysics, Gf
