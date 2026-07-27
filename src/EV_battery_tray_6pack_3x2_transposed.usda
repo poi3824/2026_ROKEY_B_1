@@ -1,0 +1,20 @@
+#usda 1.0
+(
+    defaultPrim = "BatteryTray6Pack_3x2"
+    metersPerUnit = 1
+    upAxis = "Z"
+)
+
+# 2x3 tray를 Z축 기준 90도 회전하여 3x2 방향으로 배치하는 래퍼 레이어.
+# 원본 형상/재질/충돌 정보는 하위 reference로 그대로 유지된다.
+def Xform "BatteryTray6Pack_3x2"
+{
+    double3 xformOp:rotateXYZ = (0, 0, 90)
+    uniform token[] xformOpOrder = ["xformOp:rotateXYZ"]
+
+    def Xform "TraySource" (
+        prepend references = @./EV_battery_tray_6pack_source_2x3.usd@</BatteryTray6Pack>
+    )
+    {
+    }
+}

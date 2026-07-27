@@ -1,0 +1,6 @@
+# Request (요청)
+string command
+---
+# Response (응답)
+bool success
+string message

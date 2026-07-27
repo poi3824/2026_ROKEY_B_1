@@ -1,0 +1,1 @@
+[저장 완료] /World/battery_pack3 kinematicEnabled=True -> /home/rokey/EV_combine/src/Collected_World0123/World0123.usd
