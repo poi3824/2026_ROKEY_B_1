@@ -159,7 +159,7 @@ target_fine_pos      = None
 PICK_TOLERANCE_STRICT    = 0.01     # 10mm
 JOINT_TOLERANCE          = 0.02     # 관절 오차 허용범위 (rad)
 PICK_TOLERANCE_LOOSE_VAL = 0.015
-MAX_STUCK_STEPS          = 1800      # Phase 타임아웃 기준
+MAX_STUCK_STEPS          = 100000      # Phase 타임아웃 기준
 PHYSICS_DT               = 1.0 / 60.0
 
 # ★ 버스바 PI 정렬(assembly_nut_fraction1.py에서 이식) - /busbar_alignment_error

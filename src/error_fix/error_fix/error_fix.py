@@ -199,7 +199,7 @@ class BatteryAssemblyVisionNode(Node):
         else:
             self.hold_count = 0  # 1픽셀이라도 차이 날 경우 연속 카운터 초기화
 
-        FIXED_STEP = 0.0002  # 0.1mm (0.0001m) 고정 스텝
+        FIXED_STEP = 0.0006  # 0.6mm 고정 스텝 (기존 0.0002=0.2mm에서 3배, 수렴이 너무 느려서 상향)
 
         # --- dx (위/아래) 설정 ---
         if hy < by:          # 구멍이 위에 있음
