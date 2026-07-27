@@ -110,9 +110,7 @@ class BatteryAssemblyVisionNode(Node):
         self.is_active = False          # 트리거 수신 전까지는 False
         self.bolts_detected = False     # 노드 실행 직후 백그라운드에서 검출 진행
 
-        # 버스바 미검출 시 Hold 처리용 (픽셀 좌표 차이)
-        self.last_valid_dx_px = 0       # hx - bx (양수: 구멍이 오른쪽, 음수: 구멍이 왼쪽)
-        self.last_valid_dy_px = 0       # hy - by (양수: 구멍이 아래쪽, 음수: 구멍이 위쪽)
+        # 버스바 미검출 시 Hold 처리용
         self.last_valid_dtheta = 0.0
         self.has_valid_tracking = False
 
@@ -258,8 +256,6 @@ class BatteryAssemblyVisionNode(Node):
                     self.get_logger().warn(f"⚠️ [비전 노이즈 차단] 비정상적 픽셀 오차 감지! dx:{dx_px}, dy:{dy_px} -> 프레임 스킵")
                     self.has_valid_tracking = False
                 else:
-                    self.last_valid_dx_px = dx_px
-                    self.last_valid_dy_px = dy_px
                     if self.dtheta_ema is None:
                         self.dtheta_ema = angle_error
                     else:
