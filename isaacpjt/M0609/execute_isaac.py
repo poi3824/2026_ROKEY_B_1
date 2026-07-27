@@ -113,6 +113,12 @@ NUT_PICK_Z         = NUT_SUPPLY_TABLE_Z - (NUT_GRASP_Z_LOCAL - 0.0395)
 NUT_APPROACH_Z     = 0.8                                     # 너트 파지 상공 고도
 BOLT_APPROACH_Z    = 0.6                                     # 볼트 체결 상공 고도
 
+# ★ 체결 착좌(bolt_touch_pos) 전용 높이 오프셋 - NUT_GRASP_Z_LOCAL은 너트 파지
+# 깊이(NUT_PICK_Z)에도 같이 쓰이는 공용 상수라, 착좌 높이만 따로 튜닝하기 위해
+# 분리했다. target_mid_pos[2](0.0693) + EE_OFFSET[2](0.185) + 이 값 = 목표 착좌
+# 높이(EE Z) - 실측 기준 0.3695m가 되도록 역산한 값 (2026-07-27).
+NUT_FASTEN_TOUCH_Z_LOCAL = 0.1152
+
 # ★ 너트 1/2번 파지 XY (assembly_nut_fraction1.py의 NUT1_PICK_POS/NUT2_PICK_POS와 동일값) ★
 # 그리퍼 장착 카메라(eye-in-hand)로 하강 중 실시간 추적을 시도했더니 접근할수록
 # 목표가 표류해 완전히 미달하는 문제가 있었음(2026-07-27 실측) - 원인 규명 전까지는
@@ -637,7 +643,7 @@ def main():
                         print(f"    [Vision] get_bolt_pair 실측 좌표로 대체 -> X={vpos.x:.4f}, Y={vpos.y:.4f}")
                     bolt_touch_pos = np.array([
                         bolt_target_pos[0], bolt_target_pos[1],
-                        bolt_target_pos[2] + EE_OFFSET[2] + NUT_GRASP_Z_LOCAL
+                        bolt_target_pos[2] + EE_OFFSET[2] + NUT_FASTEN_TOUCH_Z_LOCAL
                     ])
                     phase = "MOVE_TO_BOLT_NUT"
                     step_count = 0
