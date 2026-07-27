@@ -207,6 +207,10 @@ LOG_DIR       = _THIS_DIR / "logs"
 SCREW_LOG_CSV = LOG_DIR / "screw_log.csv"
 SCREW_LOG_FIELDS = ["nut_id", "step", "pass_idx", "theta_deg", "total_deg", "depth_mm", "tcp_z", "torque_nm", "stuck_counter", "seated"]
 
+# ★ YawAligner(PI) 실시간 모니터링 로그 저장 경로 (plot_yaw_align_log.py 참고) ★
+YAW_ALIGN_LOG_CSV = LOG_DIR / "yaw_align_log.csv"
+YAW_ALIGN_LOG_FIELDS = ["t_s", "step", "phase", "error_deg", "correction_deg", "dx_mm", "dy_mm", "saturated"]
+
 
 # ══════════════════════════════════════════════════════════════════════════
 #  [B] 헬퍼 및 Kinematic Pose-Glue / Screwing / 마찰력 생성 함수
@@ -606,6 +610,7 @@ def main():
     # 출력은 ±15deg로 클램프해 급격한 점프 방지.
     yaw_aligner = YawAligner(kp=1.0, ki=0.0589, out_limit_deg=15.0)
     last_dtheta_stamp = 0.0
+    yaw_align_start_time = None  # yaw_aligner.reset() 시점에 찍는 기준 시각 (t_s 축 기준)
 
     print("[대기] Isaac Sim UI에서 Play 버튼을 누르면 시퀀스를 시작합니다.")
 
@@ -639,6 +644,9 @@ def main():
 
     # ★ 체결(Screwing) 로그 버퍼 (torque-angle 등 후처리 시각화용) ★
     screw_records = []
+
+    # ★ YawAligner(PI) 실시간 모니터링 로그 버퍼 (error/correction 수렴 확인용) ★
+    yaw_align_records = []
 
     while simulation_app.is_running():
         world.step(render=True)
@@ -679,6 +687,8 @@ def main():
             screw_pass_theta = 0.0
             stuck_counter = 0
             screw_records = []
+            yaw_align_records = []
+            yaw_align_start_time = None
             print(f"\n[Play] 시퀀스 재시작 (모든 객체 포즈 및 오차 조건 초기화 완료)")
 
         if playing and phase != "DONE":
@@ -750,10 +760,12 @@ def main():
                 if step_count == 0:
                     yaw_aligner.reset()
                     last_dtheta_stamp = 0.0
+                    yaw_align_start_time = time.time()
                 if alignment_listener.last_stamp > last_dtheta_stamp and \
                         (time.time() - alignment_listener.last_stamp) <= BUSBAR_ALIGNMENT_MAX_AGE:
                     last_dtheta_stamp = alignment_listener.last_stamp
-                    yaw_aligner.update(math.degrees(alignment_listener.dtheta))
+                    _raw_error_deg = math.degrees(alignment_listener.dtheta)
+                    yaw_aligner.update(_raw_error_deg)
                     # XY도 yaw와 같은 프레임에서 같이 갱신 - 버스바 구멍은 회전축에서
                     # 떨어져 있어서, yaw가 계속 바뀌는 동안 XY를 한 번만 캡처해서 고정하면
                     # 그 뒤 yaw 보정 때문에 구멍 위치가 다시 어긋난다(실측 확인됨).
@@ -761,6 +773,16 @@ def main():
                         TARGET_INSERT_POS[0] - alignment_listener.dx,
                         TARGET_INSERT_POS[1] - alignment_listener.dy,
                     ])
+                    yaw_align_records.append({
+                        "t_s": time.time() - yaw_align_start_time,
+                        "step": step_count,
+                        "phase": phase,
+                        "error_deg": _raw_error_deg,
+                        "correction_deg": yaw_aligner.correction_deg,
+                        "dx_mm": alignment_listener.dx * 1000.0,
+                        "dy_mm": alignment_listener.dy * 1000.0,
+                        "saturated": abs(yaw_aligner.correction_deg) >= yaw_aligner.out_limit_deg,
+                    })
                 quat_busbar_yawfix = yaw_rotated_quat(quat_busbar_0deg, yaw_aligner.correction_deg)
 
                 actions = arm_controller.forward(target_end_effector_position=TARGET_DESTINATION_POS, target_end_effector_orientation=quat_busbar_yawfix)
@@ -784,12 +806,23 @@ def main():
                 if alignment_listener.last_stamp > last_dtheta_stamp and \
                         (time.time() - alignment_listener.last_stamp) <= BUSBAR_ALIGNMENT_MAX_AGE:
                     last_dtheta_stamp = alignment_listener.last_stamp
-                    yaw_aligner.update(math.degrees(alignment_listener.dtheta))
+                    _raw_error_deg = math.degrees(alignment_listener.dtheta)
+                    yaw_aligner.update(_raw_error_deg)
                     # 하강 중에도 XY를 계속 실시간으로 추적(위와 동일한 이유)
                     busbar_insert_xy = np.array([
                         TARGET_INSERT_POS[0] - alignment_listener.dx,
                         TARGET_INSERT_POS[1] - alignment_listener.dy,
                     ])
+                    yaw_align_records.append({
+                        "t_s": time.time() - yaw_align_start_time,
+                        "step": step_count,
+                        "phase": phase,
+                        "error_deg": _raw_error_deg,
+                        "correction_deg": yaw_aligner.correction_deg,
+                        "dx_mm": alignment_listener.dx * 1000.0,
+                        "dy_mm": alignment_listener.dy * 1000.0,
+                        "saturated": abs(yaw_aligner.correction_deg) >= yaw_aligner.out_limit_deg,
+                    })
                 quat_busbar_yawfix = yaw_rotated_quat(quat_busbar_0deg, yaw_aligner.correction_deg)
 
                 actions = arm_controller.forward(target_end_effector_position=step_target_pos, target_end_effector_orientation=quat_busbar_yawfix)
@@ -1420,6 +1453,14 @@ def main():
             writer.writeheader()
             writer.writerows(screw_records)
         print(f"[INFO] 체결(Screwing) 로그 저장 완료 -> {SCREW_LOG_CSV} ({len(screw_records)} rows)")
+
+    if yaw_align_records:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        with open(YAW_ALIGN_LOG_CSV, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=YAW_ALIGN_LOG_FIELDS)
+            writer.writeheader()
+            writer.writerows(yaw_align_records)
+        print(f"[INFO] YawAligner(PI) 모니터링 로그 저장 완료 -> {YAW_ALIGN_LOG_CSV} ({len(yaw_align_records)} rows)")
 
     alignment_listener.destroy_node()
     if rclpy.ok():
