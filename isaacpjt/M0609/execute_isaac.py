@@ -117,6 +117,13 @@ NUT_PICK_Z         = NUT_SUPPLY_TABLE_Z - (NUT_GRASP_Z_LOCAL - 0.0395)
 NUT_APPROACH_Z     = 0.8                                     # 너트 파지 상공 고도
 BOLT_APPROACH_Z    = 0.6                                     # 볼트 체결 상공 고도
 
+# ★ 너트 1/2번 파지 XY (assembly_nut_fraction1.py의 NUT1_PICK_POS/NUT2_PICK_POS와 동일값) ★
+# 그리퍼 장착 카메라(eye-in-hand)로 하강 중 실시간 추적을 시도했더니 접근할수록
+# 목표가 표류해 완전히 미달하는 문제가 있었음(2026-07-27 실측) - 원인 규명 전까지는
+# 공급대에 항상 같은 자리로 놓이는 너트 특성상 고정좌표가 더 안정적이라 되돌린다.
+NUT1_PICK_XY = (0.5746, -0.1008)
+NUT2_PICK_XY = (0.6643, -0.1031)
+
 # ★ 볼트 1/2번 참고 좌표 (절대좌표로 직접 이동에 사용 금지!) ★
 # 아래 두 좌표는 버스바 체결 시 사용되는 기준 배터리 중심 좌표(_REF_BATTERY_CENTER_POS) 대비
 # 상대 오프셋(Offset)을 미리 계산해 두기 위한 참고값일 뿐이며, 실제 체결 시에는
@@ -544,16 +551,15 @@ def main():
 
             elif task in ("PICK_NUT1", "PICK_NUT2"):
                 nut_index = 1 if task == "PICK_NUT1" else 2
-                if isaac_node.latest_target_pose is not None:
-                    pos = isaac_node.latest_target_pose.pose.position
-                    nut_pick_pos = np.array([pos.x, pos.y, NUT_PICK_Z])
-                    nut_approach_pos = np.array([pos.x, pos.y, NUT_APPROACH_Z])
-                    phase = "NUT_APPROACH"
-                    step_count = 0
-                    print(f"\n>>> [{task}] 너트 {nut_index}번 상공 접근 시작 (Target: X={nut_approach_pos[0]:.3f}, Y={nut_approach_pos[1]:.3f})")
-                else:
-                    print(f"\n[ERROR] [{task}] 수신된 너트 Target Pose가 없습니다.")
-                    publish_status("FAILURE:NO_TARGET_POSE")
+                # ★ 비전(latest_target_pose) 대신 assembly_nut_fraction1.py와 동일한
+                # 고정좌표 사용 - 공급대 너트 위치는 항상 같아서 eye-in-hand 실시간
+                # 추적보다 이쪽이 더 안정적 (위 NUT1_PICK_XY/NUT2_PICK_XY 주석 참고).
+                pick_xy = NUT1_PICK_XY if nut_index == 1 else NUT2_PICK_XY
+                nut_pick_pos = np.array([pick_xy[0], pick_xy[1], NUT_PICK_Z])
+                nut_approach_pos = np.array([pick_xy[0], pick_xy[1], NUT_APPROACH_Z])
+                phase = "NUT_APPROACH"
+                step_count = 0
+                print(f"\n>>> [{task}] 너트 {nut_index}번 상공 접근 시작 (Target: X={nut_approach_pos[0]:.3f}, Y={nut_approach_pos[1]:.3f})")
 
             elif task in ("ASSEMBLE_NUT1", "ASSEMBLE_NUT2"):
                 nut_index = 1 if task == "ASSEMBLE_NUT1" else 2
@@ -889,12 +895,9 @@ def main():
             # [11단계] 너트 상공 접근
             elif phase == "NUT_APPROACH":
                 publish_progress("NUT_APPROACH", 20.0)
-                # ★ 그리퍼 장착 카메라(eye-in-hand) 대응: 팔이 움직이면서 시점이 계속
-                # 바뀌므로, arm_node가 재발행하는 최신 비전 좌표(XY)로 매 스텝 목표를
-                # 갱신한다. Z는 이 단계 고정값(NUT_APPROACH_Z) 그대로 유지.
-                if isaac_node.latest_target_pose is not None:
-                    vpos = isaac_node.latest_target_pose.pose.position
-                    nut_approach_pos = np.array([vpos.x, vpos.y, NUT_APPROACH_Z])
+                # ★ eye-in-hand 실시간 추적은 접근할수록 목표가 표류해 미달하는 문제가
+                # 있어서(위 NUT1_PICK_XY 주석 참고) 되돌림 - nut_approach_pos는
+                # PICK_NUT1/2 커맨드 수신 시 고정좌표로 한 번만 설정되고 여기서는 갱신 안 함.
                 actions = arm_controller.forward(target_end_effector_position=nut_approach_pos, target_end_effector_orientation=quat_nut)
                 robot.apply_action(actions)
                 robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_OPEN))
@@ -917,11 +920,8 @@ def main():
             # [12단계] 너트 파지점 하강
             elif phase == "NUT_DESCEND":
                 publish_progress("NUT_DESCEND", 40.0)
-                # ★ NUT_APPROACH와 동일한 이유로 하강 중에도 XY를 매 스텝 갱신
-                # (Z는 이 단계 고정값 NUT_PICK_Z 그대로 유지).
-                if isaac_node.latest_target_pose is not None:
-                    vpos = isaac_node.latest_target_pose.pose.position
-                    nut_pick_pos = np.array([vpos.x, vpos.y, NUT_PICK_Z])
+                # ★ NUT_APPROACH와 동일한 이유로 하강 중에도 고정좌표(nut_pick_pos)를
+                # 그대로 유지, 매 스텝 갱신하지 않음.
                 actions = arm_controller.forward(target_end_effector_position=nut_pick_pos, target_end_effector_orientation=quat_nut)
                 robot.apply_action(actions)
                 robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_OPEN))
