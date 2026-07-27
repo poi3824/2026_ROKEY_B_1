@@ -376,8 +376,11 @@ class ArmNode(Node):
                 return result_msg
 
             # 2. 이동 완료 후 Perception 노드에 너트 좌표 요청
-            self.get_logger().info(f" -> [{task_type}] 너트 스캔 위치 도착 완료. 비전 노드에 너트 좌표 요청...")
-            found, nut_pose, msg = self.request_vision_pose_async("nut")
+            # ★ 단발 요청 대신 5초간 지속적으로 재요청 - perception_node의 롤링 평균
+            # 캐시가 도착 직후엔 비어있을 수 있고, 순간적인 미검출로 전체 태스크가
+            # abort되는 걸 막기 위함 (retry_timeout_sec 참고: request_vision_pose_async).
+            self.get_logger().info(f" -> [{task_type}] 너트 스캔 위치 도착 완료. 비전 노드에 너트 좌표 지속 요청...")
+            found, nut_pose, msg = self.request_vision_pose_async("nut", retry_timeout_sec=5.0)
 
             if found and nut_pose is not None:
                 if task_type == "SCAN_NUT1":
@@ -528,14 +531,28 @@ class ArmNode(Node):
 
         return False, None, res.message if res else "GetBoltPair 수신 결과 없음"
 
-    def request_vision_pose_async(self, target_label: str, timeout_sec: float = 3.0):
-        """Action Thread 안전한 Service 비동기 호출"""
-        if target_label in ["busbar", "nut"]:
+    def request_vision_pose_async(self, target_label: str, timeout_sec: float = 3.0,
+                                   retry_timeout_sec: float = 0.0, retry_interval_sec: float = 0.3):
+        """Action Thread 안전한 Service 비동기 호출.
+
+        retry_timeout_sec=0(기본)이면 기존과 동일하게 단발 요청 후 실패 시 바로 포기한다.
+        retry_timeout_sec > 0으로 주면, 첫 시도에서 found=False가 나와도 바로 포기하지 않고
+        그 시간 동안 retry_interval_sec 간격으로 계속 재요청한다 - perception_node의 롤링
+        평균 캐시(SMOOTHING_WINDOW_SEC)가 스캔 도착 직후엔 아직 안 채워져 있거나, 순간적으로
+        검출을 놓친 경우를 대비한 것.
+        """
+        if target_label not in ["busbar", "nut"]:
+            return False, None, "알 수 없는 타겟 라벨"
+
+        deadline = time.time() + max(retry_timeout_sec, 0.0)
+        last_message = f"'{target_label}' 검출 실패 (서비스/토픽 모두 없음)"
+
+        while True:
             if self.client_get_grasp_pose.wait_for_service(timeout_sec=1.0):
                 req = GetGraspPose.Request()
                 req.label = target_label
                 future = self.client_get_grasp_pose.call_async(req)
-                
+
                 start = time.time()
                 while not future.done():
                     if time.time() - start > timeout_sec:
@@ -546,16 +563,20 @@ class ArmNode(Node):
                     res = future.result()
                     if res.found:
                         return True, res.pose, res.message
+                    last_message = res.message
 
-            # Fallback 토픽 사용
+            # Fallback 토픽 사용 (서비스는 못 받았어도 그 사이 토픽에 새 값이 왔을 수 있음)
             if target_label == "busbar" and self.latest_busbar_grasp is not None:
                 return True, self.latest_busbar_grasp, "토픽 데이터 사용"
             elif target_label == "nut" and self.latest_nut_pose is not None:
                 return True, self.latest_nut_pose, "토픽 데이터 사용"
 
-            return False, None, f"'{target_label}' 검출 실패 (서비스/토픽 모두 없음)"
+            if time.time() >= deadline:
+                if retry_timeout_sec > 0.0:
+                    return False, None, f"'{target_label}' 검출 실패 ({retry_timeout_sec:.1f}s 재시도 후 포기: {last_message})"
+                return False, None, last_message
 
-        return False, None, "알 수 없는 타겟 라벨"
+            time.sleep(retry_interval_sec)
 
 
 def main(args=None):
