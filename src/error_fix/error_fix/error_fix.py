@@ -41,7 +41,7 @@ class BatteryAssemblyVisionNode(Node):
         # 제어 및 오차 보정 파라미터
         # ----------------------------------------------------------------------
         self.TOLERANCE_DEG = 3        # 목표 각도 정밀도: 0.5도 이하
-        self.MAX_VALID_PIXEL_ERR = 200  # 이상치 픽셀 오차 스킵 가드
+        self.MAX_VALID_PIXEL_ERR = 400  # 이상치 픽셀 오차 스킵 가드
 
         # 최신 Depth 프레임 및 상태 변수
         self.current_depth_frame = None

@@ -2,16 +2,17 @@
 """
 arm_node.py - ROS 2 Arm Control Node (MultiThreaded Executor & Reentrant Group)
 - BehaviorNode의 /execute_arm_task Action 수신
+- 타임아웃 없이 Isaac Sim 및 비전 서비스 응답을 무제한 대기
 - [지원 Task]
   1. SCAN_BATTERY        : 배터리 스캔 위치로 이동 후 Perception 노드로부터 두 볼트의 중앙 좌표 수신 및 저장
   2. SCAN_BUSBAR         : 버스바 스캔 위치로 이동 후 Perception 노드로부터 버스바 파지 좌표 미리 수신 및 저장
   3. PICK_BUSBAR         : 버스바 비전 위치 수신(또는 저장된 좌표 활용) 및 Isaac Sim 파지 명령 중계
   4. MOVE_BATTERY_CENTER : 스캔 시 저장한 배터리 중점 좌표를 Isaac Sim으로 퍼블리시 및 이동 명령 중계
   5. FINE_ALIGNMENT       : Isaac Sim 및 비전 노드의 정밀 1픽셀 오차 보정 명령 중계
-  6. ASSEMBLE_BUSBAR      : Isaac Sim으로 버스바 하강 체결 및 그리퍼 해제 명령 중계 (추가됨)
-  7. SCAN_NUT1/SCAN_NUT2       : 너트 스캔 위치 이동 후 Perception 노드로부터 너트 좌표 수신 및 저장 (신규)
-  8. PICK_NUT1/PICK_NUT2       : 스캔된 너트 좌표로 Isaac Sim 파지 명령 중계 (신규)
-  9. ASSEMBLE_NUT1/ASSEMBLE_NUT2 : Isaac Sim으로 너트 Screwing 체결 명령 중계 (신규)
+  6. ASSEMBLE_BUSBAR      : Isaac Sim으로 버스바 하강 체결 및 그리퍼 해제 명령 중계
+  7. SCAN_NUT1/SCAN_NUT2       : 너트 스캔 위치 이동 후 Perception 노드로부터 너트 좌표 수신 및 저장
+  8. PICK_NUT1/PICK_NUT2       : 스캔된 너트 좌표로 Isaac Sim 파지 명령 중계
+  9. ASSEMBLE_NUT1/ASSEMBLE_NUT2 : Isaac Sim으로 너트 Screwing 체결 명령 중계
 """
 
 import time
@@ -33,7 +34,7 @@ class ArmNode(Node):
     def __init__(self):
         super().__init__('arm_node')
         self.get_logger().info("===========================================")
-        self.get_logger().info(" ArmNode 활성화 (배터리/버스바 스캔, 파지, 이동, 정밀 보정 및 체결 지원)")
+        self.get_logger().info(" ArmNode 활성화 (타임아웃 없이 무제한 대기 모드)")
         self.get_logger().info("===========================================")
 
         # Reentrant Callback Group 적용 (교착 상태 방지)
@@ -92,7 +93,7 @@ class ArmNode(Node):
         # 버스바 스캔 시 저장할 버스바 파지 좌표 (PoseStamped)
         self.scanned_busbar_pose = None
 
-        # 너트 스캔 시 저장할 너트 1번 / 2번 좌표 (PoseStamped) (신규 추가)
+        # 너트 스캔 시 저장할 너트 1번 / 2번 좌표 (PoseStamped)
         self.scanned_nut1_pose = None
         self.scanned_nut2_pose = None
 
@@ -148,7 +149,7 @@ class ArmNode(Node):
 
             # 2. 이동 완료 후 Perception 노드에 볼트 페어 비전 좌표 요청
             self.get_logger().info(" -> [SCAN_BATTERY] 배터리 스캔 위치 도착 완료. 비전 노드에 볼트 쌍 좌표 요청...")
-            found, midpoint_pose, msg = self.request_bolt_pair_midpoint_async(timeout_sec=5.0)
+            found, midpoint_pose, msg = self.request_bolt_pair_midpoint_async()
 
             if found and midpoint_pose is not None:
                 self.scanned_battery_midpoint = midpoint_pose
@@ -193,7 +194,7 @@ class ArmNode(Node):
 
             # 2. 이동 완료 후 Perception 노드에 버스바 좌표 요청
             self.get_logger().info(" -> [SCAN_BUSBAR] 버스바 스캔 위치 도착 완료. 비전 노드에 버스바 좌표 요청...")
-            found, busbar_pose, msg = self.request_vision_pose_async("busbar", timeout_sec=5.0)
+            found, busbar_pose, msg = self.request_vision_pose_async("busbar")
 
             if found and busbar_pose is not None:
                 self.scanned_busbar_pose = busbar_pose
@@ -257,7 +258,7 @@ class ArmNode(Node):
                 goal_handle.succeed()
             else:
                 result_msg.success = False
-                result_msg.error_code = "ISAAC_FAILED_OR_TIMEOUT"
+                result_msg.error_code = "ISAAC_FAILED"
                 result_msg.message = f"Isaac Sim 완료 실패 (Status: {self.isaac_status})"
                 goal_handle.abort()
 
@@ -315,8 +316,7 @@ class ArmNode(Node):
             cmd_msg.data = "FINE_ALIGNMENT"
             self.pub_task_command.publish(cmd_msg)
 
-            # Isaac Sim이 비전 보정을 거쳐 ALIGNMENT_SUCCESS 신호를 보낼 때까지 대기 (타임아웃 45초 지정)
-            success = self.wait_for_isaac_completion(goal_handle, feedback_msg, timeout_sec=45.0)
+            success = self.wait_for_isaac_completion(goal_handle, feedback_msg)
 
             if success:
                 result_msg.success = True
@@ -331,7 +331,7 @@ class ArmNode(Node):
             return result_msg
 
         # ---------------------------------------------------------------------
-        # 🔥 [Task 6] ASSEMBLE_BUSBAR (버스바 하강 체결 및 그리퍼 해제 중계)
+        # [Task 6] ASSEMBLE_BUSBAR (버스바 하강 체결 및 그리퍼 해제 중계)
         # ---------------------------------------------------------------------
         elif task_type == "ASSEMBLE_BUSBAR":
             self.get_logger().info(" -> [ASSEMBLE_BUSBAR] Isaac Sim으로 버스바 최종 체결 명령 전송")
@@ -340,8 +340,7 @@ class ArmNode(Node):
             cmd_msg.data = "ASSEMBLE_BUSBAR"
             self.pub_task_command.publish(cmd_msg)
 
-            # Isaac Sim이 하강 체결 후 완료 신호를 보낼 때까지 대기
-            success = self.wait_for_isaac_completion(goal_handle, feedback_msg, timeout_sec=30.0)
+            success = self.wait_for_isaac_completion(goal_handle, feedback_msg)
 
             if success:
                 result_msg.success = True
@@ -356,7 +355,7 @@ class ArmNode(Node):
             return result_msg
 
         # ---------------------------------------------------------------------
-        # 🔥 [Task 7] SCAN_NUT1 / SCAN_NUT2 (너트 스캔 지점 이동 & 비전 좌표 저장) (신규 추가)
+        # [Task 7] SCAN_NUT1 / SCAN_NUT2 (너트 스캔 지점 이동 & 비전 좌표 저장)
         # ---------------------------------------------------------------------
         elif task_type in ("SCAN_NUT1", "SCAN_NUT2"):
             self.get_logger().info(f" -> [{task_type}] Isaac Sim으로 너트 스캔 이동 명령 전송")
@@ -405,7 +404,7 @@ class ArmNode(Node):
             return result_msg
 
         # ---------------------------------------------------------------------
-        # 🔥 [Task 8] PICK_NUT1 / PICK_NUT2 (너트 물리 파지 및 들어올리기) (신규 추가)
+        # [Task 8] PICK_NUT1 / PICK_NUT2 (너트 물리 파지 및 들어올리기)
         # ---------------------------------------------------------------------
         elif task_type in ("PICK_NUT1", "PICK_NUT2"):
             nut_pose = self.scanned_nut1_pose if task_type == "PICK_NUT1" else self.scanned_nut2_pose
@@ -433,14 +432,14 @@ class ArmNode(Node):
                 goal_handle.succeed()
             else:
                 result_msg.success = False
-                result_msg.error_code = "ISAAC_FAILED_OR_TIMEOUT"
+                result_msg.error_code = "ISAAC_FAILED"
                 result_msg.message = f"Isaac Sim 완료 실패 (Status: {self.isaac_status})"
                 goal_handle.abort()
 
             return result_msg
 
         # ---------------------------------------------------------------------
-        # 🔥 [Task 9] ASSEMBLE_NUT1 / ASSEMBLE_NUT2 (너트 Screwing 체결 명령 중계) (신규 추가)
+        # [Task 9] ASSEMBLE_NUT1 / ASSEMBLE_NUT2 (너트 Screwing 체결 명령 중계)
         # ---------------------------------------------------------------------
         elif task_type in ("ASSEMBLE_NUT1", "ASSEMBLE_NUT2"):
             self.get_logger().info(f" -> [{task_type}] Isaac Sim으로 너트 체결(Screwing) 명령 전송")
@@ -449,8 +448,8 @@ class ArmNode(Node):
             cmd_msg.data = task_type
             self.pub_task_command.publish(cmd_msg)
 
-            # Isaac Sim이 착좌/Screwing/Regrasp/이탈까지 완료 신호를 보낼 때까지 대기
-            success = self.wait_for_isaac_completion(goal_handle, feedback_msg, timeout_sec=60.0)
+            # Isaac Sim 완료 응답만 무제한 대기
+            success = self.wait_for_isaac_completion(goal_handle, feedback_msg)
 
             if success:
                 result_msg.success = True
@@ -474,8 +473,8 @@ class ArmNode(Node):
             goal_handle.abort()
             return result_msg
 
-    def wait_for_isaac_completion(self, goal_handle, feedback_msg, timeout_sec: float = 30.0) -> bool:
-        start_time = time.time()
+    def wait_for_isaac_completion(self, goal_handle, feedback_msg) -> bool:
+        """타임아웃 없이 Isaac Sim의 SUCCESS 또는 FAILURE 상태만 대기"""
         while rclpy.ok():
             feedback_msg.sub_phase = self.isaac_phase
             feedback_msg.progress_pct = float(self.isaac_progress)
@@ -487,26 +486,19 @@ class ArmNode(Node):
                 elif "FAILURE" in self.isaac_status:
                     return False
 
-            if time.time() - start_time > timeout_sec:
-                self.get_logger().error("Isaac Sim 응답 시간 초과 (Timeout)")
-                return False
-
             time.sleep(0.1)
 
         return False
 
-    def request_bolt_pair_midpoint_async(self, timeout_sec: float = 5.0):
-        """Perception 노드의 /perception/get_bolt_pair 서비스를 호출하여 두 볼트의 중앙 좌표 계산"""
-        if not self.client_get_bolt_pair.wait_for_service(timeout_sec=2.0):
-            return False, None, "GetBoltPair 서비스 응답 없음 (Timeout)"
+    def request_bolt_pair_midpoint_async(self):
+        """Perception 노드의 /perception/get_bolt_pair 서비스 준비 및 비동기 호출 무제한 대기"""
+        while not self.client_get_bolt_pair.wait_for_service(timeout_sec=1.0):
+            self.get_logger().warn("GetBoltPair 서비스 준비 대기 중...", throttle_duration_sec=2.0)
 
         req = GetBoltPair.Request()
         future = self.client_get_bolt_pair.call_async(req)
 
-        start = time.time()
         while not future.done():
-            if time.time() - start > timeout_sec:
-                return False, None, "GetBoltPair 서비스 호출 시간 초과"
             time.sleep(0.05)
 
         res = future.result()
@@ -528,24 +520,23 @@ class ArmNode(Node):
 
         return False, None, res.message if res else "GetBoltPair 수신 결과 없음"
 
-    def request_vision_pose_async(self, target_label: str, timeout_sec: float = 3.0):
-        """Action Thread 안전한 Service 비동기 호출"""
+    def request_vision_pose_async(self, target_label: str):
+        """GetGraspPose 서비스 무제한 대기 호출"""
         if target_label in ["busbar", "nut"]:
-            if self.client_get_grasp_pose.wait_for_service(timeout_sec=1.0):
-                req = GetGraspPose.Request()
-                req.label = target_label
-                future = self.client_get_grasp_pose.call_async(req)
-                
-                start = time.time()
-                while not future.done():
-                    if time.time() - start > timeout_sec:
-                        break
-                    time.sleep(0.05)
+            while not self.client_get_grasp_pose.wait_for_service(timeout_sec=1.0):
+                self.get_logger().warn(f"'{target_label}' GetGraspPose 서비스 준비 대기 중...", throttle_duration_sec=2.0)
 
-                if future.done() and future.result() is not None:
-                    res = future.result()
-                    if res.found:
-                        return True, res.pose, res.message
+            req = GetGraspPose.Request()
+            req.label = target_label
+            future = self.client_get_grasp_pose.call_async(req)
+            
+            while not future.done():
+                time.sleep(0.05)
+
+            if future.done() and future.result() is not None:
+                res = future.result()
+                if res.found:
+                    return True, res.pose, res.message
 
             # Fallback 토픽 사용
             if target_label == "busbar" and self.latest_busbar_grasp is not None:

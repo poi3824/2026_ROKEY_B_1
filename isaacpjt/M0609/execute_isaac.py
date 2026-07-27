@@ -16,6 +16,7 @@ BehaviorNode (FSM) 및 ArmNode, Vision Correction Node 통신 연동 버전
    Carter에 고정되어 비전 없이도 위치가 일정함), 물리 파지(Gripper Close) 및 상승
 9. ASSEMBLE_NUT1 / ASSEMBLE_NUT2 : 볼트 1/2번의 실측 월드 좌표(BOLT1/2_WORLD_POS, test_isaac
    씬 고정 배치 기준 하드코딩)로 이동, 착좌 및 Screwing 체결(Regrasp 포함)
+10. RETURN_HOME_JOINTS  : 너트 2번 체결 완료 후 초기 관절 각도 [0, 0, 90, 0, 90, 0]로 완전 복귀
 """
 
 import os
@@ -70,7 +71,7 @@ GRIPPER_JOINTS   = ["finger_joint", "right_inner_knuckle_joint"]
 BUSBAR_ROOT_PATH      = "/World/busbar"
 BUSBAR_POLYSHAPE_PATH = "/World/busbar/geo/PolyShape"
 
-# 너트 Prim 경로 (신규 추가)
+# 너트 Prim 경로
 NUT1_ROOT_PATH      = "/World/nut1"
 NUT2_ROOT_PATH      = "/World/nut2"
 NUT1_POLYSHAPE_PATH = "/World/nut1/geo/PolyShape"
@@ -104,15 +105,12 @@ BUSBAR_RELEASE_Z        = 0.37     # 그리퍼 해제 및 체결 완료 임계 Z
 INSERT_TOLERANCE_STRICT = 0.001    # Insert 단계 오차 허용범위 (1mm)
 
 # ══════════════════════════════════════════════════════════════════════════
-#  너트 조립(Nut Assembly) 파라미터 (신규 추가)
+#  너트 조립(Nut Assembly) 파라미터
 # ══════════════════════════════════════════════════════════════════════════
-# 너트 스캔 위치: 버스바 체결 완료 시점의 EE 위치 기준 상대 이동 (X, Y) + 고정 고도 (Z)
 NUT_SCAN_OFFSET_X = -0.5
 NUT_SCAN_OFFSET_Y = -0.3
 NUT_SCAN_Z        = 0.9
 
-# 너트 1/2번은 Nova Carter에 고정되어 팔(초기 위치=HOME_EE_POS)과 항상 같이 움직이므로,
-# 비전 인식 없이 초기 위치 기준 고정 상대좌표(X, Y)로 파지 위치를 계산한다.
 NUT1_OFFSET_FROM_HOME = np.array([-0.4587, -0.2957])
 NUT2_OFFSET_FROM_HOME = np.array([-0.3683, -0.2961])
 
@@ -123,9 +121,7 @@ NUT_PICK_Z         = NUT_SUPPLY_TABLE_Z - (NUT_GRASP_Z_LOCAL - 0.0395)
 NUT_APPROACH_Z     = 0.8                                     # 너트 파지 상공 고도
 BOLT_APPROACH_Z    = 0.6                                     # 너트 체결 상공 고도
 
-# ★ 볼트 1/2번 실측 월드 좌표 (test_isaac 씬 고정 배치 기준 하드코딩) ★
-# 비전(카메라 실측/초기 스캔 기반 오프셋 계산) 모두 오차가 계속 남아, 이 씬에서는 볼트가
-# 안 움직이는 점을 이용해 실측값을 그대로 상수로 고정한다.
+# ★ 볼트 1/2번 실측 월드 좌표 (test_isaac 씬 고정 배치 기준) ★
 BOLT1_WORLD_POS = np.array([1.0552, 0.3722])
 BOLT2_WORLD_POS = np.array([1.2636, 0.0098])
 
@@ -155,7 +151,7 @@ target_fine_pos      = None
 PICK_TOLERANCE_STRICT    = 0.01     # 10mm
 JOINT_TOLERANCE          = 0.02     # 관절 오차 허용범위 (rad)
 PICK_TOLERANCE_LOOSE_VAL = 0.015
-MAX_STUCK_STEPS          = 1000000      # Phase 타임아웃 기준
+MAX_STUCK_STEPS          = 1000000  # Phase 타임아웃 기준
 PHYSICS_DT               = 1.0 / 60.0
 
 URDF_PATH        = str(_THIS_DIR / "doosan-robot2/urdf/m0609_isaac_sim.urdf")
@@ -283,7 +279,7 @@ def yaw_rotated_quat(base_wxyz, delta_deg):
 
 
 def resolve_nut_assets(nut_index, nut1_xform, nut2_xform):
-    """nut_index(1 또는 2)에 따라 대상 너트 Xform과 라벨을 반환 (Nut1/Nut2 공용 로직 재사용용)"""
+    """nut_index(1 또는 2)에 따라 대상 너트 Xform과 라벨을 반환"""
     if nut_index == 1:
         return nut1_xform, "너트 1번"
     return nut2_xform, "너트 2번"
@@ -401,13 +397,13 @@ def main():
     descend_target_z = None
     target_mid_pos = None
 
-    # ── 너트 조립(Nut Assembly) 상태 변수 (신규 추가) ──
-    nut_index      = 0        # 1: 너트 1번, 2: 너트 2번 (NUT_*/MOVE_TO_BOLT_NUT 공용 Phase에서 참조)
-    NUT_SCAN_POS   = None      # 너트 스캔 위치 (최초 1회 계산 후 재사용)
-    nut_pick_pos   = None      # 초기 위치(HOME_EE_POS) 기준 고정 오프셋으로 산출된 현재 너트의 물리 파지 좌표
-    nut_approach_pos = None    # 현재 너트 파지 상공 접근 좌표
-    bolt_target_pos  = None    # BOLT1/2_WORLD_POS(하드코딩)로 산출된 체결 목표 좌표
-    bolt_touch_pos   = None    # 착좌(Screwing 시작) 목표 좌표
+    # ── 너트 조립(Nut Assembly) 상태 변수 ──
+    nut_index      = 0        # 1: 너트 1번, 2: 너트 2번
+    NUT_SCAN_POS   = None     # 너트 스캔 위치 (최초 1회 계산 후 재사용)
+    nut_pick_pos   = None     # 현재 너트의 물리 파지 좌표
+    nut_approach_pos = None   # 현재 너트 파지 상공 접근 좌표
+    bolt_target_pos  = None   # 체결 목표 좌표
+    bolt_touch_pos   = None   # 착좌(Screwing 시작) 목표 좌표
 
     screw_sub          = "rotate"
     screw_pass_idx      = 0
@@ -512,7 +508,6 @@ def main():
 
                 isaac_node.alignment_success = False
                 
-                # FINE_ALIGNMENT 진입 시 실시간 EE 위치 기준으로 Target 초기화
                 cur_ee = world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation()
                 target_fine_pos = np.array([cur_ee[0], cur_ee[1], BATTERY_CENTER_Z])
                 phase = "FINE_ALIGNMENT"
@@ -530,7 +525,6 @@ def main():
                 step_count = 0
                 print(f"\n>>> [{task}] 버스바 수직 하강 안착 시작 (Target Mid Pos: X={target_mid_pos[0]:.4f}, Y={target_mid_pos[1]:.4f})")
 
-            # ── [신규] 너트 1/2번 스캔 -> 파지 -> 체결 (Nut Assembly) ──
             elif task in ("SCAN_NUT1", "SCAN_NUT2"):
                 nut_index = 1 if task == "SCAN_NUT1" else 2
                 if NUT_SCAN_POS is None:
@@ -557,8 +551,6 @@ def main():
 
             elif task in ("ASSEMBLE_NUT1", "ASSEMBLE_NUT2"):
                 nut_index = 1 if task == "ASSEMBLE_NUT1" else 2
-                # 비전 기반(카메라 실측, BATTERY_CENTER_POS+오프셋 모두)이 계속 오차가 남아
-                # test_isaac 씬(고정 배치)에서는 실측한 월드 좌표를 그대로 하드코딩해서 쓴다.
                 bolt_world_xy = BOLT1_WORLD_POS if nut_index == 1 else BOLT2_WORLD_POS
                 bolt_target_pos = np.array([bolt_world_xy[0], bolt_world_xy[1], 0.0])
                 bolt_touch_pos = np.array([bolt_target_pos[0], bolt_target_pos[1], 0.3697])
@@ -747,7 +739,7 @@ def main():
                     publish_status("SUCCESS")
                     phase = "IDLE"
 
-            # [7단계] 비전 보정 노드 피드백 기반 미세 오차 정렬 (Target 상태 유지 보완)
+            # [7단계] 비전 보정 노드 피드백 기반 미세 오차 정렬
             elif phase == "FINE_ALIGNMENT":
                 publish_progress("FINE_ALIGNMENT_TRACKING", 85.0)
 
@@ -826,7 +818,6 @@ def main():
                 robot.apply_action(actions)
                 robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_OPEN))
 
-                # Kinematic Pose-Glue 해제
                 glue_busbar_to_ee(robot, busbar_xform, busbar_start_grasp_pos, blend=0.0)
 
                 cur_pos = world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation()
@@ -839,7 +830,7 @@ def main():
                     phase = "IDLE"
 
             # ════════════════════════════════════════════════════════════════
-            # [신규] 너트 조립(Nut Assembly) 공용 Phase (nut_index로 Nut1/Nut2 재사용)
+            # 너트 조립(Nut Assembly) 공용 Phase
             # ════════════════════════════════════════════════════════════════
             # [10단계] 너트 스캔 위치 이동
             elif phase == "NUT_SCAN_APPROACH":
@@ -889,7 +880,7 @@ def main():
                     phase = "NUT_GRASP"
                     grasp_timer = 0
 
-            # [13단계] 너트 물리 파지 (실제 그리퍼로 파지, Kinematic Glue 미사용)
+            # [13단계] 너트 물리 파지
             elif phase == "NUT_GRASP":
                 publish_progress("NUT_GRASPING", 60.0)
                 actions = arm_controller.forward(target_end_effector_position=nut_pick_pos, target_end_effector_orientation=quat_nut)
@@ -923,7 +914,7 @@ def main():
                     publish_status("SUCCESS")
                     phase = "IDLE"
 
-            # [15단계] 볼트 상공 이동 (BOLT1/2_WORLD_POS 하드코딩으로 산출된 bolt_target_pos 사용)
+            # [15단계] 볼트 상공 이동
             elif phase == "MOVE_TO_BOLT_NUT":
                 publish_progress("MOVE_TO_BOLT", 20.0)
                 bolt_approach_pos = np.array([bolt_target_pos[0], bolt_target_pos[1], BOLT_APPROACH_Z])
@@ -969,7 +960,7 @@ def main():
                     phase = "NUT_SCREW"
                     step_count = 0
 
-            # [17단계] Screwing (Nut1/Nut2 공용 - 회전 체결 / Regrasp / 토크·Stuck 감지)
+            # [17단계] Screwing
             elif phase == "NUT_SCREW":
                 publish_progress("NUT_SCREWING", 70.0)
                 if screw_sub == "rotate":
@@ -979,10 +970,6 @@ def main():
                     total_deg = screw_pass_idx * SCREW_TURNS_DEG + screw_pass_theta
                     depth_m = min((total_deg / 360.0) * NUT_PITCH_M, ENGAGE_LEN)
 
-                    # Regrasp 직후(screw_pass_idx > 0)는 재파지 지점이 REGRASP_Z_OFFSET만큼
-                    # 위에 떠 있는 상태 - 회전 시작과 동시에 그 여유분을 순간적으로 눌러버리면
-                    # (스냅) "누르면서 도는" 느낌이 나므로, 이번 pass 회전 진행률(0~1)에 비례해
-                    # 그 여유분을 서서히 소진시켜 자연스럽게 내려가도록 한다.
                     if screw_pass_idx > 0:
                         regrasp_extra = REGRASP_Z_OFFSET * (1.0 - screw_pass_theta / SCREW_TURNS_DEG)
                     else:
@@ -996,7 +983,7 @@ def main():
                     robot.apply_action(actions)
                     robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_CLOSE_NUT))
 
-                    # 실시간 토크 감지 및 Z축 정지(Stuck) 모니터링
+                    # 실시간 토크 및 Stuck 감지
                     cur_ee_pos, _ = robot.end_effector.get_world_pose()
                     z_movement = abs(prev_ee_z - cur_ee_pos[2])
                     prev_ee_z = cur_ee_pos[2]
@@ -1135,7 +1122,7 @@ def main():
                     phase = "NUT_RETRACT_ROTATE"
                     step_count = 0
 
-            # [20단계] 기본 오리엔테이션 정렬 후 완료
+            # [20단계] 기본 오리엔테이션 정렬
             elif phase == "NUT_RETRACT_ROTATE":
                 publish_progress("NUT_RETRACT_ROTATE", 98.0)
                 ee_now_pos, _ = robot.end_effector.get_world_pose()
@@ -1149,7 +1136,43 @@ def main():
                 current_err = math.dist(cur_pos, tuple(lift_target_pos))
                 if current_err < PICK_TOLERANCE_STRICT or (current_err < PICK_TOLERANCE_LOOSE_VAL and step_count > MAX_STUCK_STEPS):
                     nut_label = resolve_nut_assets(nut_index, nut1_xform, nut2_xform)[1]
-                    print(f"\n★ [ASSEMBLE_{nut_label} SUCCESS] 너트 체결 및 안전 이탈 완료!")
+                    print(f"\n[OK] {nut_label} 상공 이탈 및 회전 정렬 완료!")
+                    
+                    # 너트 2번 체결까지 전체 조립 작업이 끝난 경우 초기 관절각으로 완전 복귀
+                    if nut_index == 2:
+                        print(" -> 🚀 너트 2번 체결 완료. 초기 관절 각도 [0, 0, 90°, 0, 90°, 0] 복귀 시작...")
+                        phase = "RETURN_HOME_JOINTS"
+                        step_count = 0
+                    else:
+                        print(f"★ [ASSEMBLE_{nut_label} SUCCESS] 너트 1번 체결 완료!")
+                        publish_progress("ASSEMBLE_NUT_COMPLETE", 100.0)
+                        publish_status("SUCCESS")
+                        phase = "IDLE"
+
+            # [21단계 - 신규] 너트 2번 완료 후 초기 관절 각도복귀 [0, 0, 90°, 0, 90°, 0]
+            elif phase == "RETURN_HOME_JOINTS":
+                publish_progress("RETURNING_HOME_JOINTS", 99.0)
+
+                arm_joint_names = [
+                    "joint_1", "joint_2", "joint_3", 
+                    "joint_4", "joint_5", "joint_6"
+                ]
+                arm_dof_indices = [robot.get_dof_index(name) for name in arm_joint_names]
+
+                robot.apply_action(
+                    ArticulationAction(
+                        joint_positions=TARGET_INIT_JOINTS,
+                        joint_indices=arm_dof_indices
+                    )
+                )
+                robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_OPEN))
+
+                all_joints = robot.get_joint_positions()
+                cur_arm_joints = all_joints[arm_dof_indices]
+                joint_err = np.linalg.norm(cur_arm_joints - TARGET_INIT_JOINTS)
+
+                if joint_err < JOINT_TOLERANCE or step_count > 120:
+                    print("\n★ [ALL PROCESS COMPLETE & HOME RETURNED] 모든 너트 체결 및 초기 관절 각도 복귀 완수!")
                     publish_progress("ASSEMBLE_NUT_COMPLETE", 100.0)
                     publish_status("SUCCESS")
                     phase = "IDLE"
