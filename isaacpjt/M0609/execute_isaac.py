@@ -149,6 +149,25 @@ STUCK_Z_DELTA_THRESH = 0.0001     # Z축 하강 멈춤 판정 기준 (0.1mm)
 STUCK_STEP_LIMIT     = 12         # Z축 변화 없이 토크 지속되는 Step 수
 TCP_FORCE_CHECK_Z    = 0.378      # TCP(EE) 높이가 이 값 이하일 때만 힘/토크 감지 활성화
 
+# ══════════════════════════════════════════════════════════════════════════
+#  너트 삽입(NUT_DESCEND_TO_BOLT) 토크 기반 스파이럴 탐색 파라미터 (2026-07-27)
+# ══════════════════════════════════════════════════════════════════════════
+# ★ 논문(Factory)의 RL 정책은 force/torque 피드백으로 접촉 중 오차를 스스로
+# 흡수하는데, 여긴 고정 XY로 그냥 강체 하강만 해서 정렬이 조금만 틀어져도
+# 너트가 볼트 윗면에 걸린 채 감지/복구 없이 다음 단계로 넘어가는 문제가 있었다.
+# NUT_SCREW에 이미 있던 토크 기반 stuck 감지(TORQUE_THRESHOLD/STUCK_*) 패턴을
+# 그대로 재사용해서, 삽입 중 박힘이 감지되면 XY를 블라인드 스파이럴로 훑는다
+# (6축 F/T 힘 방향까진 안 읽고 조인트 토크 스칼라 1개뿐이라 방향은 모름 -
+# 산업 로봇에서 흔한 "spiral search insertion" 방식). 값들은 전부 시작점이라
+# 실측하면서 튜닝 필요.
+INSERT_TORQUE_THRESHOLD     = 45.0       # 삽입 중 박힘 판정 토크 (TORQUE_THRESHOLD와 동일 출발값)
+INSERT_STUCK_Z_DELTA_THRESH = 0.0001     # STUCK_Z_DELTA_THRESH와 동일
+INSERT_STUCK_STEP_LIMIT     = 12         # STUCK_STEP_LIMIT와 동일
+SEARCH_ANGLE_STEP_DEG       = 6.0        # 스텝(물리틱)당 스파이럴 각도 증가량
+SEARCH_RADIUS_PER_DEG_M     = 0.0000028  # 각도 1도당 반경 증가량 (약 3바퀴=1080도에 3mm 도달)
+SEARCH_MAX_RADIUS_M         = 0.003      # 스파이럴 최대 반경 (3mm)
+SEARCH_MAX_STEPS            = 3600       # 탐색 타임아웃(약 60s @ 60Hz) - 초과해도 경고만 출력하고 원좌표로 진행
+
 # 위치 저장용 변수
 HOME_EE_POS          = None
 SCAN_POS             = None
@@ -506,6 +525,13 @@ def main():
     nut_approach_pos = None    # 현재 너트 파지 상공 접근 좌표
     bolt_target_pos  = None    # compute_bolt_target_pos()로 동적 산출된 체결 목표 좌표
     bolt_touch_pos   = None    # 착좌(Screwing 시작) 목표 좌표
+
+    # ── NUT_DESCEND_TO_BOLT 토크 기반 스파이럴 탐색 상태 (신규 추가) ──
+    insert_stuck_counter = 0
+    insert_prev_ee_z     = None
+    spiral_active         = False
+    spiral_angle_deg      = 0.0
+    search_step_total     = 0
 
     screw_sub          = "rotate"
     screw_pass_idx      = 0
@@ -1091,12 +1117,32 @@ def main():
                     phase = "NUT_DESCEND_TO_BOLT"
                     step_count = 0
                     descend_target_z = BOLT_APPROACH_Z
+                    insert_stuck_counter = 0
+                    insert_prev_ee_z = None
+                    spiral_active = False
+                    spiral_angle_deg = 0.0
+                    search_step_total = 0
 
-            # [16단계] 볼트 착좌 하강
+            # [16단계] 볼트 착좌 하강 (박힘 감지 시 토크 기반 스파이럴 탐색)
             elif phase == "NUT_DESCEND_TO_BOLT":
                 publish_progress("NUT_DESCEND_TO_BOLT", 40.0)
                 descend_target_z = max(descend_target_z - INSERT_SPEED, bolt_touch_pos[2])
-                step_target_pos = np.array([bolt_touch_pos[0], bolt_touch_pos[1], descend_target_z])
+
+                spiral_radius = 0.0
+                if spiral_active:
+                    spiral_angle_deg += SEARCH_ANGLE_STEP_DEG
+                    spiral_radius = min(SEARCH_RADIUS_PER_DEG_M * spiral_angle_deg, SEARCH_MAX_RADIUS_M)
+                    spiral_rad = math.radians(spiral_angle_deg)
+                    xy_offset = np.array([spiral_radius * math.cos(spiral_rad), spiral_radius * math.sin(spiral_rad)])
+                    search_step_total += 1
+                else:
+                    xy_offset = np.zeros(2)
+
+                step_target_pos = np.array([
+                    bolt_touch_pos[0] + xy_offset[0],
+                    bolt_touch_pos[1] + xy_offset[1],
+                    descend_target_z,
+                ])
 
                 actions = arm_controller.forward(target_end_effector_position=step_target_pos, target_end_effector_orientation=quat_nut)
                 robot.apply_action(actions)
@@ -1104,7 +1150,56 @@ def main():
 
                 cur_pos = world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation()
 
-                if abs(cur_pos[2] - bolt_touch_pos[2]) < PICK_TOLERANCE_LOOSE_VAL or descend_target_z <= bolt_touch_pos[2]:
+                # ★ 삽입 중 박힘(stuck) 감지 - NUT_SCREW의 토크 기반 stuck 감지와 동일
+                # 패턴을 한 단계 앞으로 가져옴. TCP_FORCE_CHECK_Z 근처부터만 체크해서
+                # 그 위 자유공간 하강 중 오탐을 방지한다.
+                if cur_pos[2] <= TCP_FORCE_CHECK_Z:
+                    if insert_prev_ee_z is None:
+                        insert_prev_ee_z = cur_pos[2]
+                    z_movement = abs(insert_prev_ee_z - cur_pos[2])
+                    insert_prev_ee_z = cur_pos[2]
+
+                    joint_efforts = robot.get_measured_joint_efforts()
+                    curr_torque = abs(joint_efforts[-1]) if joint_efforts is not None and len(joint_efforts) > 0 else 0.0
+
+                    is_stuck = (z_movement < INSERT_STUCK_Z_DELTA_THRESH and curr_torque > INSERT_TORQUE_THRESHOLD)
+                    if is_stuck:
+                        insert_stuck_counter = min(insert_stuck_counter + 1, INSERT_STUCK_STEP_LIMIT * 2)
+                    else:
+                        insert_stuck_counter = max(0, insert_stuck_counter - 1)
+
+                    if insert_stuck_counter >= INSERT_STUCK_STEP_LIMIT:
+                        if not spiral_active:
+                            nut_label = resolve_nut_assets(nut_index, nut1_xform, nut2_xform)[1]
+                            print(f"  [NUT{nut_index} SEARCH] 삽입 박힘 감지({nut_label}, 토크:{curr_torque:.1f}Nm) -> 스파이럴 탐색 시작")
+                            spiral_active = True
+                            spiral_angle_deg = 0.0
+                            search_step_total = 0
+                    elif spiral_active and insert_stuck_counter == 0:
+                        # 여러 스텝 연속 정상 진행 확인 -> 구멍을 찾은 것으로 판정,
+                        # 지금 스파이럴 오프셋을 착좌 좌표에 영구 반영하고 탐색 종료
+                        bolt_touch_pos = np.array([
+                            bolt_touch_pos[0] + xy_offset[0],
+                            bolt_touch_pos[1] + xy_offset[1],
+                            bolt_touch_pos[2],
+                        ])
+                        print(f"  [NUT{nut_index} SEARCH] 정렬 복구됨 (반경:{spiral_radius*1000:.2f}mm) -> 정상 하강 재개")
+                        spiral_active = False
+                        spiral_angle_deg = 0.0
+                        search_step_total = 0
+
+                    if spiral_active and search_step_total > SEARCH_MAX_STEPS:
+                        print(f"  [NUT{nut_index} SEARCH] 탐색 타임아웃({SEARCH_MAX_STEPS}step) - 원좌표로 하강 재개")
+                        spiral_active = False
+                        spiral_angle_deg = 0.0
+                        search_step_total = 0
+
+                    if step_count % 20 == 0:
+                        spiral_status = f"ON(r={spiral_radius*1000:.2f}mm)" if spiral_active else "off"
+                        print(f"    [NUT{nut_index} DESCEND] cur_z={cur_pos[2]:.4f} target_z={bolt_touch_pos[2]:.4f} "
+                              f"torque={curr_torque:.1f}Nm spiral={spiral_status}")
+
+                if abs(cur_pos[2] - bolt_touch_pos[2]) < PICK_TOLERANCE_LOOSE_VAL or (step_count > MAX_STUCK_STEPS and not spiral_active):
                     ee_now_pos, ee_now_quat = robot.end_effector.get_world_pose()
                     screw_start_quat = np.asarray(ee_now_quat).copy()
                     screw_seat_ee_pos = np.asarray(ee_now_pos).copy()
