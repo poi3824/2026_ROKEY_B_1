@@ -213,9 +213,13 @@ class ArmNode(Node):
                 goal_handle.abort()
                 return result_msg
 
-            # 2. 이동 완료 후 Perception 노드에 버스바 좌표 요청
+            # 2. 이동 완료 후 Perception 노드에 버스바 좌표 요청 (재촬영 시퀀스: 5초 동안
+            # 0.5초 간격 재시도 - 도착 직후 조명/타이밍 문제로 순간 검출 실패해도 바로
+            # 포기하지 않는다)
             self.get_logger().info(" -> [SCAN_BUSBAR] 버스바 스캔 위치 도착 완료. 비전 노드에 버스바 좌표 요청...")
-            found, busbar_pose, msg = self.request_vision_pose_async("busbar", timeout_sec=5.0)
+            found, busbar_pose, msg = self.request_vision_pose_async(
+                "busbar", timeout_sec=5.0, retry_timeout_sec=5.0, retry_interval_sec=0.5
+            )
 
             if found and busbar_pose is not None:
                 self.scanned_busbar_pose = busbar_pose
@@ -249,9 +253,11 @@ class ArmNode(Node):
                 self.get_logger().info(" -> [PICK_BUSBAR] 미리 스캔한 버스바 좌표를 활용합니다.")
                 busbar_pose = self.scanned_busbar_pose
             else:
-                # 2순위: 실시간 비전 노드에 버스바 좌표 직접 요청
-                found, busbar_pose, msg = self.request_vision_pose_async("busbar")
-                
+                # 2순위: 실시간 비전 노드에 버스바 좌표 직접 요청 (재촬영 시퀀스 적용)
+                found, busbar_pose, msg = self.request_vision_pose_async(
+                    "busbar", retry_timeout_sec=5.0, retry_interval_sec=0.5
+                )
+
                 # 3순위: 백업으로 배터리 스캔 시 저장한 볼트 중점 좌표 활용
                 if not found:
                     if self.scanned_battery_midpoint is not None:
@@ -550,14 +556,29 @@ class ArmNode(Node):
 
         return False, None, res.message if res else "GetBoltPair 수신 결과 없음"
 
-    def request_vision_pose_async(self, target_label: str, timeout_sec: float = 3.0):
-        """Action Thread 안전한 Service 비동기 호출"""
-        if target_label in ["busbar", "nut"]:
+    def request_vision_pose_async(self, target_label: str, timeout_sec: float = 3.0,
+                                   retry_timeout_sec: float = 0.0, retry_interval_sec: float = 0.3):
+        """Action Thread 안전한 Service 비동기 호출.
+
+        retry_timeout_sec=0(기본)이면 기존과 동일하게 단발 요청 후 실패 시 바로 포기한다.
+        retry_timeout_sec > 0으로 주면, 첫 시도에서 found=False가 나와도 바로 포기하지 않고
+        그 시간 동안 retry_interval_sec 간격으로 계속 재요청한다(재촬영 시퀀스) - perception_node의
+        롤링 평균 캐시(SMOOTHING_WINDOW_SEC)가 스캔 도착 직후엔 아직 안 채워져 있거나, 순간적으로
+        검출을 놓친 경우를 대비한 것. 매 재요청마다 perception_node가 최신 프레임을 다시
+        처리하므로, 실제로 다시 촬영/검출하는 것과 동일한 효과가 있다.
+        """
+        if target_label not in ["busbar", "nut"]:
+            return False, None, "알 수 없는 타겟 라벨"
+
+        deadline = time.time() + max(retry_timeout_sec, 0.0)
+        last_message = f"'{target_label}' 검출 실패 (서비스/토픽 모두 없음)"
+
+        while True:
             if self.client_get_grasp_pose.wait_for_service(timeout_sec=1.0):
                 req = GetGraspPose.Request()
                 req.label = target_label
                 future = self.client_get_grasp_pose.call_async(req)
-                
+
                 start = time.time()
                 while not future.done():
                     if time.time() - start > timeout_sec:
@@ -568,16 +589,20 @@ class ArmNode(Node):
                     res = future.result()
                     if res.found:
                         return True, res.pose, res.message
+                    last_message = res.message
 
-            # Fallback 토픽 사용
+            # Fallback 토픽 사용 (서비스는 못 받았어도 그 사이 토픽에 새 값이 왔을 수 있음)
             if target_label == "busbar" and self.latest_busbar_grasp is not None:
                 return True, self.latest_busbar_grasp, "토픽 데이터 사용"
             elif target_label == "nut" and self.latest_nut_pose is not None:
                 return True, self.latest_nut_pose, "토픽 데이터 사용"
 
-            return False, None, f"'{target_label}' 검출 실패 (서비스/토픽 모두 없음)"
+            if time.time() >= deadline:
+                if retry_timeout_sec > 0.0:
+                    return False, None, f"'{target_label}' 검출 실패 ({retry_timeout_sec:.1f}s 재시도 후 포기: {last_message})"
+                return False, None, last_message
 
-        return False, None, "알 수 없는 타겟 라벨"
+            time.sleep(retry_interval_sec)
 
 
 def main(args=None):
