@@ -13,8 +13,9 @@ BehaviorNode (FSM) 및 ArmNode, Vision Correction Node 통신 연동 버전
 6. ASSEMBLE_BUSBAR      : 정렬된 XY 상태를 유지하며 수직 하강 안착, 버스바 고정 해제, 그리퍼 개방 및 상공 이탈
 7. SCAN_NUT1 / SCAN_NUT2   : 너트 스캔 위치(버스바 체결 위치 기준 상대 이동)로 이동
 8. PICK_NUT1 / PICK_NUT2   : 비전으로 검출된 너트 좌표로 접근, 물리 파지(Gripper Close) 및 상승
-9. ASSEMBLE_NUT1 / ASSEMBLE_NUT2 : 실시간 배터리 중심 좌표(target_mid_pos) 기준 사전 계산된
-   상대 오프셋을 적용해 산출한 볼트 목표 좌표로 이동, 착좌 및 Screwing 체결(Regrasp 포함)
+9. ASSEMBLE_NUT1 / ASSEMBLE_NUT2 : 최초 SCAN_BATTERY 스캔 좌표(BATTERY_CENTER_POS, 버스바
+   grasp offset 영향 없음) 기준 사전 계산된 상대 오프셋을 적용해 산출한 볼트 목표 좌표로
+   이동, 착좌 및 Screwing 체결(Regrasp 포함)
 """
 
 import os
@@ -118,9 +119,10 @@ NUT_APPROACH_Z     = 0.8                                     # 너트 파지 상
 BOLT_APPROACH_Z    = 0.6                                     # 볼트 체결 상공 고도
 
 # ★ 볼트 1/2번 참고 좌표 (절대좌표로 직접 이동에 사용 금지!) ★
-# 아래 두 좌표는 버스바 체결 시 사용되는 기준 배터리 중심 좌표(_REF_BATTERY_CENTER_POS) 대비
-# 상대 오프셋(Offset)을 미리 계산해 두기 위한 참고값일 뿐이며, 실제 체결 시에는
-# 실시간 배터리 중심 좌표(target_mid_pos)에 이 오프셋을 더해 동적으로 목표 좌표를 산출한다.
+# 아래 두 좌표는 배터리 중심 좌표 대비 상대 오프셋(Offset)을 미리 계산해 두기 위한 참고값일
+# 뿐이며, 실제 체결 시에는 최초 SCAN_BATTERY 스캔 좌표(BATTERY_CENTER_POS)에 이 오프셋을
+# 더해 동적으로 목표 좌표를 산출한다. target_mid_pos(버스바 체결 TCP 위치)는 버스바를
+# YOLO로 인식해 파지하는 grasp point가 매번 달라져 오차가 섞이므로 기준으로 쓰지 않는다.
 BOLT1_OFFSET_FROM_CENTER = np.array([-0.1042, 0.1812, 0.0])
 BOLT2_OFFSET_FROM_CENTER = np.array([0.1042, -0.1812, 0.0])
 
@@ -150,7 +152,7 @@ target_fine_pos      = None
 PICK_TOLERANCE_STRICT    = 0.01     # 10mm
 JOINT_TOLERANCE          = 0.02     # 관절 오차 허용범위 (rad)
 PICK_TOLERANCE_LOOSE_VAL = 0.015
-MAX_STUCK_STEPS          = 1800      # Phase 타임아웃 기준
+MAX_STUCK_STEPS          = 18000      # Phase 타임아웃 기준
 PHYSICS_DT               = 1.0 / 60.0
 
 URDF_PATH        = str(_THIS_DIR / "doosan-robot2/urdf/m0609_isaac_sim.urdf")
@@ -557,8 +559,13 @@ def main():
 
             elif task in ("ASSEMBLE_NUT1", "ASSEMBLE_NUT2"):
                 nut_index = 1 if task == "ASSEMBLE_NUT1" else 2
-                if target_mid_pos is not None:
-                    bolt_target_pos = compute_bolt_target_pos(nut_index, target_mid_pos)
+                if target_mid_pos is not None and BATTERY_CENTER_POS is not None:
+                    # 볼트는 버스바 grasp offset의 영향을 받지 않는 최초 SCAN_BATTERY 스캔 좌표
+                    # (BATTERY_CENTER_POS)의 XY를 기준으로 계산한다. Z는 버스바 체결 높이(target_mid_pos)를 유지.
+                    battery_center_ref = np.array(
+                        [BATTERY_CENTER_POS[0], BATTERY_CENTER_POS[1], target_mid_pos[2]]
+                    )
+                    bolt_target_pos = compute_bolt_target_pos(nut_index, battery_center_ref)
                     bolt_touch_pos = np.array([
                         bolt_target_pos[0], bolt_target_pos[1],
                         bolt_target_pos[2] + EE_OFFSET[2] + NUT_GRASP_Z_LOCAL
@@ -567,7 +574,7 @@ def main():
                     step_count = 0
                     print(f"\n>>> [{task}] 너트 {nut_index}번 -> 볼트 {nut_index}번 체결 시작 (Target: X={bolt_target_pos[0]:.4f}, Y={bolt_target_pos[1]:.4f})")
                 else:
-                    print(f"\n[ERROR] [{task}] 배터리 중심 좌표(target_mid_pos)가 없습니다. 먼저 ASSEMBLE_BUSBAR가 수행되어야 합니다.")
+                    print(f"\n[ERROR] [{task}] 배터리 중심 좌표가 없습니다. 먼저 SCAN_BATTERY(MOVE_BATTERY_CENTER)/ASSEMBLE_BUSBAR가 수행되어야 합니다.")
                     publish_status("FAILURE:NO_BATTERY_CENTER")
 
         # 3. FSM 제어 루프
@@ -816,15 +823,17 @@ def main():
                     # 🔥 [추가 필요] 너트 조립용 기준 좌표(Anchor) 저장 및 볼트 3D 좌표 산출
                     # -------------------------------------------------------------
                     global assembled_battery_center, calculated_bolt1_pos, calculated_bolt2_pos
-                    
-                    # 1) 실제 안착된 배터리 중심 좌표 확정 저장
-                    assembled_battery_center = np.array(target_mid_pos, dtype=float)
-                    
-                    # 2) 볼트 1, 2의 오프셋 벡터 (미리 정의된 상대 거리 오프셋)
-                    # 예: BOLT1_OFFSET = np.array([-0.1042, 0.1812, 0.0])
-                    #     BOLT2_OFFSET = np.array([0.1042, -0.1812, 0.0])
-                    calculated_bolt1_pos = assembled_battery_center + BOLT1_OFFSET_FROM_CENTER 
-                    calculated_bolt2_pos = assembled_battery_center + BOLT2_OFFSET_FROM_CENTER 
+
+                    # 버스바는 YOLO 인식으로 파지하므로 grasp point가 매번 달라져 target_mid_pos(TCP
+                    # 기준 체결 좌표)의 XY에는 grasp offset 오차가 섞여 있다. 볼트는 버스바를 얹기
+                    # 전부터 이미 고정돼 있으므로, 볼트 좌표 산출 기준은 그 오차와 무관한 최초
+                    # SCAN_BATTERY 스캔 좌표(BATTERY_CENTER_POS, get_bolt_pair 기반)의 XY를 쓴다.
+                    assembled_battery_center = np.array(
+                        [BATTERY_CENTER_POS[0], BATTERY_CENTER_POS[1], target_mid_pos[2]], dtype=float
+                    )
+
+                    calculated_bolt1_pos = assembled_battery_center + BOLT1_OFFSET_FROM_CENTER
+                    calculated_bolt2_pos = assembled_battery_center + BOLT2_OFFSET_FROM_CENTER
                     
                     print(f"\n[OK] 버스바 안착 체결 완료 (EE Z: {cur_pos[2]:.4f}m)!")
                     print(f" -> 기준 안착 좌표 저장: {assembled_battery_center}")
