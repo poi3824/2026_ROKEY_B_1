@@ -9,7 +9,10 @@ perception이 같은 USD 장면에서 검출한 `world` 좌표만 목표 생성�
 런타임에는 좌표가 없는 의미론적 요청만 받는다.
 
 - `battery`: `/bolt_cam/perception/detections_3d`에서 정확히 두 개의 `bolt`를
-  연속 검출하고 그 순수 기하 중점을 사용한다.
+  이루는 유효 쌍을 고르고 그 순수 기하 중점을 사용한다. 첫 정상 요청에서 선택한
+  쌍은 같은 Isaac 세션 동안 후보 식별 기준으로 유지하므로, busbar 작업 후 복귀할
+  때 다른 배터리 쌍으로 전환되지 않는다. 실제 목표는 매 요청의 새 검출 좌표로
+  계산하며 기억한 중점을 좌표 폴백으로 사용하지 않는다.
 - `busbar`: `/busbar_cam/perception/detections_3d`에서 복수 `busbar`가 검출되면
   confidence가 유일하게 가장 높은 한 개를 고른 뒤 연속 검출 안정성을 검사한다.
   최고 confidence가 동점이면 선택하지 않는다. 주행이 시작된 뒤에는 confidence
@@ -45,8 +48,12 @@ timestamp 하나를 한 번만 처리한다. RGB/depth stamp 차이와 callback 
 ## 물체 좌표와 chassis 목표
 
 perception 출력은 물체 중심이지 AMR chassis의 docking pose가 아니다. 물체 중심으로
-직접 주행하면 충돌하므로 현재 AMR 위치에서 검출점을 바라보는 선상에 접근 목표를
-만들고, 검출점 앞에서 `vision_standoff_m`만큼 떨어져 정지한다.
+직접 주행하면 충돌하므로 작업 셀마다 고정한 접근 normal의 선상에 목표를 만들고,
+검출점 앞에서 지정 stand-off만큼 떨어져 정지한다. battery는 첫 정상 스캔 자세인
+Isaac READY baseline과 첫 검증된 비전 target으로 접근 normal과 chassis yaw를 세션당
+한 번만 보정한다. 버스바 작업 후 복귀할 때 현재 AMR 위치로 방향을 다시 계산하지
+않으므로 같은 배터리 작업면으로 돌아온다. 검출 좌표는 같은 볼트쌍을 연관하는
+기준으로만 유지하며, 절대 station 좌표나 주행 fallback으로 저장하지 않는다.
 
 `vision_standoff_m`은 로봇·팔·작업물 기하로 실제 캘리브레이션해야 하는 상대 거리다.
 안전하지 않은 임의 기본값은 없으며 relay 시작 시 반드시 명시해야 한다.
@@ -58,6 +65,9 @@ python3 src/amr_node/scrips_drive/amr_node_drive.py \
   --ros-args \
   -p vision_standoff_m:=0.90 \
   -p battery_standoff_m:=0.75 \
+  -p battery_preapproach_extra_m:=0.80 \
+  -p battery_initial_pose_tolerance_m:=0.05 \
+  -p battery_initial_yaw_tolerance_deg:=5.0 \
   -p vision_max_target_drift_m:=0.005 \
   -p busbar_preapproach_extra_m:=0.80
 ```
@@ -69,7 +79,15 @@ python3 src/amr_node/scrips_drive/amr_node_drive.py \
 그대로 적용하지 말고 다시 측정한다. `0.005 m` drift도 현재 비전 오차와 작업
 허용치가 바뀌면 다시 정해야 한다. `battery_standoff_m=0.75 m`는 현재 초기
 AMR-배터리 중점 실측 거리 약 `0.766 m`에서 불필요한 이동을 최소화하기 위한
-battery 전용 값이다. busbar 충돌 방지 값을 battery에 재사용하지 않는다.
+battery 전용 값이다. 첫 비전 target으로 계산한 final goal과 READY baseline의
+차이가 `battery_initial_pose_tolerance_m=0.05 m`를 넘으면 잘못된 시작 위치로 보고
+방향 보정을 거부한다. 현재 yaw도 READY yaw와
+`battery_initial_yaw_tolerance_deg=5 deg` 이내여야 하며, 위치 또는 yaw가
+어긋나면 무제한 재시도하지 않고 요청을 실패시킨다. 복귀 때는 final chassis
+진행축의 뒤쪽 `0.80 m`에
+pre-approach를 만들고, 최초 chassis yaw와 같은 방향으로 직선 진입한다. 작업물
+normal 바깥으로 갔다가 final에서 90도 제자리 회전하는 경로를 만들지 않는다.
+busbar 충돌 방지 stand-off를 battery에 재사용하지 않는다.
 
 ## 같은 USD 장면 요구
 
@@ -127,6 +145,9 @@ python3 src/amr_node/scrips_drive/amr_node_drive.py \
   --ros-args \
   -p vision_standoff_m:=0.90 \
   -p battery_standoff_m:=0.75 \
+  -p battery_preapproach_extra_m:=0.80 \
+  -p battery_initial_pose_tolerance_m:=0.05 \
+  -p battery_initial_yaw_tolerance_deg:=5.0 \
   -p vision_max_target_drift_m:=0.005 \
   -p busbar_preapproach_extra_m:=0.80 \
   -p busbar_scan_yaw_offset_deg:=180.0 \
@@ -219,7 +240,20 @@ python3 src/amr_node/scrips_drive/vision_drive_demo.py \
 위 명령은 기본값으로 배터리 주행/스캔, 팔 안전 자세 복귀, 버스바 주행/손목
 스캔/파지, 배터리 복귀/조립, 너트 1·2 체결까지 수행한다. 버스바 스캔은 relay가
 주행에 사용한 동일 world 좌표를 쓰며, 손목 카메라의 새 연속 검출이 확인될 때까지
-선택 좌표 중심의 제한된 탐색 자세를 반복한다.
+선택 좌표 중심의 제한된 탐색 자세를 반복한다. 탐색은 중앙과 접근 접선 방향
+`±0.02 m` 사이에서만 움직이며, 이 scan-only offset은 이후 wrist 카메라가 발행한
+PICK 좌표를 덮어쓰지 않는다.
+
+첫 battery 단계는 READY baseline이 이미 정상 배터리 스캔 자세에 있다는 것을
+검증하면서 접근 normal과 chassis yaw를 고정한다. 버스바 파지 후 battery로 복귀할
+때는 최종 chassis 진행축 뒤쪽의 pre-approach를 거친 뒤 최초와 같은 작업면과
+chassis yaw로 직선 도킹한다. 따라서 busbar 위치에서 battery를 향한 방위가
+북쪽이어도 북쪽 goal을 새로 만들지 않는다.
+
+버스바 파지는 원래 물리 버전과 동일하게 rigid body/collision을 계속 켠 상태에서
+핑거 collider와 마찰로 수행한다. pose-glue, `set_world_pose`, 버스바용
+`FixedJoint`는 사용하지 않는다. 파지 후에는 옆으로 이동하지 않고 수직 상승하며,
+실제 busbar 상승량이 5 cm 미만이면 성공으로 처리하지 않는다.
 
 `debug_no_timeouts` 옵션은 디버깅에서만 사용한다. goal/stuck/lease와 Action
 경과 시간 제한은 끄지만 publisher 유일성, 최초 비전 표본 품질,
@@ -272,17 +306,19 @@ isaac_python src/amr_node/scrips_drive/execute_isaac.py \
   높은 confidence를 받으면 구분할 수 없다. 카메라/ROI에는 의도한 대상이 가장
   명확하게 보이고, bolt 카메라에는 의도한 볼트쌍 하나만 보여야 한다.
 - 여섯 station 자동 운용에는 perception이 안정적인 `target_id`와 품질 정보를 함께
-  발행하는 인터페이스가 추가로 필요하다. 과거 좌표와 nearest-neighbor로 ID를 붙이지
-  않는다. 현재 최근접 연관은 이미 시작된 한 번의 주행 요청 안에서 confidence
-  순위 뒤집힘을 막는 용도일 뿐, station ID를 추정하거나 다음 요청까지 기억하지 않는다.
+  발행하는 인터페이스가 추가로 필요하다. battery의 세션 내 최근접 연관은 첫
+  요청에서 선택한 같은 볼트쌍을 복귀 때 유지하는 제한된 용도이며 station ID를
+  추정하지 않는다. busbar 최근접 연관은 이미 시작된 한 번의 주행 요청 안에서
+  confidence 순위 뒤집힘을 막는 용도일 뿐 다음 요청까지 기억하지 않는다.
 - perception의 raw `Detection3DArray`에 대해 drive가 별도 연속 표본 gate를 적용한다.
   검출 알고리즘 내부 품질 상태(PnP 성공 여부 등)는 현재 메시지에 없으므로 장기적으로
   `target_id`, covariance, score, sample count, valid source가 포함된 전용 메시지가
   필요하다.
 - 현재 구현은 point-to-point 제어이며 Nav2 map/costmap/장애물 우회는 포함하지 않는다.
-- battery는 현재 AMR 위치에서 물체까지의 직선을 접근 방향으로 쓴다. busbar는
-  executor가 실제 적용한 작업 셀 회전에서 docking normal을 받고 pre-approach를
-  거치지만, 일반 장애물 우회는 하지 않는다. 각 선분 경로가 비어 있는 장면에서만
+- battery는 첫 정상 READY baseline과 비전 target으로 고정한 docking normal,
+  busbar는 executor가 실제 적용한 작업 셀 회전의 docking normal을 사용한다.
+  battery는 chassis 진행축 뒤의 접근 lane, busbar는 작업 셀 바깥 pre-approach를
+  거치지만 일반 장애물 우회는 하지 않는다. 각 선분 경로가 비어 있는 장면에서만
   사용한다.
 - 전체 공정은 `full_process_execute_isaac.py`가 물리 AMR와 arm state machine을
   같은 live stage에서 실행한다. AMR 전용 `execute_isaac.py`를 동시에 실행하지 않는다.

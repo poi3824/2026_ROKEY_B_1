@@ -21,15 +21,18 @@ from vision_goal import (  # noqa: E402
     DetectionCandidate,
     DetectionWindow,
     VisionUnavailable,
+    calibrate_directional_docking,
     compute_busbar_pick_targets,
     compute_busbar_scan_xy,
     compute_directional_standoff_goal,
+    compute_pose_aligned_preapproach,
     compute_standoff_goal,
     select_highest_confidence,
     select_nearest_busbar_path,
     select_nearest_valid_pair,
     select_nearest_to_reference,
 )
+from motion_guard import limit_revolute_joint_step  # noqa: E402
 
 
 def test_normalize_angle_wraps_both_directions():
@@ -183,19 +186,51 @@ def test_reverse_docking_uses_goal_yaw_inside_final_approach():
     assert math.isclose(command.heading_error, 0.0, abs_tol=1.0e-12)
 
 
+def test_forward_docking_reaches_position_before_perpendicular_final_yaw():
+    """Battery는 목표 직전에도 위치 bearing을 유지한 뒤 제자리 yaw 정렬한다."""
+    config = ControllerConfig(
+        linear_acceleration=100.0,
+        angular_acceleration=100.0,
+        position_tolerance=0.04,
+        final_approach_distance=0.08,
+    )
+    controller = GoToPoseController(config)
+    controller.set_goal(
+        Goal2D(
+            0.05,
+            0.0,
+            -math.pi / 2.0,
+            allow_reverse=False,
+            align_yaw_before_drive=False,
+        )
+    )
+
+    approaching = controller.compute(PoseState(0.0, 0.0, 0.0), 0.1)
+    assert approaching.phase == "drive"
+    assert approaching.linear > 0.0
+    assert math.isclose(approaching.heading_error, 0.0, abs_tol=1.0e-12)
+
+    at_position = controller.compute(PoseState(0.05, 0.0, 0.0), 0.1)
+    assert at_position.phase == "final_align"
+    assert at_position.angular < 0.0
+
+
 def test_busbar_scan_search_starts_at_selected_target_and_stays_bounded():
     target = (0.0056, 2.2893)
-    first = compute_busbar_scan_xy(target, math.pi, 0, 0.05)
+    step_m = 0.02
+    first = compute_busbar_scan_xy(target, math.pi, 0, step_m)
     assert first == pytest.approx(target)
 
     attempts = [
-        compute_busbar_scan_xy(target, math.pi, index, 0.05)
-        for index in range(6)
+        compute_busbar_scan_xy(target, math.pi, index, step_m)
+        for index in range(8)
     ]
-    assert attempts[:3] == pytest.approx(attempts[3:])
+    assert attempts[:4] == pytest.approx(attempts[4:])
+    assert attempts[0] == pytest.approx(target)
+    assert attempts[2] == pytest.approx(target)
     assert all(
         math.hypot(x - target[0], y - target[1])
-        <= 0.05 + 1.0e-12
+        <= step_m + 1.0e-12
         for x, y in attempts
     )
     # AMR 반대편으로 더 멀어지는 접근-normal 탐색은 하지 않는다.
@@ -239,6 +274,32 @@ def test_busbar_prim_resolution_rejects_unrelated_object():
 def test_busbar_scan_search_rejects_invalid_attempt(attempt):
     with pytest.raises(ValueError):
         compute_busbar_scan_xy((0.0, 0.0), 0.0, attempt, 0.05)
+
+
+def test_scan_joint_guard_limits_alternating_solver_branches():
+    current = (0.0, 0.1, -0.2)
+    limited, clipped = limit_revolute_joint_step(
+        current,
+        (math.pi - 0.01, -math.pi + 0.01, 2.8),
+        max_step_rad=0.02,
+    )
+
+    assert clipped
+    assert all(
+        abs(value - current_value) <= 0.02 + 1.0e-12
+        for value, current_value in zip(limited, current)
+    )
+
+
+def test_scan_joint_guard_uses_shortest_path_across_pi_boundary():
+    limited, clipped = limit_revolute_joint_step(
+        (math.pi - 0.01,),
+        (-math.pi + 0.01,),
+        max_step_rad=0.05,
+    )
+
+    assert not clipped
+    assert limited[0] == pytest.approx(math.pi + 0.01)
 
 
 def test_reverse_permission_alone_does_not_auto_select_reverse():
@@ -737,26 +798,89 @@ def test_directional_standoff_rejects_nonfinite_heading():
         )
 
 
-def test_live_battery_start_pose_accepts_separate_standoff():
-    current_xy = (0.4755832552909851, -0.02661629021167755)
+def test_battery_docking_calibration_preserves_initial_workface_and_yaw():
+    baseline_xy = (0.4755832552909851, -0.02661629021167755)
+    baseline_yaw = -math.pi / 2.0
     battery_midpoint_xy = (1.2209, -0.2012)
 
-    with pytest.raises(VisionUnavailable, match="standoff"):
-        compute_standoff_goal(
-            current_xy=current_xy,
-            target_xy=battery_midpoint_xy,
-            standoff_m=0.90,
-        )
-
-    goal = compute_standoff_goal(
-        current_xy=current_xy,
+    calibration = calibrate_directional_docking(
+        reference_xy=baseline_xy,
+        reference_yaw_rad=baseline_yaw,
         target_xy=battery_midpoint_xy,
         standoff_m=0.75,
+        max_reference_error_m=0.05,
+    )
+    final = compute_directional_standoff_goal(
+        target_xy=battery_midpoint_xy,
+        approach_yaw_rad=calibration.approach_yaw,
+        standoff_m=0.75,
+        docking_yaw_offset_rad=calibration.docking_yaw_offset,
+    )
+    preapproach = compute_pose_aligned_preapproach(
+        final_goal=final,
+        extra_m=0.80,
+    )
+
+    assert calibration.approach_yaw == pytest.approx(
+        math.radians(-13.1833),
+        abs=1.0e-4,
     )
     assert math.hypot(
-        battery_midpoint_xy[0] - goal.x,
-        battery_midpoint_xy[1] - goal.y,
-    ) == pytest.approx(0.75)
+        final.x - baseline_xy[0],
+        final.y - baseline_xy[1],
+    ) < 0.05
+    assert final.yaw == pytest.approx(baseline_yaw)
+    assert math.hypot(
+        preapproach.x - final.x,
+        preapproach.y - final.y,
+    ) == pytest.approx(0.80)
+    assert math.atan2(
+        final.y - preapproach.y,
+        final.x - preapproach.x,
+    ) == pytest.approx(final.yaw)
+
+
+def test_latched_battery_workface_translates_only_with_perception_target():
+    target = (2.0, 1.0)
+    calibration = calibrate_directional_docking(
+        reference_xy=(1.25, 1.0),
+        reference_yaw_rad=-math.pi / 2.0,
+        target_xy=target,
+        standoff_m=0.75,
+        max_reference_error_m=0.01,
+    )
+
+    expected = compute_directional_standoff_goal(
+        target_xy=target,
+        approach_yaw_rad=calibration.approach_yaw,
+        standoff_m=0.75,
+        docking_yaw_offset_rad=calibration.docking_yaw_offset,
+    )
+    target_shift = (0.30, -0.40)
+    shifted = compute_directional_standoff_goal(
+        target_xy=(
+            target[0] + target_shift[0],
+            target[1] + target_shift[1],
+        ),
+        approach_yaw_rad=calibration.approach_yaw,
+        standoff_m=0.75,
+        docking_yaw_offset_rad=calibration.docking_yaw_offset,
+    )
+
+    assert shifted.x - expected.x == pytest.approx(target_shift[0])
+    assert shifted.y - expected.y == pytest.approx(target_shift[1])
+    assert shifted.yaw == pytest.approx(expected.yaw)
+
+
+def test_battery_docking_calibration_rejects_wrong_initial_standoff():
+    with pytest.raises(VisionUnavailable, match="stand-off 오차"):
+        calibrate_directional_docking(
+            reference_xy=(0.0, 0.0),
+            reference_yaw_rad=0.0,
+            target_xy=(2.0, 0.0),
+            standoff_m=0.75,
+            max_reference_error_m=0.05,
+        )
 
 
 def test_duplicate_source_stamp_cannot_fake_consecutive_frames():

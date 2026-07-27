@@ -4,8 +4,8 @@ arm_node.py - ROS 2 Arm Control Node (MultiThreaded Executor & Reentrant Group)
 - BehaviorNode의 /execute_arm_task Action 수신
 - [지원 Task]
   1. SCAN_BATTERY        : 배터리 스캔 위치로 이동 후 Perception 노드로부터 두 볼트의 중앙 좌표 수신 및 저장
-  2. SCAN_BUSBAR         : 버스바 스캔 위치로 이동 후 Perception 노드로부터 버스바 파지 좌표 미리 수신 및 저장
-  3. PICK_BUSBAR         : 버스바 비전 위치 수신(또는 저장된 좌표 활용) 및 Isaac Sim 파지 명령 중계
+  2. SCAN_BUSBAR         : 고정캠 선택 좌표로 이동 후 손목캠으로 동일 버스바 여부 확인
+  3. PICK_BUSBAR         : AMR relay가 latch한 고정캠 좌표로 Isaac Sim 파지 명령 중계
   4. MOVE_BATTERY_CENTER : 스캔 시 저장한 배터리 중점 좌표를 Isaac Sim으로 퍼블리시 및 이동 명령 중계
   5. FINE_ALIGNMENT       : Isaac Sim 및 비전 노드의 정밀 1픽셀 오차 보정 명령 중계
   6. ASSEMBLE_BUSBAR      : Isaac Sim으로 버스바 하강 체결 및 그리퍼 해제 명령 중계 (추가됨)
@@ -407,16 +407,24 @@ class ArmNode(Node):
                     goal_handle,
                 )
                 if found:
-                    self.scanned_busbar_pose = busbar_pose
+                    # 손목 카메라는 동일한 버스바가 시야에 들어왔는지만 확인한다.
+                    # PICK XY는 관측 시점/카메라가 바뀌며 옆으로 이동하지 않도록
+                    # AMR 주행에 사용한 고정 카메라 snapshot을 그대로 유지한다.
+                    self.scanned_busbar_pose = selected_pose
                     self.get_logger().info(
-                        f" ★ [손목 버스바 좌표 저장 완료] "
-                        f"X: {busbar_pose.pose.position.x:.4f}, "
-                        f"Y: {busbar_pose.pose.position.y:.4f}, "
-                        f"Z: {busbar_pose.pose.position.z:.4f}"
+                        " ★ [손목 버스바 확인 완료] "
+                        f"wrist=({busbar_pose.pose.position.x:.4f}, "
+                        f"{busbar_pose.pose.position.y:.4f}, "
+                        f"{busbar_pose.pose.position.z:.4f}), "
+                        "PICK 고정캠="
+                        f"({selected_pose.pose.position.x:.4f}, "
+                        f"{selected_pose.pose.position.y:.4f}, "
+                        f"{selected_pose.pose.position.z:.4f})"
                     )
                     result_msg.success = True
                     result_msg.message = (
-                        f"손목 카메라 버스바 스캔 성공 ({msg})"
+                        "손목 카메라 동일 버스바 확인 성공; "
+                        f"PICK은 고정캠 좌표 사용 ({msg})"
                     )
                     goal_handle.succeed()
                     return result_msg
@@ -440,19 +448,24 @@ class ArmNode(Node):
             busbar_pose = self.scanned_busbar_pose
             if busbar_pose is None:
                 result_msg.success = False
-                result_msg.error_code = "NO_WRIST_SCANNED_BUSBAR"
+                result_msg.error_code = "NO_FIXED_CAMERA_BUSBAR_POSE"
                 result_msg.message = (
-                    "손목 카메라로 확인한 버스바 좌표가 없습니다. "
-                    "하드코딩/고정 카메라/배터리 좌표 폴백은 사용하지 않습니다."
+                    "손목 카메라로 동일 대상을 확인한 고정캠 버스바 "
+                    "snapshot이 없습니다."
                 )
                 goal_handle.abort()
                 return result_msg
             self.get_logger().info(
-                " -> [PICK_BUSBAR] 손목 카메라가 확인한 버스바 좌표를 사용합니다.")
+                " -> [PICK_BUSBAR] AMR 주행에 사용한 고정캠 버스바 "
+                f"좌표를 사용합니다: ({busbar_pose.pose.position.x:.4f}, "
+                f"{busbar_pose.pose.position.y:.4f}, "
+                f"{busbar_pose.pose.position.z:.4f})")
 
             # Isaac Sim 목표 좌표 및 파지 명령 퍼블리시
             self.pub_target_pose.publish(busbar_pose)
-            
+            # 서로 다른 ROS topic의 target/command 처리 순서를 보장한다.
+            time.sleep(0.1)
+
             cmd_msg = String()
             cmd_msg.data = "PICK_BUSBAR"
             self.pub_task_command.publish(cmd_msg)

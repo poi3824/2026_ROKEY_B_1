@@ -40,13 +40,16 @@ from vision_msgs.msg import Detection3DArray
 
 from fms_interfaces.msg import AmrStatus
 
+from drive_controller import normalize_angle, quaternion_to_yaw
 from vision_goal import (
     DetectionCandidate,
     DetectionWindow,
+    DirectionalDockingCalibration,
     VisionUnavailable,
     WorldGoal,
+    calibrate_directional_docking,
     compute_directional_standoff_goal,
-    compute_standoff_goal,
+    compute_pose_aligned_preapproach,
     select_highest_confidence,
     select_nearest_valid_pair,
     select_nearest_to_reference,
@@ -98,6 +101,9 @@ class AmrDriveNode(Node):
 
         self.declare_parameter("vision_standoff_m", float("nan"))
         self.declare_parameter("battery_standoff_m", float("nan"))
+        self.declare_parameter("battery_preapproach_extra_m", 0.80)
+        self.declare_parameter("battery_initial_pose_tolerance_m", 0.05)
+        self.declare_parameter("battery_initial_yaw_tolerance_deg", 5.0)
         self.declare_parameter("busbar_preapproach_extra_m", 0.80)
         self.declare_parameter("busbar_scan_yaw_offset_deg", 180.0)
         self.declare_parameter("debug_no_timeouts", False)
@@ -130,6 +136,19 @@ class AmrDriveNode(Node):
         )
         self._battery_standoff_m = float(
             self.get_parameter("battery_standoff_m").value
+        )
+        self._battery_preapproach_extra_m = float(
+            self.get_parameter("battery_preapproach_extra_m").value
+        )
+        self._battery_initial_pose_tolerance_m = float(
+            self.get_parameter("battery_initial_pose_tolerance_m").value
+        )
+        self._battery_initial_yaw_tolerance_rad = math.radians(
+            float(
+                self.get_parameter(
+                    "battery_initial_yaw_tolerance_deg"
+                ).value
+            )
         )
         self._busbar_preapproach_extra_m = float(
             self.get_parameter("busbar_preapproach_extra_m").value
@@ -194,6 +213,28 @@ class AmrDriveNode(Node):
             raise ValueError(
                 "battery_standoff_m을 battery 스캔 캘리브레이션 값으로 "
                 "명시해야 합니다. busbar stand-off를 재사용하지 않습니다."
+            )
+        if (
+            not math.isfinite(self._battery_preapproach_extra_m)
+            or self._battery_preapproach_extra_m < 0.0
+        ):
+            raise ValueError(
+                "battery_preapproach_extra_m은 유한한 0 이상의 거리여야 합니다"
+            )
+        if (
+            not math.isfinite(self._battery_initial_pose_tolerance_m)
+            or self._battery_initial_pose_tolerance_m <= 0.0
+        ):
+            raise ValueError(
+                "battery_initial_pose_tolerance_m은 유한한 양수여야 합니다"
+            )
+        if (
+            not math.isfinite(self._battery_initial_yaw_tolerance_rad)
+            or self._battery_initial_yaw_tolerance_rad <= 0.0
+            or self._battery_initial_yaw_tolerance_rad > math.pi
+        ):
+            raise ValueError(
+                "battery_initial_yaw_tolerance_deg는 0 초과 180 이하여야 합니다"
             )
         if (
             not math.isfinite(self._busbar_preapproach_extra_m)
@@ -327,6 +368,14 @@ class AmrDriveNode(Node):
 
         self._session_id = ""
         self._busbar_approach_yaw: Optional[float] = None
+        self._baseline_xy: Optional[tuple] = None
+        self._baseline_yaw: Optional[float] = None
+        self._battery_docking: Optional[
+            DirectionalDockingCalibration
+        ] = None
+        # 첫 정상 battery 요청에서 고른 볼트쌍을 같은 Isaac 세션 동안
+        # 후보 식별에만 사용한다. 주행 좌표는 매 요청의 새 snapshot을 쓴다.
+        self._battery_pair_reference: Optional[tuple] = None
         self._active: Optional[RelayGoal] = None
         self._pending: Optional[PendingVisionRequest] = None
         self._pending_reason = "비전 표본 대기 중"
@@ -340,6 +389,12 @@ class AmrDriveNode(Node):
             "AMR 비전 전용 relay 준비: "
             f"busbar_standoff={self._standoff_m:.3f}m, "
             f"battery_standoff={self._battery_standoff_m:.3f}m, "
+            f"battery_preapproach_extra="
+            f"{self._battery_preapproach_extra_m:.3f}m, "
+            f"battery_initial_pose_tolerance="
+            f"{self._battery_initial_pose_tolerance_m:.3f}m, "
+            f"battery_initial_yaw_tolerance="
+            f"{math.degrees(self._battery_initial_yaw_tolerance_rad):.1f}deg, "
             f"busbar_preapproach_extra="
             f"{self._busbar_preapproach_extra_m:.3f}m, "
             f"busbar_scan_yaw_offset="
@@ -403,6 +458,17 @@ class AmrDriveNode(Node):
                     raise ValueError(
                         "workcell busbar_approach_yaw가 유한하지 않습니다"
                     )
+            baseline = payload["baseline"]
+            if str(baseline["parent_frame_id"]) != "world":
+                raise ValueError("baseline parent frame이 world가 아닙니다")
+            baseline_x = float(baseline["origin_x"])
+            baseline_y = float(baseline["origin_y"])
+            baseline_yaw = float(baseline["origin_yaw"])
+            if not all(
+                math.isfinite(value)
+                for value in (baseline_x, baseline_y, baseline_yaw)
+            ):
+                raise ValueError("baseline pose가 유한하지 않습니다")
         except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
             self.get_logger().warn(f"잘못된 READY 무시: {exc}")
             return
@@ -421,6 +487,10 @@ class AmrDriveNode(Node):
 
         self._session_id = session_id
         self._busbar_approach_yaw = busbar_approach_yaw
+        self._baseline_xy = (baseline_x, baseline_y)
+        self._baseline_yaw = baseline_yaw
+        self._battery_docking = None
+        self._battery_pair_reference = None
         self._current_world_pose = None
         self._last_world_pose_wall = 0.0
         for gate in self._vision_gates.values():
@@ -434,7 +504,8 @@ class AmrDriveNode(Node):
         )
         self.get_logger().info(
             f"Isaac bridge READY session={session_id}; "
-            f"busbar 접근={approach}"
+            f"busbar 접근={approach}; "
+            "battery 접근=첫 비전 target과 READY baseline으로 1회 고정"
         )
 
         if active is not None:
@@ -618,6 +689,8 @@ class AmrDriveNode(Node):
         self._try_resolve_pending()
 
     def _battery_pair_reference_xy(self):
+        if self._battery_pair_reference is not None:
+            return self._battery_pair_reference
         active = self._active
         if active is not None and active.target_kind == "battery":
             return (
@@ -799,11 +872,125 @@ class AmrDriveNode(Node):
                 enforce_age=not self._debug_no_timeouts,
             )
             current = self._current_world_pose.pose.position
-            use_directional_busbar = (
+            if pending.target_kind == "battery":
+                if self._baseline_xy is None or self._baseline_yaw is None:
+                    raise VisionUnavailable(
+                        "Isaac READY baseline이 없어 battery 접근 방향을 "
+                        "보정할 수 없습니다"
+                    )
+                just_calibrated = False
+                if self._battery_docking is None:
+                    try:
+                        calibration = calibrate_directional_docking(
+                            reference_xy=self._baseline_xy,
+                            reference_yaw_rad=self._baseline_yaw,
+                            target_xy=(snapshot.x, snapshot.y),
+                            standoff_m=self._battery_standoff_m,
+                            max_reference_error_m=(
+                                self._battery_initial_pose_tolerance_m
+                            ),
+                        )
+                        orientation = (
+                            self._current_world_pose.pose.orientation
+                        )
+                        current_yaw = quaternion_to_yaw(
+                            float(orientation.x),
+                            float(orientation.y),
+                            float(orientation.z),
+                            float(orientation.w),
+                        )
+                    except (VisionUnavailable, ValueError) as exc:
+                        self._fail_pending_for(
+                            pending.target_kind,
+                            f"첫 battery docking 보정 거부: {exc}",
+                        )
+                        return
+                    current_baseline_error_m = math.hypot(
+                        float(current.x) - self._baseline_xy[0],
+                        float(current.y) - self._baseline_xy[1],
+                    )
+                    current_baseline_yaw_error = abs(
+                        normalize_angle(current_yaw - self._baseline_yaw)
+                    )
+                    if (
+                        current_baseline_error_m
+                        > self._battery_initial_pose_tolerance_m
+                        or current_baseline_yaw_error
+                        > self._battery_initial_yaw_tolerance_rad
+                    ):
+                        self._fail_pending_for(
+                            pending.target_kind,
+                            "첫 battery 방향 보정 시 실제 chassis가 READY "
+                            "baseline에서 "
+                            f"위치 {current_baseline_error_m:.3f}m "
+                            f"(제한 {self._battery_initial_pose_tolerance_m:.3f}m), "
+                            f"yaw {math.degrees(current_baseline_yaw_error):.1f}deg "
+                            "(제한 "
+                            f"{math.degrees(self._battery_initial_yaw_tolerance_rad):.1f}deg)"
+                            "만큼 다릅니다; 잘못된 접근 면은 저장하지 않습니다",
+                        )
+                        return
+
+                    self._battery_docking = calibration
+                    just_calibrated = True
+                    docking_approach_deg = math.degrees(
+                        self._battery_docking.approach_yaw
+                    )
+                    reference_error_mm = (
+                        self._battery_docking.reference_error_m * 1000.0
+                    )
+                    self.get_logger().info(
+                        "battery docking 방향 고정: "
+                        f"approach={docking_approach_deg:+.1f}deg, "
+                        "chassis="
+                        f"{math.degrees(self._baseline_yaw):+.1f}deg, "
+                        f"baseline stand-off 오차="
+                        f"{reference_error_mm:.1f}mm"
+                    )
+
+                battery_docking = self._battery_docking
+                final_goal = compute_directional_standoff_goal(
+                    target_xy=(snapshot.x, snapshot.y),
+                    approach_yaw_rad=battery_docking.approach_yaw,
+                    standoff_m=self._battery_standoff_m,
+                    docking_yaw_offset_rad=(
+                        battery_docking.docking_yaw_offset
+                    ),
+                )
+                distance_to_final = math.hypot(
+                    final_goal.x - float(current.x),
+                    final_goal.y - float(current.y),
+                )
+                use_preapproach = (
+                    not just_calibrated
+                    and self._battery_preapproach_extra_m > 0.0
+                    and distance_to_final
+                    > self._battery_initial_pose_tolerance_m
+                )
+                if use_preapproach:
+                    # 팔 장착면이 chassis 진행축과 직각이므로 작업물 normal
+                    # 바깥으로 갔다가 끝에서 90도 도는 경로를 만들지 않는다.
+                    # 최종 chassis yaw의 뒤쪽 lane에서 직선 docking한다.
+                    preapproach = compute_pose_aligned_preapproach(
+                        final_goal=final_goal,
+                        extra_m=self._battery_preapproach_extra_m,
+                    )
+                    world_goal = WorldGoal(
+                        x=preapproach.x,
+                        y=preapproach.y,
+                        yaw=math.atan2(
+                            preapproach.y - float(current.y),
+                            preapproach.x - float(current.x),
+                        ),
+                    )
+                    phase = "preapproach"
+                else:
+                    world_goal = final_goal
+                    phase = "final"
+            elif (
                 pending.target_kind == "busbar"
                 and self._busbar_approach_yaw is not None
-            )
-            if use_directional_busbar:
+            ):
                 final_goal = compute_directional_standoff_goal(
                     target_xy=(snapshot.x, snapshot.y),
                     approach_yaw_rad=self._busbar_approach_yaw,
@@ -839,18 +1026,10 @@ class AmrDriveNode(Node):
                     world_goal = final_goal
                     phase = "final"
             else:
-                standoff_m = (
-                    self._battery_standoff_m
-                    if pending.target_kind == "battery"
-                    else self._standoff_m
+                raise VisionUnavailable(
+                    f"{pending.target_kind} 작업 셀 접근 방향이 없습니다; "
+                    "현재 위치 기반 radial fallback은 사용하지 않습니다"
                 )
-                world_goal = compute_standoff_goal(
-                    current_xy=(float(current.x), float(current.y)),
-                    target_xy=(snapshot.x, snapshot.y),
-                    standoff_m=standoff_m,
-                )
-                final_goal = world_goal
-                phase = "final"
         except VisionUnavailable as exc:
             self._pending_reason = str(exc)
             self.get_logger().warn(
@@ -872,6 +1051,9 @@ class AmrDriveNode(Node):
         selected.pose.position.z = snapshot.z
         selected.pose.orientation.w = 1.0
         if pending.target_kind == "battery":
+            # 다음 battery 요청에서도 동일한 물리 볼트쌍을 고르되, 이 좌표
+            # 자체를 주행 fallback으로 사용하지는 않는다.
+            self._battery_pair_reference = (snapshot.x, snapshot.y)
             self._selected_battery_pub.publish(selected)
         else:
             # relay가 confidence gate를 통과시켜 실제 주행에 사용한 바로 그
@@ -899,12 +1081,9 @@ class AmrDriveNode(Node):
             vision_target_y=snapshot.y,
             vision_source_stamp_ns=snapshot.source_stamp_ns,
             phase=phase,
-            # 배터리는 시작 pose가 이미 standoff 허용오차 안일 수 있으므로
-            # 위치 도착 뒤 불필요한 chassis yaw 정렬을 강제하지 않는다.
-            yaw_required=(
-                pending.target_kind == "busbar"
-                and phase != "preapproach"
-            ),
+            # pre-approach는 위치만 확인한다. 최종 docking은 battery도 최초
+            # 정상 baseline yaw까지 정렬해야 팔 장착면이 작업물을 향한다.
+            yaw_required=phase != "preapproach",
             allow_reverse=(
                 phase == "final" and final_allow_reverse
             ),
@@ -1091,7 +1270,7 @@ class AmrDriveNode(Node):
                     "안전 pre-approach 도착; 최종 docking 시작",
                 )
                 self.get_logger().info(
-                    f"busbar pre-approach 도착 -> 최종 goal="
+                    f"{active.target_kind} pre-approach 도착 -> 최종 goal="
                     f"({active.final_x:.4f}, {active.final_y:.4f}, "
                     f"{math.degrees(active.final_yaw):.1f}deg)"
                 )

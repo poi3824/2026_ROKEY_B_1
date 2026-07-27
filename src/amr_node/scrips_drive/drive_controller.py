@@ -68,9 +68,8 @@ class Goal2D:
 class ControllerConfig:
     position_tolerance: float = 0.04
     yaw_tolerance: float = math.radians(3.0)
-    # 목표 바로 앞에서는 atan2로 구한 bearing이 수 mm의 횡오차에도 크게
-    # 흔들린다. 이 거리 안에서는 최종 goal yaw를 경로 방향으로 사용해
-    # turn_to_path와 final_align 사이의 경계 진동을 막는다.
+    # 명시적 reverse docking은 목표 바로 앞에서 최종 goal yaw를 경로 방향으로
+    # 사용한다. 일반 forward goal은 위치에 먼저 도달한 뒤 제자리 yaw 정렬한다.
     final_approach_distance: float = 0.08
     # 큰 곡선을 그리며 출발하지 않도록 경로 방향을 먼저 거의 맞춘다.
     turn_in_place_threshold: float = math.radians(5.0)
@@ -213,6 +212,7 @@ class GoToPoseController:
             bearing = math.atan2(dy, dx)
             if (
                 goal.yaw_required
+                and goal.align_yaw_before_drive
                 and distance <= self.config.final_approach_distance
             ):
                 path_yaw = goal.yaw

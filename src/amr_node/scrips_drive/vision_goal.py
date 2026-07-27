@@ -42,9 +42,19 @@ class WorldGoal:
     yaw: float
 
 
+@dataclass(frozen=True)
+class DirectionalDockingCalibration:
+    """첫 정상 도킹 자세에서 고정한 작업 셀 접근 방향과 chassis 방향."""
+
+    approach_yaw: float
+    docking_yaw_offset: float
+    reference_error_m: float
+
+
 _SCAN_SEARCH_PATTERN = (
     (0.0, 0.0),
     (0.0, +1.0),
+    (0.0, 0.0),
     (0.0, -1.0),
 )
 
@@ -611,4 +621,87 @@ def compute_directional_standoff_goal(
         x=target_xy[0] - math.cos(approach_yaw) * standoff_m,
         y=target_xy[1] - math.sin(approach_yaw) * standoff_m,
         yaw=docking_yaw,
+    )
+
+
+def compute_pose_aligned_preapproach(
+    *,
+    final_goal: WorldGoal,
+    extra_m: float,
+) -> WorldGoal:
+    """최종 chassis 진행축 뒤쪽에 직선 docking용 pre-approach를 만든다."""
+    values = (final_goal.x, final_goal.y, final_goal.yaw, extra_m)
+    if not all(math.isfinite(value) for value in values):
+        raise VisionUnavailable("pose-aligned pre-approach에 NaN/inf가 있습니다")
+    if extra_m <= 0.0:
+        raise VisionUnavailable("pre-approach extra_m은 양수여야 합니다")
+
+    return WorldGoal(
+        x=final_goal.x - math.cos(final_goal.yaw) * extra_m,
+        y=final_goal.y - math.sin(final_goal.yaw) * extra_m,
+        yaw=final_goal.yaw,
+    )
+
+
+def calibrate_directional_docking(
+    *,
+    reference_xy: Tuple[float, float],
+    reference_yaw_rad: float,
+    target_xy: Tuple[float, float],
+    standoff_m: float,
+    max_reference_error_m: float,
+) -> DirectionalDockingCalibration:
+    """첫 정상 chassis pose와 비전 target으로 작업 셀 docking 방향을 고정한다.
+
+    절대 station 좌표는 만들지 않는다. 이후 target이 움직이면 동일한 접근 normal과
+    chassis yaw를 유지한 채 비전 target만큼 goal도 같이 평행 이동한다.
+    """
+    values = (
+        *reference_xy,
+        reference_yaw_rad,
+        *target_xy,
+        standoff_m,
+        max_reference_error_m,
+    )
+    if not all(math.isfinite(value) for value in values):
+        raise VisionUnavailable("docking 보정값에 NaN/inf가 있습니다")
+    if standoff_m <= 0.0:
+        raise VisionUnavailable("standoff_m은 명시적인 양수여야 합니다")
+    if max_reference_error_m <= 0.0:
+        raise VisionUnavailable(
+            "max_reference_error_m은 명시적인 양수여야 합니다"
+        )
+
+    dx = target_xy[0] - reference_xy[0]
+    dy = target_xy[1] - reference_xy[1]
+    if math.hypot(dx, dy) <= 1.0e-6:
+        raise VisionUnavailable(
+            "기준 chassis pose와 검출점이 같아 접근 방향을 보정할 수 없습니다"
+        )
+
+    approach_yaw = math.atan2(dy, dx)
+    docking_yaw_offset = (
+        reference_yaw_rad - approach_yaw + math.pi
+    ) % (2.0 * math.pi) - math.pi
+    reference_goal = compute_directional_standoff_goal(
+        target_xy=target_xy,
+        approach_yaw_rad=approach_yaw,
+        standoff_m=standoff_m,
+        docking_yaw_offset_rad=docking_yaw_offset,
+    )
+    reference_error_m = math.hypot(
+        reference_goal.x - reference_xy[0],
+        reference_goal.y - reference_xy[1],
+    )
+    if reference_error_m > max_reference_error_m:
+        raise VisionUnavailable(
+            "첫 battery target과 READY baseline의 stand-off 오차 "
+            f"{reference_error_m:.3f}m가 제한 "
+            f"{max_reference_error_m:.3f}m를 초과했습니다"
+        )
+
+    return DirectionalDockingCalibration(
+        approach_yaw=approach_yaw,
+        docking_yaw_offset=docking_yaw_offset,
+        reference_error_m=reference_error_m,
     )
