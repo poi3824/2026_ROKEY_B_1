@@ -11,8 +11,7 @@ BehaviorNode (FSM) 및 ArmNode, Vision Correction Node 통신 연동 버전
 4. MOVE_BATTERY_CENTER  : ArmNode에서 보낸 배터리 중점 좌표 상공(Z=0.7m)으로 이동
 5. FINE_ALIGNMENT       : 비전 노드의 START_ERRORFIX_CORRECTION 트리거 발송 후, 1픽셀 오차 보정 피드백에 맞춰 미세 정렬
 6. ASSEMBLE_BUSBAR      : 정렬된 XY 상태를 유지하며 수직 하강 안착, 버스바 고정 해제, 그리퍼 개방 및 상공 이탈
-7. SCAN_NUT1 / SCAN_NUT2   : 너트 스캔 위치(버스바 체결 위치 기준 상대 이동)로 이동
-8. PICK_NUT1 / PICK_NUT2   : 비전으로 검출된 너트 좌표로 접근, 물리 파지(Gripper Close) 및 상승
+7. PICK_NUT1 / PICK_NUT2   : 공급대 고정좌표(NUT1_PICK_XY/NUT2_PICK_XY)로 바로 접근, 물리 파지(Gripper Close) 및 상승
 9. ASSEMBLE_NUT1 / ASSEMBLE_NUT2 : 실시간 배터리 중심 좌표(target_mid_pos) 기준 사전 계산된
    상대 오프셋을 적용해 산출한 볼트 목표 좌표로 이동, 착좌 및 Screwing 체결(Regrasp 포함)
 """
@@ -105,10 +104,14 @@ INSERT_TOLERANCE_STRICT = 0.001    # Insert 단계 오차 허용범위 (1mm)
 # ══════════════════════════════════════════════════════════════════════════
 #  너트 조립(Nut Assembly) 파라미터 (신규 추가)
 # ══════════════════════════════════════════════════════════════════════════
-# 너트 스캔 위치: 버스바 체결 완료 시점의 EE 위치 기준 상대 이동 (X, Y) + 고정 고도 (Z)
-NUT_SCAN_OFFSET_X = -0.5
-NUT_SCAN_OFFSET_Y = -0.3
-NUT_SCAN_Z        = 0.9
+# ★ 너트 1/2번 파지 XY (assembly_nut_fraction1.py의 NUT1_PICK_POS/NUT2_PICK_POS와 동일값) ★
+# 예전엔 "버스바 체결 완료 시점의 EE 위치 기준 상대 이동"으로 스캔 위치를 잡았는데,
+# 그 기준점(EE 위치)이 FINE_ALIGNMENT 비전 수렴 결과라 매번 조금씩 달라지고, 그러면
+# 상대 오프셋으로 계산한 스캔 위치도 같이 흔들려서 실제 고정된 너트 공급대에서
+# 벗어나 버리는 문제가 있었다(2026-07-27 확인). 공급대는 world 기준 고정 위치이므로
+# 그냥 절대좌표로 바로 파지한다 - 스캔 단계 자체가 불필요해서 제거.
+NUT1_PICK_XY = (0.5746, -0.1008)
+NUT2_PICK_XY = (0.6643, -0.1031)
 
 NUT_HEIGHT         = 0.0095
 NUT_GRASP_Z_LOCAL  = NUT_HEIGHT + 0.023
@@ -405,8 +408,7 @@ def main():
 
     # ── 너트 조립(Nut Assembly) 상태 변수 (신규 추가) ──
     nut_index      = 0        # 1: 너트 1번, 2: 너트 2번 (NUT_*/MOVE_TO_BOLT_NUT 공용 Phase에서 참조)
-    NUT_SCAN_POS   = None      # 너트 스캔 위치 (최초 1회 계산 후 재사용)
-    nut_pick_pos   = None      # 비전으로 산출된 현재 너트의 물리 파지 좌표
+    nut_pick_pos   = None      # NUT1_PICK_XY/NUT2_PICK_XY 기준 현재 너트의 물리 파지 좌표
     nut_approach_pos = None    # 현재 너트 파지 상공 접근 좌표
     bolt_target_pos  = None    # compute_bolt_target_pos()로 동적 산출된 체결 목표 좌표
     bolt_touch_pos   = None    # 착좌(Screwing 시작) 목표 좌표
@@ -459,7 +461,6 @@ def main():
             grasp_timer = 0
 
             nut_index = 0
-            NUT_SCAN_POS = None
             nut_pick_pos = None
             nut_approach_pos = None
             bolt_target_pos = None
@@ -532,28 +533,17 @@ def main():
                 step_count = 0
                 print(f"\n>>> [{task}] 버스바 수직 하강 안착 시작 (Target Mid Pos: X={target_mid_pos[0]:.4f}, Y={target_mid_pos[1]:.4f})")
 
-            # ── [신규] 너트 1/2번 스캔 -> 파지 -> 체결 (Nut Assembly) ──
-            elif task in ("SCAN_NUT1", "SCAN_NUT2"):
-                nut_index = 1 if task == "SCAN_NUT1" else 2
-                if NUT_SCAN_POS is None:
-                    cur_ee = world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation()
-                    NUT_SCAN_POS = np.array([cur_ee[0] + NUT_SCAN_OFFSET_X, cur_ee[1] + NUT_SCAN_OFFSET_Y, NUT_SCAN_Z])
-                phase = "NUT_SCAN_APPROACH"
-                step_count = 0
-                print(f"\n>>> [{task}] 너트 스캔 위치 이동 시작 (Target: X={NUT_SCAN_POS[0]:.3f}, Y={NUT_SCAN_POS[1]:.3f}, Z={NUT_SCAN_POS[2]:.3f})")
-
+            # ── [신규] 너트 1/2번 파지 -> 체결 (Nut Assembly) ──
+            # ★ 공급대 고정좌표(NUT1_PICK_XY/NUT2_PICK_XY)를 쓰므로 스캔 단계 없이 바로
+            # 접근/하강한다 (위 NUT1_PICK_XY 주석 참고).
             elif task in ("PICK_NUT1", "PICK_NUT2"):
                 nut_index = 1 if task == "PICK_NUT1" else 2
-                if isaac_node.latest_target_pose is not None:
-                    pos = isaac_node.latest_target_pose.pose.position
-                    nut_pick_pos = np.array([pos.x, pos.y, NUT_PICK_Z])
-                    nut_approach_pos = np.array([pos.x, pos.y, NUT_APPROACH_Z])
-                    phase = "NUT_APPROACH"
-                    step_count = 0
-                    print(f"\n>>> [{task}] 너트 {nut_index}번 상공 접근 시작 (Target: X={nut_approach_pos[0]:.3f}, Y={nut_approach_pos[1]:.3f})")
-                else:
-                    print(f"\n[ERROR] [{task}] 수신된 너트 Target Pose가 없습니다.")
-                    publish_status("FAILURE:NO_TARGET_POSE")
+                pick_xy = NUT1_PICK_XY if nut_index == 1 else NUT2_PICK_XY
+                nut_pick_pos = np.array([pick_xy[0], pick_xy[1], NUT_PICK_Z])
+                nut_approach_pos = np.array([pick_xy[0], pick_xy[1], NUT_APPROACH_Z])
+                phase = "NUT_APPROACH"
+                step_count = 0
+                print(f"\n>>> [{task}] 너트 {nut_index}번 상공 접근 시작 (Target: X={nut_approach_pos[0]:.3f}, Y={nut_approach_pos[1]:.3f})")
 
             elif task in ("ASSEMBLE_NUT1", "ASSEMBLE_NUT2"):
                 nut_index = 1 if task == "ASSEMBLE_NUT1" else 2
@@ -862,22 +852,6 @@ def main():
             # ════════════════════════════════════════════════════════════════
             # [신규] 너트 조립(Nut Assembly) 공용 Phase (nut_index로 Nut1/Nut2 재사용)
             # ════════════════════════════════════════════════════════════════
-            # [10단계] 너트 스캔 위치 이동
-            elif phase == "NUT_SCAN_APPROACH":
-                publish_progress("NUT_SCAN_NAV", 50.0)
-                actions = arm_controller.forward(target_end_effector_position=NUT_SCAN_POS, target_end_effector_orientation=quat_nut)
-                robot.apply_action(actions)
-                robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_OPEN))
-
-                cur_pos = world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation()
-                current_err = math.dist(cur_pos, tuple(NUT_SCAN_POS))
-
-                if current_err < PICK_TOLERANCE_STRICT or (current_err < PICK_TOLERANCE_LOOSE_VAL and step_count > MAX_STUCK_STEPS):
-                    print(f"[OK] 너트 스캔 위치 도착 완료! ({cur_pos[0]:.3f}, {cur_pos[1]:.3f}, {cur_pos[2]:.3f})")
-                    publish_progress("NUT_SCAN_COMPLETE", 100.0)
-                    publish_status("SUCCESS")
-                    phase = "IDLE"
-
             # [11단계] 너트 상공 접근
             elif phase == "NUT_APPROACH":
                 publish_progress("NUT_APPROACH", 20.0)

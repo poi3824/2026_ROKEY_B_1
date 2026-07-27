@@ -9,8 +9,7 @@ arm_node.py - ROS 2 Arm Control Node (MultiThreaded Executor & Reentrant Group)
   4. MOVE_BATTERY_CENTER : 스캔 시 저장한 배터리 중점 좌표를 Isaac Sim으로 퍼블리시 및 이동 명령 중계
   5. FINE_ALIGNMENT       : Isaac Sim 및 비전 노드의 정밀 1픽셀 오차 보정 명령 중계
   6. ASSEMBLE_BUSBAR      : Isaac Sim으로 버스바 하강 체결 및 그리퍼 해제 명령 중계 (추가됨)
-  7. SCAN_NUT1/SCAN_NUT2       : 너트 스캔 위치 이동 후 Perception 노드로부터 너트 좌표 수신 및 저장 (신규)
-  8. PICK_NUT1/PICK_NUT2       : 스캔된 너트 좌표로 Isaac Sim 파지 명령 중계 (신규)
+  7. PICK_NUT1/PICK_NUT2       : 공급대 고정좌표로 Isaac Sim 파지 명령 중계 (비전 없음, 신규)
   9. ASSEMBLE_NUT1/ASSEMBLE_NUT2 : Isaac Sim으로 너트 Screwing 체결 명령 중계 (신규)
 """
 
@@ -91,10 +90,6 @@ class ArmNode(Node):
 
         # 버스바 스캔 시 저장할 버스바 파지 좌표 (PoseStamped)
         self.scanned_busbar_pose = None
-
-        # 너트 스캔 시 저장할 너트 1번 / 2번 좌표 (PoseStamped) (신규 추가)
-        self.scanned_nut1_pose = None
-        self.scanned_nut2_pose = None
 
     # =========================================================================
     # 콜백 함수들
@@ -362,70 +357,15 @@ class ArmNode(Node):
             return result_msg
 
         # ---------------------------------------------------------------------
-        # 🔥 [Task 7] SCAN_NUT1 / SCAN_NUT2 (너트 스캔 지점 이동 & 비전 좌표 저장) (신규 추가)
+        # 🔥 [Task 7/8] PICK_NUT1 / PICK_NUT2 (너트 물리 파지 및 들어올리기)
         # ---------------------------------------------------------------------
-        elif task_type in ("SCAN_NUT1", "SCAN_NUT2"):
-            self.get_logger().info(f" -> [{task_type}] Isaac Sim으로 너트 스캔 이동 명령 전송")
-
-            cmd_msg = String()
-            cmd_msg.data = task_type
-            self.pub_task_command.publish(cmd_msg)
-
-            # 1. Isaac Sim이 너트 스캔 위치로 이동 완료할 때까지 대기
-            success = self.wait_for_isaac_completion(goal_handle, feedback_msg)
-
-            if not success:
-                result_msg.success = False
-                result_msg.error_code = f"{task_type}_FAILED"
-                result_msg.message = f"너트 스캔 위치 이동 실패 (Status: {self.isaac_status})"
-                goal_handle.abort()
-                return result_msg
-
-            # 2. 이동 완료 후 Perception 노드에 너트 좌표 요청
-            self.get_logger().info(f" -> [{task_type}] 너트 스캔 위치 도착 완료. 비전 노드에 너트 좌표 요청...")
-            found, nut_pose, msg = self.request_vision_pose_async("nut")
-
-            if found and nut_pose is not None:
-                if task_type == "SCAN_NUT1":
-                    self.scanned_nut1_pose = nut_pose
-                else:
-                    self.scanned_nut2_pose = nut_pose
-
-                self.get_logger().info(
-                    f" ★ [{task_type} 좌표 저장 완료] "
-                    f"X: {nut_pose.pose.position.x:.4f}, "
-                    f"Y: {nut_pose.pose.position.y:.4f}, "
-                    f"Z: {nut_pose.pose.position.z:.4f}"
-                )
-
-                result_msg.success = True
-                result_msg.message = f"너트 스캔 및 비전 좌표 취득 성공 ({msg})"
-                goal_handle.succeed()
-            else:
-                self.get_logger().error(f" -> 너트 비전 검출 실패: {msg}")
-                result_msg.success = False
-                result_msg.error_code = "NUT_VISION_FAILED"
-                result_msg.message = f"너트 스캔 좌표 취득 실패: {msg}"
-                goal_handle.abort()
-
-            return result_msg
-
-        # ---------------------------------------------------------------------
-        # 🔥 [Task 8] PICK_NUT1 / PICK_NUT2 (너트 물리 파지 및 들어올리기) (신규 추가)
-        # ---------------------------------------------------------------------
+        # ★ 너트는 공급대 고정좌표(execute_isaac.py의 NUT1_PICK_XY/NUT2_PICK_XY)를 쓰므로
+        # 스캔 단계 없이 바로 파지 명령만 보낸다. 예전 SCAN_NUT1/2(비전 스캔) 방식은
+        # 스캔 위치 자체가 "버스바 체결 완료 시점 EE 위치 기준 상대 이동"이라, 그 기준점이
+        # FINE_ALIGNMENT 수렴 결과에 따라 매번 조금씩 달라져서 실제 고정된 너트 공급대를
+        # 벗어나는 문제가 있었다(2026-07-27 확인) - 완전히 제거.
         elif task_type in ("PICK_NUT1", "PICK_NUT2"):
-            nut_pose = self.scanned_nut1_pose if task_type == "PICK_NUT1" else self.scanned_nut2_pose
-
-            if nut_pose is None:
-                self.get_logger().error(f" -> [{task_type}] 스캔된 너트 좌표가 없습니다! 먼저 SCAN_NUT을 수행하세요.")
-                result_msg.success = False
-                result_msg.error_code = "NO_SCANNED_NUT_POSE"
-                result_msg.message = "스캔된 너트 좌표가 존재하지 않습니다."
-                goal_handle.abort()
-                return result_msg
-
-            # Isaac Sim 목표 좌표 및 파지 명령 퍼블리시
-            self.pub_target_pose.publish(nut_pose)
+            self.get_logger().info(f" -> [{task_type}] Isaac Sim으로 너트 파지 명령 전송 (고정좌표)")
 
             cmd_msg = String()
             cmd_msg.data = task_type
