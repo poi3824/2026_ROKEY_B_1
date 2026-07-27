@@ -14,6 +14,7 @@ arm_node.py - ROS 2 Arm Control Node (MultiThreaded Executor & Reentrant Group)
   9. ASSEMBLE_NUT1/ASSEMBLE_NUT2 : Isaac Sim으로 너트 Screwing 체결 명령 중계 (신규)
 """
 
+import math
 import time
 import rclpy
 from rclpy.node import Node
@@ -95,6 +96,14 @@ class ArmNode(Node):
         # 너트 스캔 시 저장할 너트 1번 / 2번 좌표 (PoseStamped) (신규 추가)
         self.scanned_nut1_pose = None
         self.scanned_nut2_pose = None
+
+        # ★ 배터리 중심 기준 볼트1/2 예상 오프셋 (execute_isaac.py의 BOLT1/2_OFFSET_FROM_CENTER와
+        # 반드시 동일하게 유지) - get_bolt_pair가 반환하는 A/B 두 볼트 중 어느 쪽이 이
+        # nut_index에 해당하는지 구분(가까운 쪽 매칭)하는 기준점으로만 쓴다.
+        self._BOLT_OFFSET_FROM_CENTER = {
+            1: (-0.1042, 0.1812),
+            2: (0.1042, -0.1812),
+        }
 
     # =========================================================================
     # 콜백 함수들
@@ -448,6 +457,34 @@ class ArmNode(Node):
         # 🔥 [Task 9] ASSEMBLE_NUT1 / ASSEMBLE_NUT2 (너트 Screwing 체결 명령 중계) (신규 추가)
         # ---------------------------------------------------------------------
         elif task_type in ("ASSEMBLE_NUT1", "ASSEMBLE_NUT2"):
+            nut_index = 1 if task_type == "ASSEMBLE_NUT1" else 2
+
+            # ★ 볼트 위치는 원래 (배터리 중심 + 고정 오프셋) 가정만으로 계산돼서 실측과
+            # 어긋나면 체결 위치를 못 잡는 문제가 있었음 - 착좌 하강 진입 전 get_bolt_pair로
+            # 딱 1회 실측 보정을 시도한다. 실패했다고 /target_pose를 그냥 안 보내면
+            # execute_isaac.py의 latest_target_pose에 이전 태스크(PICK_NUT 등)의 낡은 값이
+            # 그대로 남아있어 엉뚱한 좌표로 오인될 위험이 있다 - 실패 시에도 반드시
+            # 같은 (배터리 중심 + 고정 오프셋) 기준 좌표를 대신 발행해서 최신값을 덮어쓴다.
+            found, bolt_pose, vmsg = self.request_bolt_pose_by_index_async(nut_index, timeout_sec=5.0)
+            if found and bolt_pose is not None:
+                self.pub_target_pose.publish(bolt_pose)
+                self.get_logger().info(
+                    f" -> [{task_type}] get_bolt_pair 실측 보정 적용 -> "
+                    f"X={bolt_pose.pose.position.x:.4f}, Y={bolt_pose.pose.position.y:.4f} ({vmsg})"
+                )
+            else:
+                self.get_logger().warn(f" -> [{task_type}] 볼트 실측 실패({vmsg}), 고정 오프셋 좌표로 진행")
+                if self.scanned_battery_midpoint is not None:
+                    offset = self._BOLT_OFFSET_FROM_CENTER[nut_index]
+                    center = self.scanned_battery_midpoint.pose.position
+                    fallback_pose = PoseStamped()
+                    fallback_pose.header = self.scanned_battery_midpoint.header
+                    fallback_pose.pose.position.x = center.x + offset[0]
+                    fallback_pose.pose.position.y = center.y + offset[1]
+                    fallback_pose.pose.position.z = center.z
+                    fallback_pose.pose.orientation = self.scanned_battery_midpoint.pose.orientation
+                    self.pub_target_pose.publish(fallback_pose)
+
             self.get_logger().info(f" -> [{task_type}] Isaac Sim으로 너트 체결(Screwing) 명령 전송")
 
             cmd_msg = String()
@@ -543,6 +580,49 @@ class ArmNode(Node):
             return True, midpoint_pose, res.message
 
         return False, None, res.message if res else "GetBoltPair 수신 결과 없음"
+
+    def request_bolt_pose_by_index_async(self, nut_index: int, timeout_sec: float = 5.0):
+        """너트 체결(ASSEMBLE_NUT1/2) 직전에 get_bolt_pair로 실측한 볼트 좌표를 nut_index에
+        매칭해서 반환한다. get_bolt_pair는 A/B 두 볼트를 이전 tick과의 최근접 매칭으로만
+        구분하고 bolt1/bolt2로 라벨링하지 않으므로, scanned_battery_midpoint(SCAN_BATTERY에서
+        저장) + _BOLT_OFFSET_FROM_CENTER로 계산한 예상 좌표에 더 가까운 쪽을 그 nut_index의
+        볼트로 판정한다.
+        """
+        if self.scanned_battery_midpoint is None:
+            return False, None, "scanned_battery_midpoint 없음 (SCAN_BATTERY 먼저 필요)"
+
+        offset = self._BOLT_OFFSET_FROM_CENTER.get(nut_index)
+        if offset is None:
+            return False, None, f"알 수 없는 nut_index={nut_index!r}"
+
+        center = self.scanned_battery_midpoint.pose.position
+        expected_x = center.x + offset[0]
+        expected_y = center.y + offset[1]
+
+        if not self.client_get_bolt_pair.wait_for_service(timeout_sec=2.0):
+            return False, None, "GetBoltPair 서비스 응답 없음 (Timeout)"
+
+        req = GetBoltPair.Request()
+        future = self.client_get_bolt_pair.call_async(req)
+
+        start = time.time()
+        while not future.done():
+            if time.time() - start > timeout_sec:
+                return False, None, "GetBoltPair 서비스 호출 시간 초과"
+            time.sleep(0.05)
+
+        res = future.result()
+        if res is None or not res.found:
+            return False, None, res.message if res else "GetBoltPair 수신 결과 없음"
+
+        pos_a = res.pose_a.pose.position
+        pos_b = res.pose_b.pose.position
+        dist_a = math.hypot(pos_a.x - expected_x, pos_a.y - expected_y)
+        dist_b = math.hypot(pos_b.x - expected_x, pos_b.y - expected_y)
+        matched = res.pose_a if dist_a <= dist_b else res.pose_b
+        matched_dist = min(dist_a, dist_b)
+
+        return True, matched, f"{res.message} (예상좌표 대비 매칭거리 {matched_dist:.4f}m)"
 
     def request_vision_pose_async(self, target_label: str, timeout_sec: float = 3.0,
                                    retry_timeout_sec: float = 0.0, retry_interval_sec: float = 0.3):

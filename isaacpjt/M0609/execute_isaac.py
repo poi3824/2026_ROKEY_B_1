@@ -559,6 +559,14 @@ def main():
                 nut_index = 1 if task == "ASSEMBLE_NUT1" else 2
                 if target_mid_pos is not None:
                     bolt_target_pos = compute_bolt_target_pos(nut_index, target_mid_pos)
+                    # ★ arm_node가 착좌 진입 직전 get_bolt_pair 실측값을 /target_pose로
+                    # 먼저 보내뒀으면 그 XY로 대체 (Z는 기존 고정 오프셋 계산값 유지 -
+                    # depth/체결 깊이 계산은 별도로 튜닝된 값이라 그대로 둔다). 못 받았으면
+                    # 기존처럼 고정 오프셋 계산값 그대로 사용.
+                    if isaac_node.latest_target_pose is not None:
+                        vpos = isaac_node.latest_target_pose.pose.position
+                        bolt_target_pos = np.array([vpos.x, vpos.y, bolt_target_pos[2]])
+                        print(f"    [Vision] get_bolt_pair 실측 좌표로 대체 -> X={vpos.x:.4f}, Y={vpos.y:.4f}")
                     bolt_touch_pos = np.array([
                         bolt_target_pos[0], bolt_target_pos[1],
                         bolt_target_pos[2] + EE_OFFSET[2] + NUT_GRASP_Z_LOCAL
