@@ -582,6 +582,19 @@ def main():
         prog_msg.data = pct
         isaac_node.pub_progress.publish(prog_msg)
 
+    def refresh_arm_base_pose():
+        """AMR 베이스가 이동/회전한 뒤 팔 IK가 가정하는 베이스 포즈를 실제 값으로 갱신한다.
+        이걸 빼먹으면 IK가 옛 베이스 기준으로 목표를 계산해 팔이 엉뚱한 방향으로 뻗는다."""
+        base_link_xf = world_xf(stage, f"{M0609_PATH}/base_link")
+        base_pos = base_link_xf.ExtractTranslation()
+        base_quat = base_link_xf.ExtractRotationQuat()
+        arm_controller._motion_policy.set_robot_base_pose(
+            robot_position=np.array([base_pos[0], base_pos[1], base_pos[2]]),
+            robot_orientation=np.array(
+                [base_quat.GetReal(), *[float(v) for v in base_quat.GetImaginary()]]
+            ),
+        )
+
     while simulation_app.is_running():
         world.step(render=True)
         rclpy.spin_once(isaac_node, timeout_sec=0.0)
@@ -699,17 +712,7 @@ def main():
                     print(f"\n[AMR] 목표 지점 도착 (X={new_x:.4f}, Y={new_y:.4f}) -> 바퀴 잠금")
                     lock_amr_base(stage, NOVA_CARTER_ROOT)
                     wheels_locked = True
-
-                    # AMR이 이동했으므로 팔 IK가 가정하는 베이스 위치도 갱신해야 한다.
-                    base_link_xf = world_xf(stage, f"{M0609_PATH}/base_link")
-                    base_pos = base_link_xf.ExtractTranslation()
-                    base_quat = base_link_xf.ExtractRotationQuat()
-                    arm_controller._motion_policy.set_robot_base_pose(
-                        robot_position=np.array([base_pos[0], base_pos[1], base_pos[2]]),
-                        robot_orientation=np.array(
-                            [base_quat.GetReal(), *[float(v) for v in base_quat.GetImaginary()]]
-                        ),
-                    )
+                    refresh_arm_base_pose()
 
             sim_pose_msg = Pose2D()
             sim_pose_msg.x = float(amr_pos[0])
@@ -729,6 +732,10 @@ def main():
                 wheels_locked = True
                 amr_moving = False
                 amr_target_xy_theta = None
+                # 정상 도착 경로와 동일하게, 강제 잠금 시에도 팔 IK 베이스 포즈를
+                # 실제 위치로 갱신한다 (안 하면 IK가 옛 베이스 기준으로 계산해 팔이
+                # 엉뚱한 방향/거리로 뻗는다).
+                refresh_arm_base_pose()
 
             if task == "SCAN_BATTERY":
                 phase = "INIT_POSE"

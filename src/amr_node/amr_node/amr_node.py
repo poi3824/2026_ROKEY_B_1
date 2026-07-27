@@ -12,8 +12,9 @@ SUB /amr/drive_state (std_msgs/String, optional)  <- physics bridge
 PUB /amr/cancel      (std_msgs/Empty)              -> physics bridge
 
 ``scripts/execute_isaac.py``처럼 ``/amr/sim_pose``만 발행하는 단순 브리지에서는
-위치 허용 오차로 도착을 판단한다. ``/amr/drive_state``를 지원하는 물리 브리지에서는
-위치뿐 아니라 최종 자세 정렬과 실패 여부까지 브리지가 판정한 결과를 사용한다.
+위치+방향(yaw) 허용 오차로 도착을 판단한다. ``/amr/drive_state``를 지원하는 물리
+브리지에서는 위치/방향뿐 아니라 최종 자세 정렬과 실패 여부까지 브리지가 판정한
+결과를 사용한다.
 """
 import json
 import math
@@ -28,6 +29,7 @@ from std_msgs.msg import Empty, String
 from fms_interfaces.msg import AmrGoal, AmrStatus
 
 DEFAULT_ARRIVAL_TOLERANCE_M = 0.05
+DEFAULT_ARRIVAL_YAW_TOLERANCE_RAD = 0.03
 DEFAULT_BRIDGE_TIMEOUT_SEC = 10.0
 GOAL_FRAME_ID = 'amr_baseline'
 ACTIVE_DRIVE_STATES = {'ACTIVE', 'DRIVING'}
@@ -58,13 +60,20 @@ class AmrNode(Node):
         self.declare_parameter(
             'arrival_tolerance_m', DEFAULT_ARRIVAL_TOLERANCE_M)
         self.declare_parameter(
+            'arrival_yaw_tolerance_rad', DEFAULT_ARRIVAL_YAW_TOLERANCE_RAD)
+        self.declare_parameter(
             'bridge_timeout_sec', DEFAULT_BRIDGE_TIMEOUT_SEC)
         self._arrival_tolerance = float(
             self.get_parameter('arrival_tolerance_m').value)
+        self._arrival_yaw_tolerance = float(
+            self.get_parameter('arrival_yaw_tolerance_rad').value)
         self._bridge_timeout = float(
             self.get_parameter('bridge_timeout_sec').value)
         if self._arrival_tolerance <= 0.0:
             raise ValueError('arrival_tolerance_m must be greater than zero')
+        if self._arrival_yaw_tolerance <= 0.0:
+            raise ValueError(
+                'arrival_yaw_tolerance_rad must be greater than zero')
         if self._bridge_timeout < 0.0:
             raise ValueError('bridge_timeout_sec must be zero or greater')
 
@@ -84,6 +93,7 @@ class AmrNode(Node):
         self._current_pose = (0.0, 0.0, 0.0)
         self._goal_station_id = ''
         self._goal_xy = None
+        self._goal_theta = None
         self._goal_stamp = ''
         self._moving = False
         self._drive_state_seen = False
@@ -125,6 +135,7 @@ class AmrNode(Node):
 
         self._goal_station_id = station_id
         self._goal_xy = (float(msg.x), float(msg.y))
+        self._goal_theta = float(msg.theta)
         self._goal_stamp = _stamp_key(goal_pose)
         self._moving = True
         self._drive_state_seen = False
@@ -154,10 +165,14 @@ class AmrNode(Node):
         dx = self._goal_xy[0] - msg.x
         dy = self._goal_xy[1] - msg.y
         distance = math.hypot(dx, dy)
-        if distance <= self._arrival_tolerance:
+        yaw_error = math.atan2(
+            math.sin(self._goal_theta - msg.theta),
+            math.cos(self._goal_theta - msg.theta))
+        if distance <= self._arrival_tolerance \
+                and abs(yaw_error) <= self._arrival_yaw_tolerance:
             self._finish(
                 AmrStatus.STATE_ARRIVED,
-                f'도착 (위치 오차 {distance:.3f} m)')
+                f'도착 (위치 오차 {distance:.3f} m, 방향 오차 {yaw_error:.3f} rad)')
 
     def _on_drive_state(self, msg: String):
         try:
@@ -206,6 +221,7 @@ class AmrNode(Node):
         station_id = self._goal_station_id
         self._moving = False
         self._goal_xy = None
+        self._goal_theta = None
         self._goal_stamp = ''
         self._drive_state_seen = False
         self._publish_status(state, station_id, message)
