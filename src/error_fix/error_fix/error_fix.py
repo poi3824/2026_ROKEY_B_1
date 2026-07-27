@@ -6,10 +6,57 @@ import numpy as np
 
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import Image, CameraInfo
 from geometry_msgs.msg import PoseStamped
 from std_msgs.msg import String
 from cv_bridge import CvBridge
+from scipy.spatial.transform import Rotation as R
+
+# ──────────────────────────────────────────────────────────────────────────
+# ★ camera_bolt 고정 World Pose (error_fix_depth1.py에서 Busbar.usd 실측으로
+# 캘리브레이션한 값 그대로 재사용) - 픽셀+depth를 실제 world 미터 오차로 정확히
+# 환산해서 진짜 Kp/Ki PI를 적용하기 위함 (기존엔 depth를 구독만 하고 안 썼음).
+# ──────────────────────────────────────────────────────────────────────────
+CAMERA_BOLT_WORLD_POS = np.array([1.259848, -0.005358, 1.218396])
+CAMERA_BOLT_WORLD_QUAT_WXYZ = np.array([0.7071067811865476, 0.0, 0.0, 0.7071067811865475])
+_CAMERA_BOLT_ROT = R.from_quat([
+    CAMERA_BOLT_WORLD_QUAT_WXYZ[1], CAMERA_BOLT_WORLD_QUAT_WXYZ[2],
+    CAMERA_BOLT_WORLD_QUAT_WXYZ[3], CAMERA_BOLT_WORLD_QUAT_WXYZ[0],
+])
+# ROS 카메라 광학 프레임(X:right, Y:down, Z:forward) -> USD 카메라 로컬 프레임(X:right, Y:up, Z:backward)
+_OPTICAL_TO_USD_CAM = np.diag([1.0, -1.0, -1.0])
+
+
+def pixel_depth_to_world(u, v, depth_m, fx, fy, cx, cy):
+    """픽셀 좌표(u,v) + depth(m)를 camera_bolt 고정 pose 기준 world 좌표(m)로 변환."""
+    x_opt = (u - cx) * depth_m / fx
+    y_opt = (v - cy) * depth_m / fy
+    z_opt = depth_m
+    p_cam_usd = _OPTICAL_TO_USD_CAM @ np.array([x_opt, y_opt, z_opt])
+    return _CAMERA_BOLT_ROT.apply(p_cam_usd) + CAMERA_BOLT_WORLD_POS
+
+
+class IncrementalPI:
+    """증분형(velocity-form) PI - 매 사이클 '이번에 추가로 보정할 양(delta)'을 반환한다.
+    delta = Ki*error + Kp*(error - 직전 error). 받는 쪽(execute_isaac.py)이 이 delta를
+    누적(+=)하는 구조와 맞물려 설계됨 (assembly_nut_fraction1.py의 YawAligner와 동일 패턴)."""
+
+    def __init__(self, kp, ki, out_limit=None):
+        self.kp = kp
+        self.ki = ki
+        self.out_limit = out_limit
+        self.prev_error = None
+
+    def reset(self):
+        self.prev_error = None
+
+    def step(self, error):
+        delta_error = 0.0 if self.prev_error is None else (error - self.prev_error)
+        self.prev_error = error
+        delta = self.ki * error + self.kp * delta_error
+        if self.out_limit is not None:
+            delta = max(-self.out_limit, min(self.out_limit, delta))
+        return delta
 
 
 class BatteryAssemblyVisionNode(Node):
@@ -26,6 +73,9 @@ class BatteryAssemblyVisionNode(Node):
         )
         self.depth_sub = self.create_subscription(
             Image, '/camera_bolt/depth', self.depth_callback, 10
+        )
+        self.caminfo_sub = self.create_subscription(
+            CameraInfo, '/camera_bolt/camera_info', self.caminfo_callback, 10
         )
 
         # 트리거 명령 수신 (Isaac Sim으로부터 오차 보정 시작 신호 구독)
@@ -45,6 +95,7 @@ class BatteryAssemblyVisionNode(Node):
 
         # 최신 Depth 프레임 및 상태 변수
         self.current_depth_frame = None
+        self.current_depth_frame_resized = None  # RGB 해상도에 맞춰 정렬된 depth (world 변환용)
         self.fixed_bolt_coords = []
         self.busbar_hole_coords = []
         self.busbar_hole_depths = []
@@ -65,6 +116,27 @@ class BatteryAssemblyVisionNode(Node):
         self.last_valid_dtheta = 0.0
         self.has_valid_tracking = False
 
+        # ★ 카메라 intrinsics (camera_info 최초 1회 수신 시 캐시, 고정 카메라라 갱신 불필요)
+        self.fx = None
+        self.fy = None
+        self.cx = None
+        self.cy = None
+
+        # ★ world 좌표(m) 기준 실측 오차 - pixel_depth_to_world로 계산됨
+        self.last_valid_dx_m = 0.0
+        self.last_valid_dy_m = 0.0
+        self.has_valid_world_error = False
+
+        # ★ 진짜 PI 제어기 (world 미터/도 단위 오차에 비례). 위치는 실측 캘리브레이션이
+        # 없어 보수적인 값으로 시작 - 너무 느리거나 진동하면 kp/ki를 조정할 것.
+        # 각도는 assembly_nut_fraction1.py에서 RMPFlow 스텝응답 실측으로 설계된 값 재사용.
+        # ★ out_limit=0.002(2mm)로 클램프 - execute_isaac.py의 FINE_ALIGNMENT가
+        # abs(offset.x) <= 0.0025(2.5mm)를 넘으면 그 스텝을 통째로 버리기 때문에,
+        # 그보다 작게 유지해야 큰 오차에서도 스텝이 누락되지 않는다.
+        self.pi_x = IncrementalPI(kp=0.15, ki=0.35, out_limit=0.002)   # m/cycle
+        self.pi_y = IncrementalPI(kp=0.15, ki=0.35, out_limit=0.002)   # m/cycle
+        self.pi_yaw = IncrementalPI(kp=1.0, ki=0.0589, out_limit=0.5)  # deg/cycle
+
         # 연속 30 Step 유지 카운터
         self.hold_count = 0
 
@@ -80,6 +152,19 @@ class BatteryAssemblyVisionNode(Node):
             self.get_logger().info(f"\n>>> [Vision Correction] 오차 보정 시작 신호 수신 ({cmd})!")
             self.is_active = True
             self.hold_count = 0  # 새로 시작 시 연속 카운터 초기화
+            self.pi_x.reset()
+            self.pi_y.reset()
+            self.pi_yaw.reset()
+
+    def caminfo_callback(self, msg):
+        if self.fx is None:
+            self.fx = msg.k[0]
+            self.fy = msg.k[4]
+            self.cx = msg.k[2]
+            self.cy = msg.k[5]
+            self.get_logger().info(
+                f"✅ camera_bolt intrinsics 수신: fx={self.fx:.2f}, fy={self.fy:.2f}, cx={self.cx:.2f}, cy={self.cy:.2f}"
+            )
 
     def depth_callback(self, msg):
         try:
@@ -159,12 +244,28 @@ class BatteryAssemblyVisionNode(Node):
                     self.last_valid_dtheta = angle_error
                     self.has_valid_tracking = True
 
+                    # ★ 진짜 PI를 쓰려면 실제 world 오차(m)가 필요 - 픽셀+depth를
+                    # camera_bolt 고정 캘리브레이션으로 언프로젝션해서 계산한다.
+                    self.has_valid_world_error = False
+                    if (self.fx is not None and self.current_depth_frame_resized is not None
+                            and hole_depth > 0.0):
+                        bolt_depth = float(self.current_depth_frame_resized[by, bx])
+                        if bolt_depth > 0.0:
+                            bolt_world = pixel_depth_to_world(bx, by, bolt_depth, self.fx, self.fy, self.cx, self.cy)
+                            hole_world = pixel_depth_to_world(hx, hy, hole_depth, self.fx, self.fy, self.cx, self.cy)
+                            world_err = hole_world - bolt_world
+                            self.last_valid_dx_m = float(world_err[0])
+                            self.last_valid_dy_m = float(world_err[1])
+                            self.has_valid_world_error = True
+
                     cv2.circle(display_img, (hx, hy), 5, (0, 0, 255), -1)
                     cv2.line(display_img, (bx, by), (hx, hy), (255, 0, 255), 1, cv2.LINE_AA)
                     cv2.putText(display_img, f"E:({dx_px},{dy_px}) Z:{hole_depth:.2f}", (hx + 8, hy - 8),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 255), 1)
 
-                    status_line = f"dx:{dx_px:+2d}px, dy:{dy_px:+2d}px, dTheta:{angle_error:+.2f}deg [{self.hold_count}/30]"
+                    world_str = (f"world_dx:{self.last_valid_dx_m*1000:+.1f}mm world_dy:{self.last_valid_dy_m*1000:+.1f}mm"
+                                 if self.has_valid_world_error else "world:N/A")
+                    status_line = f"dx:{dx_px:+2d}px, dy:{dy_px:+2d}px, dTheta:{angle_error:+.2f}deg, {world_str} [{self.hold_count}/30]"
                     sys.stdout.write(f"\r\033[K[Tracking Status] {status_line}")
                     sys.stdout.flush()
 
@@ -199,37 +300,38 @@ class BatteryAssemblyVisionNode(Node):
         else:
             self.hold_count = 0  # 1픽셀이라도 차이 날 경우 연속 카운터 초기화
 
-        FIXED_STEP = 0.0006  # 0.6mm 고정 스텝 (기존 0.0002=0.2mm에서 3배, 수렴이 너무 느려서 상향)
-
-        # --- dx (위/아래) 설정 ---
-        if hy < by:          # 구멍이 위에 있음
-            step_x = +FIXED_STEP
-        elif hy > by:        # 구멍이 아래쪽에 있음
-            step_x = -FIXED_STEP
+        if self.has_valid_world_error:
+            # ★ 진짜 PI - world 미터 오차(hole-bolt)에 비례해서 스텝이 자동으로 커지고
+            # (오차 클 때) 작아짐(수렴할 때). error = -world_err로 줘야 hole이 bolt에
+            # 도달하는 방향으로 delta가 나온다(부호는 execute_isaac.py가 그대로
+            # target_fine_pos += delta 하는 것과 맞물려서 검증 필요 - 반대로 움직이면
+            # pi_x/pi_y의 error 부호를 반대로 뒤집을 것).
+            step_x = self.pi_x.step(-self.last_valid_dx_m)
+            step_y = self.pi_y.step(-self.last_valid_dy_m)
         else:
-            step_x = 0.0
+            # depth/camera_info 아직 준비 안 됐을 때 폴백: 기존 고정 스텝(bang-bang)
+            FIXED_STEP = 0.0006
+            if hy < by:
+                step_x = +FIXED_STEP
+            elif hy > by:
+                step_x = -FIXED_STEP
+            else:
+                step_x = 0.0
+            if hx < bx:
+                step_y = +FIXED_STEP
+            elif hx > bx:
+                step_y = -FIXED_STEP
+            else:
+                step_y = 0.0
 
-        # --- dy (왼쪽/오른쪽) 설정 ---
-        if hx < bx:          # 구멍이 오른쪽에 있음 (로봇 관점 dy 설정)
-            step_y = +FIXED_STEP
-        elif hx > bx:        # 구멍이 왼쪽에 있음
-            step_y = -FIXED_STEP
-        else:
-            step_y = 0.0
-
-        # --- 각도 보정 ---
-        if dtheta > 0:
-            step_dtheta = -0.01
-        elif dtheta < 0:
-            step_dtheta = 0.01
-        else:
-            step_dtheta = 0.0
+        # --- 각도 보정: assembly_nut_fraction1.py에서 실측 검증된 Kp/Ki 그대로 재사용 ---
+        step_dtheta = self.pi_yaw.step(dtheta)
 
         # 메시지 작성 및 퍼블리시
         target_msg = PoseStamped()
         target_msg.header.stamp = self.get_clock().now().to_msg()
         target_msg.header.frame_id = "world"
-        
+
         target_msg.pose.position.x = step_x
         target_msg.pose.position.y = step_y
         target_msg.pose.position.z = 0.0
@@ -382,6 +484,8 @@ class BatteryAssemblyVisionNode(Node):
 
         depth_h, depth_w = depth_img.shape[:2]
         depth_img_resized = cv2.resize(depth_img, (w, h), interpolation=cv2.INTER_NEAREST) if (depth_h, depth_w) != (h, w) else depth_img
+        # RGB 픽셀 좌표계와 정렬된 depth (고정 볼트 depth 샘플링에 재사용 - world 오차 계산용)
+        self.current_depth_frame_resized = depth_img_resized
 
         depth_norm = cv2.normalize(depth_img_resized, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
         depth_blur = cv2.GaussianBlur(depth_norm, (5, 5), 0)
