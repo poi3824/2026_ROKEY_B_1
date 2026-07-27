@@ -979,8 +979,17 @@ def main():
                     total_deg = screw_pass_idx * SCREW_TURNS_DEG + screw_pass_theta
                     depth_m = min((total_deg / 360.0) * NUT_PITCH_M, ENGAGE_LEN)
 
+                    # Regrasp 직후(screw_pass_idx > 0)는 재파지 지점이 REGRASP_Z_OFFSET만큼
+                    # 위에 떠 있는 상태 - 회전 시작과 동시에 그 여유분을 순간적으로 눌러버리면
+                    # (스냅) "누르면서 도는" 느낌이 나므로, 이번 pass 회전 진행률(0~1)에 비례해
+                    # 그 여유분을 서서히 소진시켜 자연스럽게 내려가도록 한다.
+                    if screw_pass_idx > 0:
+                        regrasp_extra = REGRASP_Z_OFFSET * (1.0 - screw_pass_theta / SCREW_TURNS_DEG)
+                    else:
+                        regrasp_extra = 0.0
+
                     target_pos = screw_seat_ee_pos.copy()
-                    target_pos[2] = screw_seat_ee_pos[2] - depth_m
+                    target_pos[2] = screw_seat_ee_pos[2] - depth_m + regrasp_extra
                     target_quat = yaw_rotated_quat(screw_start_quat, screw_pass_theta)
 
                     actions = arm_controller.forward(target_end_effector_position=target_pos, target_end_effector_orientation=target_quat)
