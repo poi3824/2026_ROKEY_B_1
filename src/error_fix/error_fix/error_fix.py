@@ -127,6 +127,14 @@ class BatteryAssemblyVisionNode(Node):
         self.last_valid_dy_m = 0.0
         self.has_valid_world_error = False
 
+        # ★ yaw 게인을 낮춰도 정상상태 오실레이션이 남는 문제 대응(2026-07-27):
+        # dtheta가 매 프레임 battery_angle-busbar_angle을 raw로 다시 계산해서 노이즈가
+        # 큰데, Kp*(error-prev_error)항이 이 노이즈를 그대로 증폭시켜 게인을 낮춰도
+        # 노이즈 크기만큼은 계속 진동한다. dtheta 자체를 지수이동평균(EMA)으로 스무딩해서
+        # PI에 넣기 전에 노이즈를 줄인다.
+        self.dtheta_ema = None
+        self.ANGLE_EMA_ALPHA = 0.25
+
         # ★ 진짜 PI 제어기 (world 미터/도 단위 오차에 비례). 위치는 실측 캘리브레이션이
         # 없어 보수적인 값으로 시작 - 너무 느리거나 진동하면 kp/ki를 조정할 것.
         # 각도는 assembly_nut_fraction1.py에서 RMPFlow 스텝응답 실측으로 설계된 값 재사용.
@@ -161,6 +169,7 @@ class BatteryAssemblyVisionNode(Node):
             self.pi_x.reset()
             self.pi_y.reset()
             self.pi_yaw.reset()
+            self.dtheta_ema = None
 
     def caminfo_callback(self, msg):
         if self.fx is None:
@@ -247,7 +256,12 @@ class BatteryAssemblyVisionNode(Node):
                 else:
                     self.last_valid_dx_px = dx_px
                     self.last_valid_dy_px = dy_px
-                    self.last_valid_dtheta = angle_error
+                    if self.dtheta_ema is None:
+                        self.dtheta_ema = angle_error
+                    else:
+                        self.dtheta_ema = (self.ANGLE_EMA_ALPHA * angle_error
+                                            + (1.0 - self.ANGLE_EMA_ALPHA) * self.dtheta_ema)
+                    self.last_valid_dtheta = self.dtheta_ema
                     self.has_valid_tracking = True
 
                     # ★ 진짜 PI를 쓰려면 실제 world 오차(m)가 필요 - 픽셀+depth를
