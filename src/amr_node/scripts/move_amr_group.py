@@ -37,15 +37,19 @@ battery_pack0~5 / Z_busbar1~3 / bench_busbar 등 고정 조립 트레이는 옮�
   # GUI에서 4개 prim을 직접 드래그해서 옮긴 뒤 Isaac Sim에서 Ctrl+S로 저장했다면,
   # Property 패널을 하나씩 클릭할 필요 없이 이걸로 현재 좌표 + BASELINE 대비 delta를 한 번에 확인:
   python3 move_amr_group.py --read
+
+  # 눈으로 맞춰서 확정한 프리셋으로 이동 (BASELINE 기준, X는 항상 0으로 고정):
+  python3 move_amr_group.py --preset row1 --save
 """
 import argparse
 import datetime
+import os
 import shutil
 import sys
 
-from pxr import Usd, UsdGeom, Gf
+from pxr import Usd, UsdGeom, Gf, Tf
 
-DEFAULT_USD = "/home/rokey/EV_combine/src/Collected_Busbar3/Busbar.usd"
+DEFAULT_USD = "/home/rokey/EV_combine/src/Collected_Busbar_amr/Busbar.usd"
 
 GROUP_PRIMS = [
     "/World/Nova_Carter",
@@ -62,6 +66,24 @@ BASELINE = {
     "/World/nut2": Gf.Vec3d(0.47100575524334387, -0.3012513976789413, 0.9711038761801655),
 }
 
+# BASELINE 기준 delta 프리셋 -- row1(battery_pack3/4/5) 3개 컬럼.
+#
+# X는 전부 0으로 고정한다: 지금까지 조립(arm reach) 로직이 검증된 유일한 X가
+# BASELINE 원본 X이기 때문 -- "트레이 가까이 붙는 라인"을 이거 하나로 통일해서
+# 여러 컴퓨터/팀원이 서로 다른 X에서 테스트하며 생기는 혼선을 없앤다. Y만 바꿔서
+# 컬럼을 고른다.
+#
+# col2(-0.5983)는 이번 세션에서 반복 테스트해 애니메이션/물리 양쪽 다 문제없이
+# 동작 확인된 값. col1/col3는 실측 컬럼 간격(battery_pack3<->4 0.577m,
+# pack4<->5 0.527m, 평균 0.55m)을 그 기준점에 +-로 적용한 값이라 "이 정도 거리에
+# 컬럼이 있다"는 추정이지, 어느 컬럼이 정확히 pack3/4/5 중 무엇인지는 팀원이
+# 조립 스크립트로 직접 확인해야 한다 (2026-07-27 기준 미검증).
+PRESETS = {
+    "col1": Gf.Vec3d(0.0, -0.0483, 0.0),   # col2 - 0.55
+    "col2": Gf.Vec3d(0.0, -0.5983, 0.0),   # 반복 테스트된 기준점
+    "col3": Gf.Vec3d(0.0, -1.1483, 0.0),   # col2 + 0.55
+}
+
 
 def _get_translate_op(stage: Usd.Stage, path: str):
     prim = stage.GetPrimAtPath(path)
@@ -76,11 +98,24 @@ def _get_translate_op(stage: Usd.Stage, path: str):
 
 
 def move_group(stage: Usd.Stage, delta: Gf.Vec3d):
+    """현재 좌표 기준으로 delta만큼 상대 이동."""
     results = []
     for path in GROUP_PRIMS:
         translate_op = _get_translate_op(stage, path)
         before = translate_op.Get()
         after = Gf.Vec3d(before) + delta
+        translate_op.Set(after)
+        results.append((path, before, after))
+    return results
+
+
+def apply_preset(stage: Usd.Stage, preset_delta: Gf.Vec3d):
+    """BASELINE + preset_delta로 절대 이동 (현재 좌표가 뭐든 상관없이 항상 같은 결과)."""
+    results = []
+    for path in GROUP_PRIMS:
+        translate_op = _get_translate_op(stage, path)
+        before = translate_op.Get()
+        after = Gf.Vec3d(BASELINE[path]) + preset_delta
         translate_op.Set(after)
         results.append((path, before, after))
     return results
@@ -103,18 +138,32 @@ def main():
     parser.add_argument("--dx", type=float, default=0.0)
     parser.add_argument("--dy", type=float, default=0.0)
     parser.add_argument("--dz", type=float, default=0.0)
+    parser.add_argument("--preset", choices=sorted(PRESETS.keys()),
+                         help="BASELINE + 등록된 delta로 절대 이동 (--dx/--dy/--dz와 동시 사용 불가)")
     parser.add_argument("--save", action="store_true", help="지정 안 하면 dry-run(저장 안 함)")
     parser.add_argument("--read", action="store_true",
                          help="이동 없이 현재 좌표 + BASELINE 대비 delta만 출력 (GUI에서 직접 드래그 후 저장한 값 확인용)")
     args = parser.parse_args()
 
-    stage = Usd.Stage.Open(args.usd)
+    if not os.path.isfile(args.usd):
+        print(f"파일 없음: {args.usd}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        stage = Usd.Stage.Open(args.usd)
+    except Tf.ErrorException as e:
+        print(f"스테이지를 열 수 없음: {args.usd}\n{e}", file=sys.stderr)
+        sys.exit(1)
     if stage is None:
         print(f"스테이지를 열 수 없음: {args.usd}", file=sys.stderr)
         sys.exit(1)
 
     if args.read:
-        results = read_group(stage)
+        try:
+            results = read_group(stage)
+        except RuntimeError as e:
+            print(f"이동 그룹 prim을 찾을 수 없음 -- Busbar.usd가 맞는 파일인지 확인: {e}", file=sys.stderr)
+            sys.exit(1)
         print(f"{'prim':35s} {'current translate':35s} delta vs BASELINE")
         deltas = []
         for path, current, delta in results:
@@ -128,15 +177,30 @@ def main():
             print(f"\n일치 -- 공통 delta = {deltas[0]} (이 값을 --dx/--dy/--dz로 다른 컴퓨터에서 재현하면 됨)")
         return
 
-    if args.dx == 0.0 and args.dy == 0.0 and args.dz == 0.0:
-        print("delta가 전부 0이다. --dx/--dy/--dz 중 하나는 지정해야 한다.", file=sys.stderr)
+    manual_delta_given = args.dx != 0.0 or args.dy != 0.0 or args.dz != 0.0
+    if args.preset and manual_delta_given:
+        print("--preset과 --dx/--dy/--dz는 동시에 못 쓴다.", file=sys.stderr)
+        sys.exit(1)
+    if not args.preset and not manual_delta_given:
+        print("delta가 전부 0이다. --preset 또는 --dx/--dy/--dz 중 하나는 지정해야 한다.", file=sys.stderr)
         sys.exit(1)
 
-    delta = Gf.Vec3d(args.dx, args.dy, args.dz)
-
-    results = move_group(stage, delta)
-
-    print(f"delta = {tuple(delta)}")
+    if args.preset:
+        preset_delta = PRESETS[args.preset]
+        try:
+            results = apply_preset(stage, preset_delta)
+        except RuntimeError as e:
+            print(f"이동 그룹 prim을 찾을 수 없음 -- Busbar.usd가 맞는 파일인지 확인: {e}", file=sys.stderr)
+            sys.exit(1)
+        print(f"preset = {args.preset} (BASELINE + {tuple(preset_delta)})")
+    else:
+        delta = Gf.Vec3d(args.dx, args.dy, args.dz)
+        try:
+            results = move_group(stage, delta)
+        except RuntimeError as e:
+            print(f"이동 그룹 prim을 찾을 수 없음 -- Busbar.usd가 맞는 파일인지 확인: {e}", file=sys.stderr)
+            sys.exit(1)
+        print(f"delta = {tuple(delta)}")
     for path, before, after in results:
         print(f"  {path:35s} {tuple(round(v, 4) for v in before)} -> {tuple(round(v, 4) for v in after)}")
 
