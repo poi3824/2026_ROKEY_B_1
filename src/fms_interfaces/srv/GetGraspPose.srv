@@ -1,0 +1,7 @@
+# Request (요청)
+string label
+---
+# Response (응답)
+bool found
+geometry_msgs/PoseStamped pose
+string message
