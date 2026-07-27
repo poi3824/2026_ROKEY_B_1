@@ -22,8 +22,6 @@ from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from geometry_msgs.msg import PoseStamped
 from std_msgs.msg import String, Float32
-from rcl_interfaces.srv import SetParameters
-from rcl_interfaces.msg import Parameter, ParameterValue, ParameterType
 
 # Action 및 Custom Interfaces
 from fms_interfaces.action import ExecuteArmTask
@@ -56,12 +54,6 @@ class ArmNode(Node):
         )
         self.client_get_bolt_pair = self.create_client(
             GetBoltPair, '/perception/get_bolt_pair', callback_group=self.cb_group
-        )
-        # perception_node의 use_bolt_roi 파라미터를 원격으로 켜고 끄기 위한 표준
-        # ROS2 파라미터 서비스 클라이언트 (perception_node가 'perception_node'라는
-        # 이름으로 뜨므로 자동 생성되는 서비스 경로).
-        self.client_set_perception_params = self.create_client(
-            SetParameters, '/perception_node/set_parameters', callback_group=self.cb_group
         )
 
         # 3. Perception Node 토픽 백업 구독
@@ -401,31 +393,25 @@ class ArmNode(Node):
         elif task_type in ("ASSEMBLE_NUT1", "ASSEMBLE_NUT2"):
             nut_index = 1 if task_type == "ASSEMBLE_NUT1" else 2
 
-            # ★ 볼트 위치는 원래 (배터리 중심 + 고정 오프셋) 가정만으로 계산돼서 실측과
-            # 어긋나면 체결 위치를 못 잡는 문제가 있었음 - 착좌 하강 진입 전 get_bolt_pair로
-            # 딱 1회 실측 보정을 시도한다. 실패했다고 /target_pose를 그냥 안 보내면
-            # execute_isaac.py의 latest_target_pose에 이전 태스크(PICK_NUT 등)의 낡은 값이
-            # 그대로 남아있어 엉뚱한 좌표로 오인될 위험이 있다 - 실패 시에도 반드시
-            # 같은 (배터리 중심 + 고정 오프셋) 기준 좌표를 대신 발행해서 최신값을 덮어쓴다.
-            found, bolt_pose, vmsg = self.request_bolt_pose_by_index_async(nut_index, timeout_sec=5.0)
-            if found and bolt_pose is not None:
+            # ★ get_bolt_pair 실측 보정 제거 - 배터리 중심(스캔값) + 고정 오프셋만 쓰는
+            # 절대좌표 방식으로 되돌림 (사용자 요청, 2026-07-27). 매번 새로 측정하지 않고
+            # SCAN_BATTERY 때 구한 scanned_battery_midpoint에 고정 오프셋만 더한다.
+            if self.scanned_battery_midpoint is not None:
+                offset = self._BOLT_OFFSET_FROM_CENTER[nut_index]
+                center = self.scanned_battery_midpoint.pose.position
+                bolt_pose = PoseStamped()
+                bolt_pose.header = self.scanned_battery_midpoint.header
+                bolt_pose.pose.position.x = center.x + offset[0]
+                bolt_pose.pose.position.y = center.y + offset[1]
+                bolt_pose.pose.position.z = center.z
+                bolt_pose.pose.orientation = self.scanned_battery_midpoint.pose.orientation
                 self.pub_target_pose.publish(bolt_pose)
                 self.get_logger().info(
-                    f" -> [{task_type}] get_bolt_pair 실측 보정 적용 -> "
-                    f"X={bolt_pose.pose.position.x:.4f}, Y={bolt_pose.pose.position.y:.4f} ({vmsg})"
+                    f" -> [{task_type}] 고정 오프셋 절대좌표 적용 -> "
+                    f"X={bolt_pose.pose.position.x:.4f}, Y={bolt_pose.pose.position.y:.4f}"
                 )
             else:
-                self.get_logger().warn(f" -> [{task_type}] 볼트 실측 실패({vmsg}), 고정 오프셋 좌표로 진행")
-                if self.scanned_battery_midpoint is not None:
-                    offset = self._BOLT_OFFSET_FROM_CENTER[nut_index]
-                    center = self.scanned_battery_midpoint.pose.position
-                    fallback_pose = PoseStamped()
-                    fallback_pose.header = self.scanned_battery_midpoint.header
-                    fallback_pose.pose.position.x = center.x + offset[0]
-                    fallback_pose.pose.position.y = center.y + offset[1]
-                    fallback_pose.pose.position.z = center.z
-                    fallback_pose.pose.orientation = self.scanned_battery_midpoint.pose.orientation
-                    self.pub_target_pose.publish(fallback_pose)
+                self.get_logger().warn(f" -> [{task_type}] scanned_battery_midpoint 없음, 좌표 갱신 건너뜀")
 
             self.get_logger().info(f" -> [{task_type}] Isaac Sim으로 너트 체결(Screwing) 명령 전송")
 
@@ -522,83 +508,6 @@ class ArmNode(Node):
             return True, midpoint_pose, res.message
 
         return False, None, res.message if res else "GetBoltPair 수신 결과 없음"
-
-    def _set_perception_bolt_roi(self, enabled: bool, timeout_sec: float = 2.0) -> bool:
-        """perception_node의 use_bolt_roi 파라미터를 원격으로 켜고 끈다.
-        SCAN_BATTERY(배터리 전체를 넓게 찍는 구도)용으로 튜닝된 고정 픽셀 ROI가,
-        구도가 다른 시점(예: ASSEMBLE_NUT - 팔이 볼트 바로 위 0도 자세라 화면이
-        반대로 들어감)에 get_bolt_pair를 호출할 때 정상 검출을 막지 않도록 임시로
-        끄기 위함. 실패해도 비치명적(호출부에서 로그만 남기고 그대로 진행)."""
-        if not self.client_set_perception_params.wait_for_service(timeout_sec=timeout_sec):
-            self.get_logger().warn("perception_node set_parameters 서비스 응답 없음 - ROI 전환 스킵")
-            return False
-
-        req = SetParameters.Request()
-        param = Parameter()
-        param.name = 'use_bolt_roi'
-        param.value = ParameterValue(type=ParameterType.PARAMETER_BOOL, bool_value=enabled)
-        req.parameters = [param]
-
-        future = self.client_set_perception_params.call_async(req)
-        start = time.time()
-        while not future.done():
-            if time.time() - start > timeout_sec:
-                self.get_logger().warn("perception_node use_bolt_roi 설정 시간 초과")
-                return False
-            time.sleep(0.05)
-
-        return future.result() is not None
-
-    def request_bolt_pose_by_index_async(self, nut_index: int, timeout_sec: float = 5.0):
-        """너트 체결(ASSEMBLE_NUT1/2) 직전에 get_bolt_pair로 실측한 볼트 좌표를 nut_index에
-        매칭해서 반환한다. get_bolt_pair는 A/B 두 볼트를 이전 tick과의 최근접 매칭으로만
-        구분하고 bolt1/bolt2로 라벨링하지 않으므로, scanned_battery_midpoint(SCAN_BATTERY에서
-        저장) + _BOLT_OFFSET_FROM_CENTER로 계산한 예상 좌표에 더 가까운 쪽을 그 nut_index의
-        볼트로 판정한다.
-        """
-        if self.scanned_battery_midpoint is None:
-            return False, None, "scanned_battery_midpoint 없음 (SCAN_BATTERY 먼저 필요)"
-
-        offset = self._BOLT_OFFSET_FROM_CENTER.get(nut_index)
-        if offset is None:
-            return False, None, f"알 수 없는 nut_index={nut_index!r}"
-
-        center = self.scanned_battery_midpoint.pose.position
-        expected_x = center.x + offset[0]
-        expected_y = center.y + offset[1]
-
-        # ASSEMBLE_NUT 시점엔 화면 구도가 SCAN_BATTERY와 달라(0도 자세) bolt ROI가
-        # 정상 볼트까지 걸러버릴 수 있어서, get_bolt_pair 호출 동안만 꺼뒀다가 끝나면
-        # 반드시(성공/실패 무관하게) 복원한다.
-        roi_was_disabled = self._set_perception_bolt_roi(False)
-        try:
-            if not self.client_get_bolt_pair.wait_for_service(timeout_sec=2.0):
-                return False, None, "GetBoltPair 서비스 응답 없음 (Timeout)"
-
-            req = GetBoltPair.Request()
-            future = self.client_get_bolt_pair.call_async(req)
-
-            start = time.time()
-            while not future.done():
-                if time.time() - start > timeout_sec:
-                    return False, None, "GetBoltPair 서비스 호출 시간 초과"
-                time.sleep(0.05)
-
-            res = future.result()
-            if res is None or not res.found:
-                return False, None, res.message if res else "GetBoltPair 수신 결과 없음"
-
-            pos_a = res.pose_a.pose.position
-            pos_b = res.pose_b.pose.position
-            dist_a = math.hypot(pos_a.x - expected_x, pos_a.y - expected_y)
-            dist_b = math.hypot(pos_b.x - expected_x, pos_b.y - expected_y)
-            matched = res.pose_a if dist_a <= dist_b else res.pose_b
-            matched_dist = min(dist_a, dist_b)
-
-            return True, matched, f"{res.message} (예상좌표 대비 매칭거리 {matched_dist:.4f}m)"
-        finally:
-            if roi_was_disabled:
-                self._set_perception_bolt_roi(True)
 
     def request_vision_pose_async(self, target_label: str, timeout_sec: float = 3.0,
                                    retry_timeout_sec: float = 0.0, retry_interval_sec: float = 0.3):
