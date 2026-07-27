@@ -67,6 +67,35 @@ BUSBAR_SYMMETRY_PAIRS = [(0, 1), (2, 3), (4, 5)]
 SINGLE_KEYPOINT_SLOT = 0
 
 
+# class YoloPoseDetector:
+#     """YOLO-pose(keypoints) 모델 기반 검출. 파지 픽셀 = Center 키포인트."""
+
+#     def __init__(self, model_path: str):
+#         self._model = YOLO(model_path)
+#         self.names = self._model.names
+
+#     def detect(self, image: np.ndarray, conf_threshold: float, iou_threshold: float = 0.7) -> list[dict]:
+#         """반환: [{"label", "score", "pixel": (u, v), "bbox_px": (x0,y0,x1,y1),
+#         "keypoints_px": np.ndarray shape (9,2)}, ...]"""
+#         results = self._model(image, conf=conf_threshold, iou=iou_threshold, verbose=False)[0]
+#         detections = []
+#         if results.keypoints is None:
+#             return detections
+
+#         keypoints_xy = results.keypoints.xy.cpu().numpy()
+#         for box, kpts, cls, conf in zip(
+#             results.boxes.xyxy, keypoints_xy, results.boxes.cls, results.boxes.conf
+#         ):
+#             u, v = kpts[CENTER_KEYPOINT_INDEX]
+#             detections.append({
+#                 "label": self.names[int(cls)],
+#                 "score": float(conf),
+#                 "pixel": (float(u), float(v)),
+#                 "bbox_px": tuple(box.tolist()),
+#                 "keypoints_px": kpts,
+#             })
+#         return detections
+
 class YoloPoseDetector:
     """YOLO-pose(keypoints) 모델 기반 검출."""
 

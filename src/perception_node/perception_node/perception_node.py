@@ -7,8 +7,9 @@ SUB <camera_info_topic>  (sensor_msgs/CameraInfo)
 
 PUB /perception/detections_3d  (vision_msgs/Detection3DArray, <world_frame> 기준)
 PUB <debug_image_topic>         (sensor_msgs/Image, bgr8) — rqt_image_view 등으로
-                                 keypoints/bbox/좌표(픽셀, 카메라 프레임, world 프레임)를
-                                 확인하기 위한 디버그 오버레이. publish_debug_image로 끌 수 있음.
+                                 keypoints/bbox/좌표(픽셀, 카메라 프레임, world 프레임) 및
+                                 BOLT ROI 영역을 확인하기 위한 디버그 오버레이.
+                                 publish_debug_image로 끌 수 있음.
 SRV /perception/get_grasp_pose (fms_interfaces/GetGraspPose) — 라벨별 최신 검출(world 좌표,
                                  최근 SMOOTHING_WINDOW_SEC 이내 표본의 평균값)을 캐시에서
                                  그대로 반환. 호출 시점에 재추론하지 않으므로, 호출 전에
@@ -50,6 +51,7 @@ import collections
 import math
 import os
 
+import cv2
 import numpy as np
 import rclpy
 from ament_index_python.packages import get_package_share_directory
@@ -97,19 +99,20 @@ class PerceptionNode(Node):
         self.declare_parameter('camera_info_topic', '/camera_info')
         self.declare_parameter('model_path', DEFAULT_MODEL_PATH)
         self.declare_parameter('world_frame', 'world')
-        # 기본값은 라이브 Isaac Sim(World0123.usd) 카메라 구성 기준: 이미지 헤더의
-        # frame_id는 sim_camera지만 tf 트리는 camera_color_optical_frame으로 발행되므로,
-        # 인자 없이 `ros2 run perception_node perception_node`만으로 동작하도록 맞춰둔다.
-        # 다른 tf 프레임을 쓰는 bag 등에서는 camera_frame_override 파라미터로 덮어쓰면 된다.
         self.declare_parameter('camera_frame_override', 'camera_color_optical_frame')
-        # conf 상향 + iou 하향 = 사실상 비최대억제(NMS)를 더 세게 걸어 한 객체에 대해
-        # 중복/저신뢰 박스가 살아남는 걸 줄임 (ultralytics 기본값은 conf=0.25, iou=0.7).
         self.declare_parameter('conf_threshold', 0.6)
         self.declare_parameter('iou_threshold', 0.45)
         self.declare_parameter('detection_period_sec', 0.5)
         self.declare_parameter('publish_debug_image', True)
         self.declare_parameter('debug_image_topic', '/perception/debug_image')
         self.declare_parameter('grasp_query_max_age_sec', 5.0)
+
+        # 🔥 bolt 라벨 스캔 시에만 적용할 ROI 영역 파라미터 (640x640 기준)
+        self.declare_parameter('use_bolt_roi', True)
+        self.declare_parameter('bolt_roi_x_min', 150)
+        self.declare_parameter('bolt_roi_x_max', 490)
+        self.declare_parameter('bolt_roi_y_min', 150)
+        self.declare_parameter('bolt_roi_y_max', 450)
 
         rgb_topic = self.get_parameter('rgb_topic').value
         depth_topic = self.get_parameter('depth_topic').value
@@ -133,16 +136,11 @@ class PerceptionNode(Node):
         self._camera_model = None
         self._camera_frame_id = None
 
-        # 라벨별 최신 검출(world 좌표 + 시각) 캐시. /perception/get_grasp_pose 서비스가
-        # 이 캐시를 그대로 반환한다 (호출 시점에 재추론하지 않음).
         self._latest_by_label = {}
-
-        # 라벨별 롤링 표본(월드 좌표, 시각) — 오차 분포 확인 및 평균 보정용.
         self._recent_detections = collections.defaultdict(list)
-        # 'bolt'는 한 tick에 2개가 나오므로 A/B 두 버킷으로 따로 추적한다.
         self._recent_bolt_a = []
         self._recent_bolt_b = []
-        self._latest_bolt_pair = None  # (mean_a, mean_b, stamp, sample_count)
+        self._latest_bolt_pair = None
 
         self._tf_buffer = Buffer()
         self._tf_listener = TransformListener(self._tf_buffer, self)
@@ -212,8 +210,42 @@ class PerceptionNode(Node):
         bolt_this_tick = []  # 'bolt'는 tick당 여러 개(보통 2개)일 수 있어 따로 전부 모음
         busbar_yaw_this_tick = None  # best_this_tick[busbar]가 갱신될 때만 같이 갱신
 
+        # ROI 파라미터 로드
+        use_bolt_roi = self.get_parameter('use_bolt_roi').value
+        bolt_x_min = self.get_parameter('bolt_roi_x_min').value
+        bolt_x_max = self.get_parameter('bolt_roi_x_max').value
+        bolt_y_min = self.get_parameter('bolt_roi_y_min').value
+        bolt_y_max = self.get_parameter('bolt_roi_y_max').value
+
+        # 🔥 rqt_image_view 시각화를 위한 ROI 박스 그리기
+        if debug_image is not None and use_bolt_roi:
+            cv2.rectangle(
+                debug_image,
+                (bolt_x_min, bolt_y_min),
+                (bolt_x_max, bolt_y_max),
+                (255, 0, 0),
+                2
+            )
+            cv2.putText(
+                debug_image,
+                'BOLT ROI',
+                (bolt_x_min + 5, bolt_y_min + 20),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (255, 0, 0),
+                2
+            )
+
         for det in self._detector.detect(rgb, self._conf_threshold, self._iou_threshold):
-            if det['label'] == BUSBAR_LABEL:
+            label = det['label']
+
+            # 🔥 'bolt' 라벨인 경우에만 ROI 범위 검사 수행
+            if use_bolt_roi and label == BOLT_LABEL:
+                px_x, px_y = det['pixel']
+                if not (bolt_x_min <= px_x <= bolt_x_max and bolt_y_min <= px_y <= bolt_y_max):
+                    continue  # 배터리 스캔 영역 밖의 볼트는 스킵
+
+            if label == BUSBAR_LABEL:
                 world_point, yaw_rad, status = self._resolve_busbar_pose(det, depth, header.stamp)
                 camera_point = None  # PnP 경로는 단일 카메라 포인트 개념이 없어 오버레이만 생략
             else:
@@ -227,7 +259,7 @@ class PerceptionNode(Node):
             if world_point is not None:
                 array_msg.detections.append(
                     self._make_detection3d(det, world_point, header.stamp))
-                label, score = det['label'], det['score']
+                score = det['score']
                 if label not in best_this_tick or score > best_this_tick[label][0]:
                     best_this_tick[label] = (score, world_point)
                     if label == BUSBAR_LABEL:
@@ -238,9 +270,8 @@ class PerceptionNode(Node):
         now = self.get_clock().now()
         for label, (score, world_point) in best_this_tick.items():
             if label == BOLT_LABEL:
-                continue  # 'bolt'는 아래 _update_bolt_pair에서 2개를 쌍으로 별도 추적
+                continue
             mean_point, _n = self._update_smoothed(label, world_point, now)
-            # 라벨별 최신값 캐시를 이번 tick 결과로 갱신(덮어쓰기) — /perception/get_grasp_pose가 참조.
             self._latest_by_label[label] = (score, mean_point, now)
             yaw_rad = busbar_yaw_this_tick if label == BUSBAR_LABEL else None
             self._publish_vision_topic(label, mean_point, header.stamp, yaw_rad)
@@ -288,8 +319,6 @@ class PerceptionNode(Node):
             self._nut_pose_pub.publish(msg)
 
     def _smooth_bucket(self, bucket: list, world_point, now) -> tuple:
-        """(world_point, stamp) 표본 리스트(bucket)에 새 표본을 추가하고, SMOOTHING_WINDOW_SEC
-        보다 오래된 표본은 버린 뒤 평균/표준편차를 계산해 반환한다. bucket은 in-place로 갱신됨."""
         bucket.append((np.asarray(world_point, dtype=float), now))
         cutoff = now - Duration(seconds=SMOOTHING_WINDOW_SEC)
         while bucket and bucket[0][1] < cutoff:
@@ -324,13 +353,15 @@ class PerceptionNode(Node):
         return tuple(mean), n
 
     def _update_bolt_pair(self, bolt_candidates, now):
-        """이번 tick의 'bolt' 검출들(보통 2개) 중 상위 2개를, 이전 tick 위치와 가장 가까운
-        조합으로 A/B에 매칭해 각각 독립적으로 롤링 평균한다. 2개 미만이면 이번 tick은
-        건너뛰고 기존 캐시를 유지한다 (한쪽이 가려진 경우 등)."""
         if len(bolt_candidates) < 2:
             return
 
-        bolt_candidates = sorted(bolt_candidates, key=lambda c: c[0], reverse=True)[:2]
+        # 점수 기준 정렬에서 화면 중앙(카메라 축) 근처 우선 정렬로 보정
+        bolt_candidates = sorted(
+            bolt_candidates, 
+            key=lambda c: np.hypot(c[1][0], c[1][1])
+        )[:2]
+
         points = [np.asarray(wp, dtype=float) for _, wp in bolt_candidates]
 
         prev_a = self._recent_bolt_a[-1][0] if self._recent_bolt_a else None
@@ -444,7 +475,6 @@ class PerceptionNode(Node):
         detection.bbox.center.position.y = wy
         detection.bbox.center.position.z = wz
         detection.bbox.center.orientation.w = 1.0
-        # 2D bbox 픽셀 크기를 그대로 xy 크기로 근사한 값일 뿐, 실제 3D extent가 아님.
         x0, y0, x1, y1 = det['bbox_px']
         detection.bbox.size.x = float(x1 - x0)
         detection.bbox.size.y = float(y1 - y0)

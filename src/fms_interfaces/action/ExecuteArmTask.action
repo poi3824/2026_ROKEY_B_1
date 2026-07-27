@@ -1,0 +1,8 @@
+string task_type
+---
+bool success
+string error_code
+string message
+---
+float32 progress_pct
+string sub_phase

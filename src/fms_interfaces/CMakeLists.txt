@@ -26,11 +26,9 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/StudPose.msg"
   "msg/BusbarGrasp.msg"
   "msg/NutPose.msg"
-  "srv/ArmControl.srv"
   "srv/GetGraspPose.srv"
   "srv/GetBoltPair.srv"
-  "action/BusbarInsert.action"
-  "action/NutFasten.action"
+  "action/ExecuteArmTask.action"
   DEPENDENCIES std_msgs geometry_msgs builtin_interfaces action_msgs
 )
 

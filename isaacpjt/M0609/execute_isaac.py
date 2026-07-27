@@ -1,9 +1,30 @@
+#!/usr/bin/env python3
+"""
+execute_isaac.py - Busbar Automation Sequence for Isaac Sim
+BehaviorNode (FSM) 및 ArmNode, Vision Correction Node 통신 연동 버전
+
+[동작 방식]
+0. INIT_POSE            : 관절값 [0, 90, 0, 0, 90, 0] 도 단위로 초기 위치 정렬
+1. SCAN_BATTERY         : 초기 위치 기준 Z=0.7m 스캔 위치로 이동
+2. SCAN_BUSBAR          : 상대 위치 이동 및 버스바 스캔
+3. PICK_BUSBAR          : Z=0.6m 상공 접근 -> Z=0.455m 파지 위치 하강 -> Kinematic 파지 및 상승
+4. MOVE_BATTERY_CENTER  : ArmNode에서 보낸 배터리 중점 좌표 상공(Z=0.7m)으로 이동
+5. FINE_ALIGNMENT       : 비전 노드의 START_ERRORFIX_CORRECTION 트리거 발송 후, 1픽셀 오차 보정 피드백에 맞춰 미세 정렬
+6. ASSEMBLE_BUSBAR      : 정렬된 XY 상태를 유지하며 수직 하강 안착, 버스바 고정 해제, 그리퍼 개방 및 상공 이탈
+7. SCAN_NUT1 / SCAN_NUT2   : 너트 스캔 위치(버스바 체결 위치 기준 상대 이동)로 이동
+8. PICK_NUT1 / PICK_NUT2   : 비전으로 검출된 너트 좌표로 접근, 물리 파지(Gripper Close) 및 상승
+9. ASSEMBLE_NUT1 / ASSEMBLE_NUT2 : 실시간 배터리 중심 좌표(target_mid_pos) 기준 사전 계산된
+   상대 오프셋을 적용해 산출한 볼트 목표 좌표로 이동, 착좌 및 Screwing 체결(Regrasp 포함)
+"""
+
 import os
 import sys
+import math
 import time
-import threading
+import numpy as np
 from pathlib import Path
 
+# 1. Isaac SimulationApp 초기화
 from isaacsim import SimulationApp
 
 _HEADLESS = os.environ.get("AMR_HEADLESS") == "1"
@@ -13,265 +34,202 @@ from omni.isaac.core.utils.extensions import enable_extension
 enable_extension("omni.isaac.ros2_bridge")
 simulation_app.update()
 
-import numpy as np
+sys.stdout.reconfigure(line_buffering=True)
+
+# 2. USD 및 Isaac Core Imports
 import omni.usd
-from pxr import Usd, UsdPhysics, UsdGeom, Gf
-
-import rclpy
-from rclpy.node import Node
-from geometry_msgs.msg import PoseStamped
-from std_msgs.msg import Bool, Int32, String
-
+from pxr import Usd, UsdGeom, UsdPhysics, Gf
 from isaacsim.core.api import World
+from isaacsim.core.prims import SingleXFormPrim
 from isaacsim.robot.manipulators.grippers import ParallelGripper
 from isaacsim.robot.manipulators.manipulators import SingleManipulator
 from isaacsim.core.utils.types import ArticulationAction
 
-_THIS_DIR = Path(__file__).resolve().parent
+# 3. ROS 2 Imports
+import rclpy
+from rclpy.node import Node
+from geometry_msgs.msg import PoseStamped
+from std_msgs.msg import String, Float32
 
-# RMPFlow 모듈 경로 등록
+# RMPFlow Controller 경로 설정
+_THIS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(_THIS_DIR / "rmpflow"))
 from m0609_rmpflow_controller import RMPFlowController
 
-# USD 및 URDF / RMPFlow 설정 파일 경로 (Collected_World_0123은 isaacpjt/M0609가 아니라
-# 저장소 루트의 src/ 밑에 있다)
-USD_PATH = str(_THIS_DIR.parent.parent / "src/Collected_World_0123/World0123.usd")
-URDF_PATH = str(_THIS_DIR / "doosan-robot2/urdf/m0609_isaac_sim.urdf")
-ROBOT_DESC_PATH = str(_THIS_DIR / "rmpflow/m0609_description.yaml")
-RMPFLOW_CFG_PATH = str(_THIS_DIR / "rmpflow/m0609_rmpflow_common.yaml")
+# ══════════════════════════════════════════════════════════════════════════
+#  [A] 설정 및 파라미터
+# ══════════════════════════════════════════════════════════════════════════
+USD_PATH = "/home/rokey/junhyeok_version/isaacpjt/M0609/Collected_Busbar/Busbar.usd"
 
 NOVA_CARTER_ROOT = "/World/Nova_Carter/chassis_link"
 M0609_PATH       = "/World/m0609"
-M0609_BASE_PATH  = "/World/m0609/base_link"
 EE_LINK_NAME     = "link_6"
 GRIPPER_JOINTS   = ["finger_joint", "right_inner_knuckle_joint"]
 
-# 그리퍼 위치 파라미터
-GRIPPER_OPEN  = np.array([0.0, 0.0])
-GRIPPER_CLOSE = np.array([0.96, 0.96])
-GRIPPER_DELTA = np.array([-0.5, -0.5])
+BUSBAR_ROOT_PATH      = "/World/busbar"
+BUSBAR_POLYSHAPE_PATH = "/World/busbar/geo/PolyShape"
 
-# ★ 너트 파지: 그리퍼 핑거 마찰만으로는 안정적으로 붙잡지 못해(8_bolt_nut_screw.py에서
-# 이미 검증된 문제) FixedJoint로 물리적으로 용접한다. arm_node의 NUT_GRASP에서 그리퍼를
-# 닫은 직후 결속(engage), FASTEN 재생 궤적이 그리퍼를 여는 프레임에서 해제(release)한다.
-# RigidBodyAPI/CollisionAPI는 nut1/nut2 자체가 아니라 geo/PolyShape 메시에 붙어 있다
-# (World0123.usd 실측 확인됨) -- FixedJoint body1은 반드시 실제 RigidBody 프림을 가리켜야 한다.
-NUT_PRIM_PATHS = {"nut1": "/World/nut1/geo/PolyShape", "nut2": "/World/nut2/geo/PolyShape"}
-# 너트별로 body0/body1을 "생성 시점에 고정"해둔 별도 조인트를 쓴다. 하나의 조인트를
-# 매번 engage_grasp()에서 body0Rel/body1Rel로 재타겟하면(이전 버전) PhysX가 Play 이후
-# 조인트 토폴로지 변경을 제대로 재쿠킹하지 못해 "disjointed body transforms" 경고와
-# 함께 팔이 튕겨나가는(snap) 현상이 재현됐다 -- body 타겟은 절대 런타임에 바꾸지 않고,
-# enabled 플래그와 로컬 오프셋(순수 attribute, 토폴로지 아님)만 매번 갱신한다
-# (8_bolt_nut_screw.py에서 검증된 패턴과 동일).
-GRASP_JOINT_PATHS = {
-    "nut1": "/World/_nut_grasp_joint_nut1",
-    "nut2": "/World/_nut_grasp_joint_nut2",
-}
+# 너트 Prim 경로 (신규 추가)
+NUT1_ROOT_PATH      = "/World/nut1"
+NUT2_ROOT_PATH      = "/World/nut2"
+NUT1_POLYSHAPE_PATH = "/World/nut1/geo/PolyShape"
+NUT2_POLYSHAPE_PATH = "/World/nut2/geo/PolyShape"
 
+# 그리퍼 파라미터
+GRIPPER_OPEN      = np.array([0.0, 0.0])
+GRIPPER_CLOSE     = np.array([0.8, 0.8])
+GRIPPER_CLOSE_NUT = np.array([0.96, 0.96])
+GRIPPER_DELTA     = np.array([-0.5, -0.5])
+GRIP_CLOSE_RAMP_STEPS = 50
 
-def _upright_quat(quat):
-    """더 이상 보정하지 않고 그대로 반환한다. World0123.usd의 nut1/nut2
-    geo/PolyShape 자체 orient를 고쳐서(2026-07-24) local Z가 이제 정말로 위를
-    향하므로, 여기서 identity를 강제하면 오히려 라이브 실제 자세(이제는 이미
-    올바름, 다만 identity와 정확히 같지는 않고 Z축 기준 180도 yaw 차이가 있을 수
-    있음)와 어긋나는 새 mismatch를 만들어 FixedJoint가 "disjointed"로 판단해
-    다시 스냅(180도 튐)을 일으킨다 -- 실측으로 확인됨. 씬이 이미 정정됐으니
-    engage_grasp()는 라이브 자세를 그대로 믿는다(8_bolt_nut_screw.py의 원래
-    방식과 동일)."""
-    return quat
+# Kinematic Pose-Glue 파라미터
+EE_OFFSET = np.array([0.0, 0.0, 0.185])
+BUSBAR_HEIGHT = 0.003
+BUSBAR_GRASP_Z_LOCAL = BUSBAR_HEIGHT + 0.02
+BUSBAR_REST_ORIENTATION = np.array([0.5, -0.5, 0.5, 0.5])
 
+# 기본 좌표 및 높이 정의
+TARGET_INIT_JOINTS   = np.array([0.0, 0.0, np.radians(90.0), 0.0, np.radians(90.0), 0.0])
 
-def make_grasp_joints(stage, ee_path):
-    for nut_id, joint_path in GRASP_JOINT_PATHS.items():
-        j = UsdPhysics.FixedJoint.Define(stage, joint_path)
-        j.CreateBody0Rel().SetTargets([ee_path])
-        j.CreateBody1Rel().SetTargets([NUT_PRIM_PATHS[nut_id]])
-        j.CreateJointEnabledAttr(False)
+_POS_GRAB_PICK       = 0.455
+SCAN_APPROACH_Z      = 0.7     # 배터리 스캔 고도
+BUSBAR_SCAN_Z        = 0.7     # 버스바 스캔 고도
+BUSBAR_APPROACH_Z    = 0.60   # 버스바 파지 접근 고도 (Z = 0.6m)
+BATTERY_CENTER_Z     = 0.40   # 배터리 중점 이동 고도 (Z = 0.7m)
 
+# 버스바 체결 및 하강 제어 파라미터
+INSERT_SPEED            = 0.0005   # Step당 수직 하강 거리
+BUSBAR_RELEASE_Z        = 0.37     # 그리퍼 해제 및 체결 완료 임계 Z 높이
+INSERT_TOLERANCE_STRICT = 0.001    # Insert 단계 오차 허용범위 (1mm)
 
-def engage_grasp(stage, ee_path, nut_id):
-    """ee_path(그리퍼)-nut_id(너트)의 현재 상대 자세를 그대로 고정해 결속을 활성화한다."""
-    joint_path = GRASP_JOINT_PATHS.get(nut_id)
-    if joint_path is None:
-        return False
+# ══════════════════════════════════════════════════════════════════════════
+#  너트 조립(Nut Assembly) 파라미터 (신규 추가)
+# ══════════════════════════════════════════════════════════════════════════
+# 너트 스캔 위치: 버스바 체결 완료 시점의 EE 위치 기준 상대 이동 (X, Y) + 고정 고도 (Z)
+NUT_SCAN_OFFSET_X = -0.5
+NUT_SCAN_OFFSET_Y = -0.3
+NUT_SCAN_Z        = 0.9
 
-    b0_xf = get_world_transform(stage, ee_path)
-    b1_xf = get_world_transform(stage, NUT_PRIM_PATHS[nut_id])
-    b0_pos, b0_quat = b0_xf.ExtractTranslation(), b0_xf.ExtractRotationQuat()
-    b1_pos, b1_quat_raw = b1_xf.ExtractTranslation(), b1_xf.ExtractRotationQuat()
-    b1_quat = _upright_quat(b1_quat_raw)
+NUT_HEIGHT         = 0.0095
+NUT_GRASP_Z_LOCAL  = NUT_HEIGHT + 0.023
+NUT_SUPPLY_TABLE_Z = 0.72                                   # 너트 공급대 높이
+NUT_PICK_Z         = NUT_SUPPLY_TABLE_Z - (NUT_GRASP_Z_LOCAL - 0.0395)
+NUT_APPROACH_Z     = 0.8                                     # 너트 파지 상공 고도
+BOLT_APPROACH_Z    = 0.6                                     # 볼트 체결 상공 고도
 
-    # 진단용: 보정 로직이 실제로 그 순간 라이브 자세에 대해 뭘 하고 있는지 확인.
-    import math
-    raw_z = Gf.Rotation(b1_quat_raw).TransformDir(Gf.Vec3d(0.0, 0.0, 1.0))
-    fixed_z = Gf.Rotation(b1_quat).TransformDir(Gf.Vec3d(0.0, 0.0, 1.0))
-    raw_tilt = math.degrees(math.acos(max(-1.0, min(1.0, raw_z[2]))))
-    fixed_tilt = math.degrees(math.acos(max(-1.0, min(1.0, fixed_z[2]))))
-    print(
-        f"[GRASP] {nut_id} 결속 시점 raw local_z={tuple(round(v,3) for v in raw_z)} "
-        f"tilt={raw_tilt:.1f}deg -> 보정후 local_z={tuple(round(v,3) for v in fixed_z)} "
-        f"tilt={fixed_tilt:.1f}deg  |  raw_quat_wxyz={tuple(round(v,4) for v in (b1_quat_raw.GetReal(), *b1_quat_raw.GetImaginary()))}"
-    )
+# ★ 볼트 1/2번 참고 좌표 (절대좌표로 직접 이동에 사용 금지!) ★
+# 아래 두 좌표는 버스바 체결 시 사용되는 기준 배터리 중심 좌표(_REF_BATTERY_CENTER_POS) 대비
+# 상대 오프셋(Offset)을 미리 계산해 두기 위한 참고값일 뿐이며, 실제 체결 시에는
+# 실시간 배터리 중심 좌표(target_mid_pos)에 이 오프셋을 더해 동적으로 목표 좌표를 산출한다.
+BOLT1_OFFSET_FROM_CENTER = np.array([-0.1042, 0.1812, 0.0])
+BOLT2_OFFSET_FROM_CENTER = np.array([0.1042, -0.1812, 0.0])
 
-    m0 = Gf.Matrix4d(); m0.SetRotateOnly(b0_quat); m0.SetTranslateOnly(b0_pos)
-    m1 = Gf.Matrix4d(); m1.SetRotateOnly(b1_quat); m1.SetTranslateOnly(b1_pos)
-    rel = m1 * m0.GetInverse()
-    t = rel.ExtractTranslation()
-    r = rel.ExtractRotationQuat()
+# 너트 체결(Screwing) 파라미터
+ENGAGE_LEN           = 0.0125     # 체결 깊이 (12.5mm)
+SCREW_TURNS_DEG      = 350.0      # 1회전당 350도
+REGRASP_CYCLES       = 1          # 총 2회전 (Regrasp 1회)
+SCREW_OMEGA_DEG_S    = 120.0      # 초당 120도 회전
+REGRASP_LIFT_HEIGHT  = 0.05       # Regrasp 시 수직 상승 높이 (5cm)
+REGRASP_Z_OFFSET     = 0.005      # Regrasp 하강/재파지 시 높이 보정
 
-    j = UsdPhysics.FixedJoint.Get(stage, joint_path)
-    j.CreateLocalPos0Attr(Gf.Vec3f(float(t[0]), float(t[1]), float(t[2])))
-    j.CreateLocalRot0Attr(Gf.Quatf(float(r.GetReal()), *[float(x) for x in r.GetImaginary()]))
-    j.CreateLocalPos1Attr(Gf.Vec3f(0.0, 0.0, 0.0))
-    j.CreateLocalRot1Attr(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
-    j.GetJointEnabledAttr().Set(True)
-    return True
+TOTAL_REV   = (SCREW_TURNS_DEG / 360.0) * (1 + REGRASP_CYCLES)
+NUT_PITCH_M = ENGAGE_LEN / TOTAL_REV
 
+TORQUE_THRESHOLD     = 45.0       # 6번 조인트 반력 임계값 (Nm)
+STUCK_Z_DELTA_THRESH = 0.0001     # Z축 하강 멈춤 판정 기준 (0.1mm)
+STUCK_STEP_LIMIT     = 12         # Z축 변화 없이 토크 지속되는 Step 수
+TCP_FORCE_CHECK_Z    = 0.378      # TCP(EE) 높이가 이 값 이하일 때만 힘/토크 감지 활성화
 
-def release_grasp(stage):
-    for joint_path in GRASP_JOINT_PATHS.values():
-        j = UsdPhysics.FixedJoint.Get(stage, joint_path)
-        if j:
-            j.GetJointEnabledAttr().Set(False)
+# 위치 저장용 변수
+HOME_EE_POS          = None
+SCAN_POS             = None
+BUSBAR_SCAN_POS      = None
+BATTERY_CENTER_POS   = None
+target_fine_pos      = None
 
+PICK_TOLERANCE_STRICT    = 0.01     # 10mm
+JOINT_TOLERANCE          = 0.02     # 관절 오차 허용범위 (rad)
+PICK_TOLERANCE_LOOSE_VAL = 0.015
+MAX_STUCK_STEPS          = 1800      # Phase 타임아웃 기준
+PHYSICS_DT               = 1.0 / 60.0
 
-class IsaacRmpflowNode(Node):
-    """목표 Pose 수신, 그리퍼 명령 수신 및 현재 엔드이펙터 Pose 피드백 퍼블리시 노드"""
+URDF_PATH        = str(_THIS_DIR / "doosan-robot2/urdf/m0609_isaac_sim.urdf")
+ROBOT_DESC_PATH  = str(_THIS_DIR / "rmpflow/m0609_description.yaml")
+RMPFLOW_CFG_PATH = str(_THIS_DIR / "rmpflow/m0609_rmpflow_common.yaml")
 
+# ══════════════════════════════════════════════════════════════════════════
+#  [B] 비전 브릿지 및 유틸리티 함수
+# ══════════════════════════════════════════════════════════════════════════
+class Execute_Isaac_Busar(Node):
+    """ArmNode / BehaviorNode / VisionNode 통신 브릿지"""
     def __init__(self):
-        super().__init__('isaac_rmpflow_node')
-        
-        self.target_position = None
-        self.target_orientation = None
-        self.latest_gripper_cmd = 0  # 초기 상태: 0 (열림)
-        # arm_node의 nut_fasten(/arm/joint_command 직접 관절 재생)이 팔을 쥐고 있는 동안은
-        # False로 내려와 RMPFlow가 마지막 target_pose를 계속 재적용해 충돌하는 것을 막는다.
-        self.rmpflow_enabled = True
+        super().__init__("execute_isaac_busar")
+        self.latest_target_pose = None
+        self.requested_task = None
+        self.alignment_success = False
 
-        # 1. 목표 Pose 서브스크라이버
-        self.subscription = self.create_subscription(
-            PoseStamped,
-            '/arm/target_pose',
-            self.target_pose_callback,
-            10
+        self.sub_target_pose = self.create_subscription(
+            PoseStamped, '/target_pose', self._on_target_pose, 10
+        )
+        self.sub_task_cmd = self.create_subscription(
+            String, '/task_command', self._on_task_command, 10
         )
 
-        # 2. 그리퍼 명령 서브스크라이버 (0: 열림, 1: 닫힘)
-        self.gripper_sub = self.create_subscription(
-            Int32,
-            '/arm/gripper_command',
-            self.gripper_command_callback,
-            10
-        )
+        self.pub_phase = self.create_publisher(String, '/isaac_phase', 10)
+        self.pub_progress = self.create_publisher(Float32, '/isaac_progress', 10)
+        self.pub_status = self.create_publisher(String, '/isaac_status', 10)
+        self.pub_errorfix_command = self.create_publisher(String, '/errorfix_command', 10)
 
-        # 3. RMPFlow 활성/비활성 서브스크라이버
-        self.rmpflow_enable_sub = self.create_subscription(
-            Bool,
-            '/arm/rmpflow_enable',
-            self.rmpflow_enable_callback,
-            10
-        )
+    def _on_target_pose(self, msg: PoseStamped):
+        self.latest_target_pose = msg
 
-        # 4. 너트 결속(FixedJoint) 요청 서브스크라이버. data=nut_id 결속, data=""(빈 문자열) 해제.
-        # None="대기 중인 요청 없음" 센티널이라 매 프레임 재적용하지 않고 딱 한 번만 처리한다.
-        self.nut_grasp_request = None
-        self.nut_grasp_attach_sub = self.create_subscription(
-            String,
-            '/arm/nut_grasp_attach',
-            self.nut_grasp_attach_callback,
-            10
-        )
-
-        # 3. 현재 Pose 퍼블리셔 (Feedback 전용)
-        self.current_pose_pub = self.create_publisher(
-            PoseStamped,
-            '/arm/current_pose',
-            10
-        )
-        
-        self.get_logger().info("Isaac Sim RMPFlow Node 준비 완료")
-
-    def target_pose_callback(self, msg: PoseStamped):
-        self.target_position = np.array([
-            msg.pose.position.x,
-            msg.pose.position.y,
-            msg.pose.position.z,
-        ])
-        # RMPFlowController Quaternion 순서: [w, x, y, z]
-        self.target_orientation = np.array([
-            msg.pose.orientation.w,
-            msg.pose.orientation.x,
-            msg.pose.orientation.y,
-            msg.pose.orientation.z,
-        ])
-
-    def gripper_command_callback(self, msg: Int32):
-        """0: 열림(Open), 1: 닫힘(Close) 수신"""
-        self.latest_gripper_cmd = msg.data
-
-    def rmpflow_enable_callback(self, msg: Bool):
-        self.rmpflow_enabled = msg.data
-
-    def nut_grasp_attach_callback(self, msg: String):
-        self.nut_grasp_request = msg.data
-
-    def publish_current_ee_pose(self, stage, ee_prim_path):
-        """현재 link_6의 World Pose를 ROS 2 토픽으로 퍼블리시"""
-        if not ee_prim_path:
-            return
-
-        prim = stage.GetPrimAtPath(ee_prim_path)
-        if not prim.IsValid():
-            return
-
-        ee_xf = UsdGeom.Xformable(prim).ComputeLocalToWorldTransform(0)
-        pos = ee_xf.ExtractTranslation()
-        quat = ee_xf.ExtractRotationQuat()
-
-        msg = PoseStamped()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.header.frame_id = "world"
-        
-        msg.pose.position.x = float(pos[0])
-        msg.pose.position.y = float(pos[1])
-        msg.pose.position.z = float(pos[2])
-        
-        msg.pose.orientation.w = float(quat.GetReal())
-        msg.pose.orientation.x = float(quat.GetImaginary()[0])
-        msg.pose.orientation.y = float(quat.GetImaginary()[1])
-        msg.pose.orientation.z = float(quat.GetImaginary()[2])
-
-        self.current_pose_pub.publish(msg)
+    def _on_task_command(self, msg: String):
+        self.get_logger().info(f"[Task Command 수신]: {msg.data}")
+        if msg.data == "ALIGNMENT_SUCCESS":
+            self.alignment_success = True
+        else:
+            self.requested_task = msg.data
 
 
-def set_all_drives(stage, root_path, stiffness=1.0e8, damping=1.0e4, max_force=1.0e8):
-    for prim in Usd.PrimRange(stage.GetPrimAtPath(root_path)):
-        for dt in ("angular", "linear"):
-            drive = UsdPhysics.DriveAPI.Get(prim, dt)
-            if drive:
-                drive.GetStiffnessAttr().Set(stiffness)
-                drive.GetDampingAttr().Set(damping)
-                drive.GetMaxForceAttr().Set(max_force)
+def euler_to_quaternion_wxyz(roll, pitch, yaw):
+    cy, sy = np.cos(yaw * 0.5), np.sin(yaw * 0.5)
+    cp, sp = np.cos(pitch * 0.5), np.sin(pitch * 0.5)
+    cr, sr = np.cos(roll * 0.5), np.sin(roll * 0.5)
+
+    w = cr * cp * cy + sr * sp * sy
+    x = sr * cp * cy - cr * sp * sy
+    y = cr * sp * cy + sr * sp * sy
+    z = cr * cp * sy - sr * sp * cy
+    return np.array([w, x, y, z])
 
 
-def lock_amr_base(stage, amr_root_path):
-    """★ [핵심 해결 1] AMR 차체 및 바퀴 관절을 완전 잠금(Break Lock)하여 미끄러짐/기울어짐 방지"""
-    amr_prim = stage.GetPrimAtPath(amr_root_path).GetParent()
-    if not amr_prim.IsValid():
-        amr_prim = stage.GetPrimAtPath(amr_root_path)
+def disable_physics_recursively(stage, prim_path):
+    root_prim = stage.GetPrimAtPath(prim_path)
+    if not root_prim.IsValid():
+        return
+    for prim in Usd.PrimRange(root_prim):
+        if prim.HasAPI(UsdPhysics.CollisionAPI):
+            UsdPhysics.CollisionAPI(prim).GetCollisionEnabledAttr().Set(False)
+        if prim.HasAPI(UsdPhysics.RigidBodyAPI):
+            UsdPhysics.RigidBodyAPI(prim).GetRigidBodyEnabledAttr().Set(False)
 
-    locked_count = 0
-    for prim in Usd.PrimRange(amr_prim):
-        for dt in ("angular", "linear"):
-            drive = UsdPhysics.DriveAPI.Get(prim, dt)
-            if drive:
-                drive.GetStiffnessAttr().Set(1.0e9)
-                drive.GetDampingAttr().Set(1.0e6)
-                drive.GetMaxForceAttr().Set(1.0e9)
-                if drive.GetTargetVelocityAttr():
-                    drive.GetTargetVelocityAttr().Set(0.0)
-                locked_count += 1
-    print(f"AMR 베이스 및 바퀴 관절 드라이브 잠금 완료 (잠긴 Drive 수: {locked_count})")
+
+def enable_physics_recursively(stage, prim_path):
+    root_prim = stage.GetPrimAtPath(prim_path)
+    if not root_prim.IsValid():
+        return
+    for prim in Usd.PrimRange(root_prim):
+        if prim.HasAPI(UsdPhysics.CollisionAPI):
+            UsdPhysics.CollisionAPI(prim).GetCollisionEnabledAttr().Set(True)
+        if prim.HasAPI(UsdPhysics.RigidBodyAPI):
+            UsdPhysics.RigidBodyAPI(prim).GetRigidBodyEnabledAttr().Set(True)
+
+
+def world_xf(stage, path):
+    prim = stage.GetPrimAtPath(path)
+    if not prim.IsValid():
+        raise RuntimeError(f"Prim 경로가 올바르지 않습니다: {path}")
+    return UsdGeom.Xformable(prim).ComputeLocalToWorldTransform(0)
 
 
 def find_prim_path(stage, root_path, name):
@@ -282,39 +240,118 @@ def find_prim_path(stage, root_path, name):
     return None
 
 
-def get_world_transform(stage, path):
-    prim = stage.GetPrimAtPath(path)
-    return UsdGeom.Xformable(prim).ComputeLocalToWorldTransform(0)
+def lock_amr_base(stage, amr_root_path):
+    amr_prim = stage.GetPrimAtPath(amr_root_path).GetParent()
+    if not amr_prim.IsValid():
+        amr_prim = stage.GetPrimAtPath(amr_root_path)
+
+    for prim in Usd.PrimRange(amr_prim):
+        for dt in ("angular", "linear"):
+            drive = UsdPhysics.DriveAPI.Get(prim, dt)
+            if drive:
+                drive.GetStiffnessAttr().Set(1.0e9)
+                drive.GetDampingAttr().Set(1.0e6)
+                drive.GetMaxForceAttr().Set(1.0e9)
+                if drive.GetTargetVelocityAttr():
+                    drive.GetTargetVelocityAttr().Set(0.0)
 
 
+def glue_busbar_to_ee(robot, busbar_xform, rest_pick_pos, blend):
+    if busbar_xform is None or rest_pick_pos is None:
+        return
+    ee_pos, ee_quat = robot.end_effector.get_world_pose()
+    grasp_point_pos = np.asarray(ee_pos) - EE_OFFSET
+    target_pos = grasp_point_pos - np.array([0.0, 0.0, BUSBAR_GRASP_Z_LOCAL])
+
+    busbar_pos = rest_pick_pos + blend * (target_pos - rest_pick_pos)
+    busbar_xform.set_world_pose(position=busbar_pos, orientation=np.asarray(ee_quat))
+
+
+def yaw_rotated_quat(base_wxyz, delta_deg):
+    """base_wxyz 오리엔테이션을 월드 Z축 기준으로 delta_deg 만큼 추가 회전시킨 쿼터니언 반환 (Screwing 회전용)"""
+    base_q = Gf.Quatd(float(base_wxyz[0]), Gf.Vec3d(float(base_wxyz[1]), float(base_wxyz[2]), float(base_wxyz[3])))
+    base_rot = Gf.Rotation(base_q)
+    extra_rot = Gf.Rotation(Gf.Vec3d(0.0, 0.0, 1.0), float(delta_deg))
+    combined = extra_rot * base_rot
+    q = combined.GetQuat()
+    return np.array([q.GetReal(), *q.GetImaginary()])
+
+
+def resolve_nut_assets(nut_index, nut1_xform, nut2_xform):
+    """nut_index(1 또는 2)에 따라 대상 너트 Xform과 라벨을 반환 (Nut1/Nut2 공용 로직 재사용용)"""
+    if nut_index == 1:
+        return nut1_xform, "너트 1번"
+    return nut2_xform, "너트 2번"
+
+
+def compute_bolt_target_pos(nut_index, battery_center_pos):
+    """사전 계산된 배터리 중심 기준 오프셋을 실시간 배터리 중심 좌표(Anchor)에 적용하여
+    볼트 1/2번 체결 목표 3D 월드 좌표를 동적으로 산출한다 (절대좌표 하드코딩 금지)."""
+    offset = BOLT1_OFFSET_FROM_CENTER if nut_index == 1 else BOLT2_OFFSET_FROM_CENTER
+    return np.asarray(battery_center_pos) + offset
+
+
+def update_target_positions(target_pose_msg: PoseStamped):
+    global BUSBAR_APPROACH_POS, BUSBAR_PICK_POS, BUSBAR_LIFT_MOVE_POS
+
+    pos = target_pose_msg.pose.position
+    
+    # 1) 실제 파지 좌표 (Z = 0.455m)
+    pick_z = _POS_GRAB_PICK
+    new_pick = np.array([pos.x, pos.y, pick_z])
+    BUSBAR_PICK_POS = new_pick
+
+    # 2) 상공 접근 좌표 (Z = 0.600m 고정)
+    BUSBAR_APPROACH_POS = np.array([pos.x, pos.y, BUSBAR_APPROACH_Z])
+
+    # 3) 상승 이동 좌표 (Z = 0.600m 고정)
+    BUSBAR_LIFT_MOVE_POS = np.array([pos.x, pos.y + 0.1, BUSBAR_APPROACH_Z])
+
+    print(f"[Dynamic Target Set] Approach Pos (Z={BUSBAR_APPROACH_Z:.2f}m): ({BUSBAR_APPROACH_POS[0]:.4f}, {BUSBAR_APPROACH_POS[1]:.4f}, {BUSBAR_APPROACH_POS[2]:.4f})")
+    print(f"[Dynamic Target Set] Pick Pos     (Z={BUSBAR_PICK_POS[2]:.4f}m): ({BUSBAR_PICK_POS[0]:.4f}, {BUSBAR_PICK_POS[1]:.4f}, {BUSBAR_PICK_POS[2]:.4f})")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  [C] 메인 파이프라인
+# ══════════════════════════════════════════════════════════════════════════
 def main():
-    rclpy.init()
+    global BUSBAR_APPROACH_POS, BUSBAR_PICK_POS, BUSBAR_LIFT_MOVE_POS, SCAN_POS, HOME_EE_POS, BUSBAR_SCAN_POS, BATTERY_CENTER_POS, target_fine_pos
+
+    usd_file_path = Path(USD_PATH).resolve()
+    if not usd_file_path.is_file():
+        raise FileNotFoundError(f"[ERROR] USD 파일을 찾을 수 없습니다: {usd_file_path}")
 
     ctx = omni.usd.get_context()
-    ctx.open_stage(USD_PATH)
+    ctx.open_stage(str(usd_file_path))
     for _ in range(15):
         simulation_app.update()
 
     stage = ctx.get_stage()
-    world = World(stage_units_in_meters=1.0)
+    if not stage:
+        raise RuntimeError(f"[ERROR] Stage를 로드하지 못했습니다: {usd_file_path}")
 
-    # ★ AMR 차체 및 바퀴 고정 적용
+    world = World(stage_units_in_meters=1.0, physics_dt=PHYSICS_DT)
     lock_amr_base(stage, NOVA_CARTER_ROOT)
 
-    # 로봇팔 관절 Physics Drive 적용
-    set_all_drives(stage, M0609_PATH)
+    busbar_xform = SingleXFormPrim(BUSBAR_POLYSHAPE_PATH, name="busbar_poly") if stage.GetPrimAtPath(BUSBAR_POLYSHAPE_PATH).IsValid() else None
+    init_busbar_pos, init_busbar_quat = busbar_xform.get_world_pose() if busbar_xform else (None, None)
+
+    nut1_xform = SingleXFormPrim(NUT1_POLYSHAPE_PATH, name="nut1_poly") if stage.GetPrimAtPath(NUT1_POLYSHAPE_PATH).IsValid() else None
+    nut2_xform = SingleXFormPrim(NUT2_POLYSHAPE_PATH, name="nut2_poly") if stage.GetPrimAtPath(NUT2_POLYSHAPE_PATH).IsValid() else None
+    init_nut1_pos, init_nut1_quat = nut1_xform.get_world_pose() if nut1_xform else (None, None)
+    init_nut2_pos, init_nut2_quat = nut2_xform.get_world_pose() if nut2_xform else (None, None)
+
     ee_path = find_prim_path(stage, M0609_PATH, EE_LINK_NAME)
-
     gripper = ParallelGripper(
-        end_effector_prim_path=ee_path,
-        joint_prim_names=GRIPPER_JOINTS,
-        joint_opened_positions=GRIPPER_OPEN,
-        joint_closed_positions=GRIPPER_CLOSE,
-        action_deltas=GRIPPER_DELTA,
-    )
-
+            end_effector_prim_path=ee_path,
+            joint_prim_names=GRIPPER_JOINTS,
+            joint_opened_positions=GRIPPER_OPEN,
+            joint_closed_positions=GRIPPER_CLOSE,
+            action_deltas=GRIPPER_DELTA,
+        )
+    
     robot = world.scene.add(SingleManipulator(
-        prim_path=NOVA_CARTER_ROOT,
+        prim_path=NOVA_CARTER_ROOT, 
         name="mobile_manipulator",
         end_effector_prim_path=ee_path,
         gripper=gripper,
@@ -330,112 +367,823 @@ def main():
         dof_names=robot.dof_names,
     )
 
-    make_grasp_joints(stage, ee_path)
+    for _ in range(30):
+        world.step(render=True)
 
-    # RMPFlow Controller 생성
+    quat_busbar = euler_to_quaternion_wxyz(0.0, 3.1415, 1.5708)
+    quat_nut = euler_to_quaternion_wxyz(0.0, 3.1415, 0.0)
+
+    rclpy.init()
+    isaac_node = Execute_Isaac_Busar()
+
     arm_controller = RMPFlowController(
-        name="m0609_external_pose_controller",
+        name="m0609_busbar_controller",
         robot_articulation=robot,
         urdf_path=URDF_PATH,
         robot_description_path=ROBOT_DESC_PATH,
         rmpflow_config_path=RMPFLOW_CFG_PATH,
-        end_effector_frame_name="link_6",
+        end_effector_frame_name=EE_LINK_NAME,
     )
 
-    # ROS 2 스핀 스레드 실행
-    sub_node = IsaacRmpflowNode()
-    executor = rclpy.executors.SingleThreadedExecutor()
-    executor.add_node(sub_node)
-    ros_thread = threading.Thread(target=executor.spin, daemon=True)
-    ros_thread.start()
+    base_link_xf = world_xf(stage, f"{M0609_PATH}/base_link")
+    base_pos = base_link_xf.ExtractTranslation()
+    base_quat = base_link_xf.ExtractRotationQuat()
+    arm_controller._motion_policy.set_robot_base_pose(
+        robot_position=np.array([base_pos[0], base_pos[1], base_pos[2]]),
+        robot_orientation=np.array([base_quat.GetReal(), *[float(x) for x in base_quat.GetImaginary()]]),
+    )
 
-    print("\n[Isaac Sim] RMPFlow 실행 준비 완료. Play 버튼을 눌러 동작을 시작하세요.")
+    print("\nIsaac Sim 준비 완료 - BehaviorNode 명령을 대기합니다.")
 
-    # Simulation Loop
+    step_count = 0
+    grasp_timer = 0
     was_playing = False
+    phase = "IDLE"
+    busbar_start_grasp_pos = None
+    descend_target_z = None
+    target_mid_pos = None
+
+    # ── 너트 조립(Nut Assembly) 상태 변수 (신규 추가) ──
+    nut_index      = 0        # 1: 너트 1번, 2: 너트 2번 (NUT_*/MOVE_TO_BOLT_NUT 공용 Phase에서 참조)
+    NUT_SCAN_POS   = None      # 너트 스캔 위치 (최초 1회 계산 후 재사용)
+    nut_pick_pos   = None      # 비전으로 산출된 현재 너트의 물리 파지 좌표
+    nut_approach_pos = None    # 현재 너트 파지 상공 접근 좌표
+    bolt_target_pos  = None    # compute_bolt_target_pos()로 동적 산출된 체결 목표 좌표
+    bolt_touch_pos   = None    # 착좌(Screwing 시작) 목표 좌표
+
+    screw_sub          = "rotate"
+    screw_pass_idx      = 0
+    screw_pass_theta    = 0.0
+    screw_seat_ee_pos   = None
+    screw_start_quat    = None
+    screw_pass_end_pos  = None
+    screw_release_step  = 0
+    screw_regrasp_step  = 0
+    screw_unwind_deg    = 0.0
+    prev_ee_z           = 0.0
+    stuck_counter       = 0
+
+    def publish_status(status_str: str):
+        msg = String()
+        msg.data = status_str
+        isaac_node.pub_status.publish(msg)
+
+    def publish_progress(phase_name: str, pct: float):
+        p_msg = String()
+        p_msg.data = phase_name
+        isaac_node.pub_phase.publish(p_msg)
+
+        prog_msg = Float32()
+        prog_msg.data = pct
+        isaac_node.pub_progress.publish(prog_msg)
+
     while simulation_app.is_running():
         world.step(render=True)
-
+        rclpy.spin_once(isaac_node, timeout_sec=0.0)
         playing = world.is_playing()
 
+        # 1. Play / Stop 상태 보정
         if playing and not was_playing:
-            # ★ Stop 후 다시 Play를 누른 시점. Stop을 누르면 물리 상태(로봇
-            # 관절 등)는 USD 초기 자세로 리셋되지만, RMPFlow 컨트롤러 내부
-            # 상태와 ROS2 쪽에 남아있는 마지막 target_pose는 리셋되지 않는다.
-            # 이 상태에서 곧바로 arm_controller.forward()가 그 오래된(멀리
-            # 떨어진) 목표를 계속 쓰면, 이제 막 초기 자세로 리셋된 로봇이
-            # 한 프레임 만에 그 큰 오차를 따라잡으려다 튕겨나간다.
-            # -> world/robot을 다시 초기화하고, RMPFlow도 리셋하고, 마지막
-            #    target을 지워서 새 명령이 올 때까지 움직이지 않게 한다.
             world.reset()
-            robot.initialize()
-            robot.gripper.initialize(
-                physics_sim_view=world.physics_sim_view,
-                articulation_apply_action_func=robot.apply_action,
-                get_joint_positions_func=robot.get_joint_positions,
-                set_joint_positions_func=robot.set_joint_positions,
-                dof_names=robot.dof_names,
-            )
-            arm_controller.reset()
-            sub_node.target_position = None
-            sub_node.target_orientation = None
-            release_grasp(stage)
-            sub_node.nut_grasp_request = None
-            print("재시작 감지 -> world/robot/RMPFlow 재초기화, 이전 목표 좌표/너트 결속 초기화")
+            enable_physics_recursively(stage, BUSBAR_ROOT_PATH)
+            enable_physics_recursively(stage, NUT1_ROOT_PATH)
+            enable_physics_recursively(stage, NUT2_ROOT_PATH)
+            if busbar_xform and init_busbar_pos is not None:
+                busbar_xform.set_world_pose(position=init_busbar_pos, orientation=init_busbar_quat)
+            if nut1_xform and init_nut1_pos is not None:
+                nut1_xform.set_world_pose(position=init_nut1_pos, orientation=init_nut1_quat)
+            if nut2_xform and init_nut2_pos is not None:
+                nut2_xform.set_world_pose(position=init_nut2_pos, orientation=init_nut2_quat)
+
+            step_count = 0
+            grasp_timer = 0
+
+            nut_index = 0
+            NUT_SCAN_POS = None
+            nut_pick_pos = None
+            nut_approach_pos = None
+            bolt_target_pos = None
+            bolt_touch_pos = None
+            screw_sub = "rotate"
+            screw_pass_idx = 0
+            screw_pass_theta = 0.0
+            stuck_counter = 0
+
+        # 2. BehaviorNode / ArmNode 명령 분기 처리
+        if playing and isaac_node.requested_task:
+            task = isaac_node.requested_task
+            isaac_node.requested_task = None
+
+            if task == "SCAN_BATTERY":
+                phase = "INIT_POSE"
+                step_count = 0
+                print(f"\n>>> [{task}] 배터리 스캔 요청 수신 -> 1) 초기 관절 정렬 시작")
+
+            elif task == "SCAN_BUSBAR":
+                cur_pos = world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation()
+                BUSBAR_SCAN_POS = np.array([cur_pos[0] - 0.5, cur_pos[1] + 0.5, BUSBAR_SCAN_Z])
+                phase = "SCAN_BUSBAR_APPROACH"
+                step_count = 0
+                print(f"\n>>> [{task}] 버스바 스캔 위치 이동 시작 (Target: X={BUSBAR_SCAN_POS[0]:.3f}, Y={BUSBAR_SCAN_POS[1]:.3f}, Z={BUSBAR_SCAN_POS[2]:.3f})")
+
+            elif task == "PICK_BUSBAR":
+                if isaac_node.latest_target_pose is not None:
+                    update_target_positions(isaac_node.latest_target_pose)
+                phase = "BUSBAR_APPROACH"
+                step_count = 0
+                print(f"\n>>> [{task}] 버스바 상공 접근(Z=0.6m) 시작")
+
+            elif task == "MOVE_BATTERY_CENTER":
+                if isaac_node.latest_target_pose is not None:
+                    pos = isaac_node.latest_target_pose.pose.position
+                    BATTERY_CENTER_POS = np.array([pos.x, pos.y, BATTERY_CENTER_Z])
+                    phase = "MOVE_BATTERY_CENTER_APPROACH"
+                    step_count = 0
+                    print(f"\n>>> [{task}] 배터리 볼트 중점 상공 이동 시작 (Target: X={BATTERY_CENTER_POS[0]:.3f}, Y={BATTERY_CENTER_POS[1]:.3f}, Z={BATTERY_CENTER_POS[2]:.3f})")
+                else:
+                    print(f"\n[ERROR] [{task}] 수신된 Target Pose가 없습니다.")
+                    publish_status("FAILURE:NO_TARGET_POSE")
+
+            elif task == "FINE_ALIGNMENT":
+                print("\n>>> [{task}] 비전 정밀 오차 보정 시작")
+                print(" -> 🚀 오차 보정 비전 노드에 시작 트리거 전송 [START_ERRORFIX_CORRECTION]")
+                
+                start_cmd = String()
+                start_cmd.data = "START_ERRORFIX_CORRECTION"
+                isaac_node.pub_errorfix_command.publish(start_cmd)
+
+                isaac_node.alignment_success = False
+                
+                # FINE_ALIGNMENT 진입 시 실시간 EE 위치 기준으로 Target 초기화
+                cur_ee = world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation()
+                target_fine_pos = np.array([cur_ee[0], cur_ee[1], BATTERY_CENTER_Z])
+                phase = "FINE_ALIGNMENT"
+                step_count = 0
+
+            elif task == "ASSEMBLE_BUSBAR":
+                cur_ee = world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation()
+                if target_fine_pos is not None:
+                    target_mid_pos = np.array([target_fine_pos[0], target_fine_pos[1], 0.0693])
+                else:
+                    target_mid_pos = np.array([cur_ee[0], cur_ee[1], 0.0693])
+
+                descend_target_z = cur_ee[2]
+                phase = "BUSBAR_DESCEND_TO_BOLT"
+                step_count = 0
+                print(f"\n>>> [{task}] 버스바 수직 하강 안착 시작 (Target Mid Pos: X={target_mid_pos[0]:.4f}, Y={target_mid_pos[1]:.4f})")
+
+            # ── [신규] 너트 1/2번 스캔 -> 파지 -> 체결 (Nut Assembly) ──
+            elif task in ("SCAN_NUT1", "SCAN_NUT2"):
+                nut_index = 1 if task == "SCAN_NUT1" else 2
+                if NUT_SCAN_POS is None:
+                    cur_ee = world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation()
+                    NUT_SCAN_POS = np.array([cur_ee[0] + NUT_SCAN_OFFSET_X, cur_ee[1] + NUT_SCAN_OFFSET_Y, NUT_SCAN_Z])
+                phase = "NUT_SCAN_APPROACH"
+                step_count = 0
+                print(f"\n>>> [{task}] 너트 스캔 위치 이동 시작 (Target: X={NUT_SCAN_POS[0]:.3f}, Y={NUT_SCAN_POS[1]:.3f}, Z={NUT_SCAN_POS[2]:.3f})")
+
+            elif task in ("PICK_NUT1", "PICK_NUT2"):
+                nut_index = 1 if task == "PICK_NUT1" else 2
+                if isaac_node.latest_target_pose is not None:
+                    pos = isaac_node.latest_target_pose.pose.position
+                    nut_pick_pos = np.array([pos.x, pos.y, NUT_PICK_Z])
+                    nut_approach_pos = np.array([pos.x, pos.y, NUT_APPROACH_Z])
+                    phase = "NUT_APPROACH"
+                    step_count = 0
+                    print(f"\n>>> [{task}] 너트 {nut_index}번 상공 접근 시작 (Target: X={nut_approach_pos[0]:.3f}, Y={nut_approach_pos[1]:.3f})")
+                else:
+                    print(f"\n[ERROR] [{task}] 수신된 너트 Target Pose가 없습니다.")
+                    publish_status("FAILURE:NO_TARGET_POSE")
+
+            elif task in ("ASSEMBLE_NUT1", "ASSEMBLE_NUT2"):
+                nut_index = 1 if task == "ASSEMBLE_NUT1" else 2
+                if target_mid_pos is not None:
+                    bolt_target_pos = compute_bolt_target_pos(nut_index, target_mid_pos)
+                    bolt_touch_pos = np.array([
+                        bolt_target_pos[0], bolt_target_pos[1],
+                        bolt_target_pos[2] + EE_OFFSET[2] + NUT_GRASP_Z_LOCAL
+                    ])
+                    phase = "MOVE_TO_BOLT_NUT"
+                    step_count = 0
+                    print(f"\n>>> [{task}] 너트 {nut_index}번 -> 볼트 {nut_index}번 체결 시작 (Target: X={bolt_target_pos[0]:.4f}, Y={bolt_target_pos[1]:.4f})")
+                else:
+                    print(f"\n[ERROR] [{task}] 배터리 중심 좌표(target_mid_pos)가 없습니다. 먼저 ASSEMBLE_BUSBAR가 수행되어야 합니다.")
+                    publish_status("FAILURE:NO_BATTERY_CENTER")
+
+        # 3. FSM 제어 루프
+        if playing and phase != "IDLE" and phase != "DONE":
+
+            # [STEP 0-A] 초기 관절 자세 정렬
+            if phase == "INIT_POSE":
+                publish_progress("INIT_ALIGN", 10.0)
+                
+                arm_joint_names = [
+                    "joint_1", "joint_2", "joint_3", 
+                    "joint_4", "joint_5", "joint_6"
+                ]
+                arm_dof_indices = [robot.get_dof_index(name) for name in arm_joint_names]
+
+                robot.apply_action(
+                    ArticulationAction(
+                        joint_positions=TARGET_INIT_JOINTS,
+                        joint_indices=arm_dof_indices
+                    )
+                )
+                robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_OPEN))
+
+                all_joints = robot.get_joint_positions()
+                cur_arm_joints = all_joints[arm_dof_indices]
+                
+                joint_err = np.linalg.norm(cur_arm_joints - TARGET_INIT_JOINTS)
+
+                if joint_err < JOINT_TOLERANCE or step_count > 60:
+                    HOME_EE_POS = world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation()
+                    SCAN_POS = np.array([HOME_EE_POS[0], HOME_EE_POS[1], SCAN_APPROACH_Z])
+                    
+                    print(f"[OK] 1) 관절 정렬 완료! (EE Pos: {HOME_EE_POS[0]:.3f}, {HOME_EE_POS[1]:.3f}, {HOME_EE_POS[2]:.3f})")
+                    print(f" -> 2) 초기 위치 기준 Z={SCAN_APPROACH_Z}m 상승 시작 (Target: {SCAN_POS[0]:.3f}, {SCAN_POS[1]:.3f}, {SCAN_POS[2]:.3f})")
+                    
+                    phase = "SCAN_APPROACH"
+                    step_count = 0
+
+            # [STEP 0-B] 배터리 스캔 고도 상승 (Z = 0.7m)
+            elif phase == "SCAN_APPROACH":
+                publish_progress("SCAN_NAV", 50.0)
+                actions = arm_controller.forward(
+                    target_end_effector_position=SCAN_POS,
+                    target_end_effector_orientation=euler_to_quaternion_wxyz(0.0, 3.1415, -1.5708)
+                )
+                robot.apply_action(actions)
+                robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_OPEN))
+
+                cur_pos = world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation()
+                current_err = math.dist(cur_pos, tuple(SCAN_POS))
+
+                if current_err < PICK_TOLERANCE_STRICT or (current_err < PICK_TOLERANCE_LOOSE_VAL and step_count > MAX_STUCK_STEPS):
+                    print(f"[OK] 배터리 스캔 위치 도착 완료! ({cur_pos[0]:.3f}, {cur_pos[1]:.3f}, {cur_pos[2]:.3f})")
+                    publish_progress("SCAN_COMPLETE", 100.0)
+                    publish_status("SUCCESS")
+                    phase = "IDLE"
+
+            # [STEP 1] 버스바 스캔 위치 이동
+            elif phase == "SCAN_BUSBAR_APPROACH":
+                publish_progress("SCAN_BUSBAR_NAV", 50.0)
+                actions = arm_controller.forward(
+                    target_end_effector_position=BUSBAR_SCAN_POS,
+                    target_end_effector_orientation=quat_busbar
+                )
+                robot.apply_action(actions)
+                robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_OPEN))
+
+                cur_pos = world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation()
+                current_err = math.dist(cur_pos, tuple(BUSBAR_SCAN_POS))
+
+                if current_err < PICK_TOLERANCE_STRICT or (current_err < PICK_TOLERANCE_LOOSE_VAL and step_count > MAX_STUCK_STEPS):
+                    print(f"[OK] 버스바 스캔 위치 도착 완료! ({cur_pos[0]:.3f}, {cur_pos[1]:.3f}, {cur_pos[2]:.3f})")
+                    publish_progress("SCAN_BUSBAR_COMPLETE", 100.0)
+                    publish_status("SUCCESS")
+                    phase = "IDLE"
+
+            # [2단계] 버스바 상공 위치 접근 (Z = 0.6m)
+            elif phase == "BUSBAR_APPROACH":
+                publish_progress("APPROACH", 20.0)
+                actions = arm_controller.forward(
+                    target_end_effector_position=BUSBAR_APPROACH_POS,
+                    target_end_effector_orientation=quat_busbar
+                )
+                robot.apply_action(actions)
+                robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_OPEN))
+
+                cur_pos = world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation()
+                current_err = math.dist(cur_pos, tuple(BUSBAR_APPROACH_POS))
+
+                if current_err < PICK_TOLERANCE_STRICT or (current_err < PICK_TOLERANCE_LOOSE_VAL and step_count > MAX_STUCK_STEPS):
+                    print(f"[OK] 1. 버스바 상공(Z={BUSBAR_APPROACH_POS[2]:.3f}m) 접근 완료 -> 2. 파지점(Z={BUSBAR_PICK_POS[2]:.3f}m) 수직 하강 시작")
+                    phase = "BUSBAR_DESCEND"
+                    step_count = 0
+
+            # [3단계] 파지 위치 수직 하강 (Z = 0.455m)
+            elif phase == "BUSBAR_DESCEND":
+                publish_progress("DESCEND", 50.0)
+                actions = arm_controller.forward(
+                    target_end_effector_position=BUSBAR_PICK_POS,
+                    target_end_effector_orientation=quat_busbar
+                )
+                robot.apply_action(actions)
+                robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_OPEN))
+
+                cur_pos = world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation()
+                current_err = math.dist(cur_pos, tuple(BUSBAR_PICK_POS))
+
+                if current_err < PICK_TOLERANCE_STRICT or (current_err < PICK_TOLERANCE_LOOSE_VAL and step_count > MAX_STUCK_STEPS):
+                    print("[OK] 2. 버스바 파지점 도착 -> Kinematic 파지 시작")
+                    phase = "BUSBAR_GRASP"
+                    grasp_timer = 0
+
+            # [4단계] Kinematic Pose-Glue 파지
+            elif phase == "BUSBAR_GRASP":
+                publish_progress("GRASPING", 75.0)
+                if grasp_timer == 0:
+                    disable_physics_recursively(stage, BUSBAR_ROOT_PATH)
+                    if busbar_xform is not None:
+                        real_pos, _ = busbar_xform.get_world_pose()
+                        busbar_start_grasp_pos = np.array(real_pos)
+                    else:
+                        busbar_start_grasp_pos = BUSBAR_PICK_POS
+
+                actions = arm_controller.forward(
+                    target_end_effector_position=BUSBAR_PICK_POS,
+                    target_end_effector_orientation=quat_busbar
+                )
+                robot.apply_action(actions)
+
+                grasp_timer += 1
+                ramp_frac = min(grasp_timer / GRIP_CLOSE_RAMP_STEPS, 1.0)
+                grip_target = ramp_frac * GRIPPER_CLOSE
+                robot.gripper.apply_action(ArticulationAction(joint_positions=grip_target))
+
+                glue_busbar_to_ee(robot, busbar_xform, busbar_start_grasp_pos, blend=ramp_frac)
+
+                if grasp_timer >= GRIP_CLOSE_RAMP_STEPS:
+                    print("[OK] 3. 버스바 파지 완료 -> 4. 안전 고도 상승")
+                    phase = "BUSBAR_LIFT"
+                    step_count = 0
+
+            # [5단계] 안전 고도 들어올리기 (Z = 0.6m)
+            elif phase == "BUSBAR_LIFT":
+                publish_progress("LIFTING", 90.0)
+                actions = arm_controller.forward(
+                    target_end_effector_position=BUSBAR_LIFT_MOVE_POS,
+                    target_end_effector_orientation=quat_busbar
+                )
+                robot.apply_action(actions)
+                robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_CLOSE))
+
+                glue_busbar_to_ee(robot, busbar_xform, busbar_start_grasp_pos, blend=1.0)
+
+                cur_pos = world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation()
+                current_err = math.dist(cur_pos, tuple(BUSBAR_LIFT_MOVE_POS))
+
+                if current_err < PICK_TOLERANCE_STRICT or (current_err < PICK_TOLERANCE_LOOSE_VAL and step_count > MAX_STUCK_STEPS):
+                    print("\n★ [PICK_BUSBAR SUCCESS] 버스바 파지 및 상승 완수!")
+                    publish_progress("COMPLETE", 100.0)
+                    publish_status("SUCCESS")
+                    phase = "IDLE"
+
+            # [6단계] 배터리 중점 상공으로 이동 (Z = 0.7m, 버스바 고정 상태 유지)
+            elif phase == "MOVE_BATTERY_CENTER_APPROACH":
+                publish_progress("MOVING_BATTERY_CENTER", 50.0)
+                actions = arm_controller.forward(
+                    target_end_effector_position=BATTERY_CENTER_POS,
+                    target_end_effector_orientation=euler_to_quaternion_wxyz(0.0, 3.1415, 0.0)
+                )
+                robot.apply_action(actions)
+                robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_CLOSE))
+                glue_busbar_to_ee(robot, busbar_xform, busbar_start_grasp_pos, blend=1.0)
+
+                cur_pos = world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation()
+                current_err = math.dist(cur_pos, tuple(BATTERY_CENTER_POS))
+
+                if current_err < PICK_TOLERANCE_STRICT or (current_err < PICK_TOLERANCE_LOOSE_VAL and step_count > MAX_STUCK_STEPS):
+                    print(f"[OK] 배터리 중점 상공 위치 도착 완료! ({cur_pos[0]:.3f}, {cur_pos[1]:.3f}, {cur_pos[2]:.3f})")
+                    publish_progress("MOVE_BATTERY_CENTER_COMPLETE", 100.0)
+                    publish_status("SUCCESS")
+                    phase = "IDLE"
+
+            # [7단계] 비전 보정 노드 피드백 기반 미세 오차 정렬 (Target 상태 유지 보완)
+            elif phase == "FINE_ALIGNMENT":
+                publish_progress("FINE_ALIGNMENT_TRACKING", 85.0)
+
+                cur_ee_pos = world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation()
+
+                if isaac_node.latest_target_pose is not None:
+                    offset = isaac_node.latest_target_pose.pose.position
+                    if abs(offset.x) <= 0.0025 and abs(offset.y) <= 0.0025:             
+                        target_fine_pos[0] += offset.x
+                        target_fine_pos[1] += offset.y
+                        target_fine_pos[2] = BATTERY_CENTER_Z
+                        
+                        print(f"\n[FINE_ALIGNMENT] Vision Offset Received -> dx: {offset.x:+.4f}m, dy: {offset.y:+.4f}m")
+                        print(f"               └─ New Target Pos -> X: {target_fine_pos[0]:.4f}, Y: {target_fine_pos[1]:.4f}, Z: {target_fine_pos[2]:.4f}")
+
+                    isaac_node.latest_target_pose = None
+
+                sys.stdout.write(
+                    f"\r\033[K[FINE_ALIGNMENT Loop] Cur EE: ({cur_ee_pos[0]:.4f}, {cur_ee_pos[1]:.4f}) "
+                    f"-> Target: ({target_fine_pos[0]:.4f}, {target_fine_pos[1]:.4f})"
+                )
+                sys.stdout.flush()
+
+                actions = arm_controller.forward(
+                    target_end_effector_position=target_fine_pos,
+                    target_end_effector_orientation=euler_to_quaternion_wxyz(0.0, 3.1415, 0.0)
+                )
+                robot.apply_action(actions)
+
+                robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_CLOSE))
+                glue_busbar_to_ee(robot, busbar_xform, busbar_start_grasp_pos, blend=1.0)
+
+                if isaac_node.alignment_success:
+                    print("\n\n★ [FINE_ALIGNMENT SUCCESS] 미세 오차 보정 성공 및 정렬 완료!")
+                    publish_progress("FINE_ALIGNMENT_COMPLETE", 100.0)
+                    publish_status("SUCCESS")
+                    phase = "IDLE"
+
+            # [8단계] 버스바 수직 하강 체결
+            elif phase == "BUSBAR_DESCEND_TO_BOLT":
+                publish_progress("BUSBAR_DESCEND_INSERT", 90.0)
+
+                descend_target_z = max(descend_target_z - INSERT_SPEED, target_mid_pos[2])
+                step_target_pos = np.array([target_mid_pos[0], target_mid_pos[1], descend_target_z])
+
+                actions = arm_controller.forward(
+                    target_end_effector_position=step_target_pos,
+                    target_end_effector_orientation=euler_to_quaternion_wxyz(0.0, 3.1415, 0.0)
+                )
+                robot.apply_action(actions)
+                robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_CLOSE))
+
+                glue_busbar_to_ee(robot, busbar_xform, busbar_start_grasp_pos, blend=1.0)
+
+                cur_pos = world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation()
+                dist_err = math.dist(cur_pos, tuple(target_mid_pos))
+
+                if cur_pos[2] <= BUSBAR_RELEASE_Z or dist_err < INSERT_TOLERANCE_STRICT:
+                    if busbar_xform is not None:
+                        busbar_xform.set_world_pose(position=target_mid_pos, orientation=BUSBAR_REST_ORIENTATION)
+                    
+                    # -------------------------------------------------------------
+                    # 🔥 [추가 필요] 너트 조립용 기준 좌표(Anchor) 저장 및 볼트 3D 좌표 산출
+                    # -------------------------------------------------------------
+                    global assembled_battery_center, calculated_bolt1_pos, calculated_bolt2_pos
+                    
+                    # 1) 실제 안착된 배터리 중심 좌표 확정 저장
+                    assembled_battery_center = np.array(target_mid_pos, dtype=float)
+                    
+                    # 2) 볼트 1, 2의 오프셋 벡터 (미리 정의된 상대 거리 오프셋)
+                    # 예: BOLT1_OFFSET = np.array([-0.1042, 0.1812, 0.0])
+                    #     BOLT2_OFFSET = np.array([0.1042, -0.1812, 0.0])
+                    calculated_bolt1_pos = assembled_battery_center + BOLT1_OFFSET_FROM_CENTER 
+                    calculated_bolt2_pos = assembled_battery_center + BOLT2_OFFSET_FROM_CENTER 
+                    
+                    print(f"\n[OK] 버스바 안착 체결 완료 (EE Z: {cur_pos[2]:.4f}m)!")
+                    print(f" -> 기준 안착 좌표 저장: {assembled_battery_center}")
+                    print(f" -> 동적 계산된 볼트1 좌표: {calculated_bolt1_pos}")
+                    print(f" -> 동적 계산된 볼트2 좌표: {calculated_bolt2_pos}")
+                    # -------------------------------------------------------------
+
+                    phase = "BUSBAR_RELEASE_AND_RETRACT"
+                    step_count = 0
+
+            # [9단계] 버스바 해제 및 안전 상공 이탈
+            elif phase == "BUSBAR_RELEASE_AND_RETRACT":
+                publish_progress("BUSBAR_RETRACT", 95.0)
+
+                retract_pos = np.array([target_mid_pos[0], target_mid_pos[1], BATTERY_CENTER_Z])
+                actions = arm_controller.forward(
+                    target_end_effector_position=retract_pos,
+                    target_end_effector_orientation=euler_to_quaternion_wxyz(0.0, 3.1415, 0.0)
+                )
+                robot.apply_action(actions)
+                robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_OPEN))
+
+                # Kinematic Pose-Glue 해제
+                glue_busbar_to_ee(robot, busbar_xform, busbar_start_grasp_pos, blend=0.0)
+
+                cur_pos = world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation()
+                current_err = math.dist(cur_pos, tuple(retract_pos))
+
+                if current_err < PICK_TOLERANCE_STRICT or step_count > MAX_STUCK_STEPS:
+                    print("\n★ [ASSEMBLE_BUSBAR SUCCESS] 버스바 체결 및 안전 이탈 완료!")
+                    publish_progress("ASSEMBLE_BUSBAR_COMPLETE", 100.0)
+                    publish_status("SUCCESS")
+                    phase = "IDLE"
+
+            # ════════════════════════════════════════════════════════════════
+            # [신규] 너트 조립(Nut Assembly) 공용 Phase (nut_index로 Nut1/Nut2 재사용)
+            # ════════════════════════════════════════════════════════════════
+            # [10단계] 너트 스캔 위치 이동
+            elif phase == "NUT_SCAN_APPROACH":
+                publish_progress("NUT_SCAN_NAV", 50.0)
+                actions = arm_controller.forward(target_end_effector_position=NUT_SCAN_POS, target_end_effector_orientation=quat_nut)
+                robot.apply_action(actions)
+                robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_OPEN))
+
+                cur_pos = world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation()
+                current_err = math.dist(cur_pos, tuple(NUT_SCAN_POS))
+
+                if current_err < PICK_TOLERANCE_STRICT or (current_err < PICK_TOLERANCE_LOOSE_VAL and step_count > MAX_STUCK_STEPS):
+                    print(f"[OK] 너트 스캔 위치 도착 완료! ({cur_pos[0]:.3f}, {cur_pos[1]:.3f}, {cur_pos[2]:.3f})")
+                    publish_progress("NUT_SCAN_COMPLETE", 100.0)
+                    publish_status("SUCCESS")
+                    phase = "IDLE"
+
+            # [11단계] 너트 상공 접근
+            elif phase == "NUT_APPROACH":
+                publish_progress("NUT_APPROACH", 20.0)
+                actions = arm_controller.forward(target_end_effector_position=nut_approach_pos, target_end_effector_orientation=quat_nut)
+                robot.apply_action(actions)
+                robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_OPEN))
+
+                cur_pos = world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation()
+                current_err = math.dist(cur_pos, tuple(nut_approach_pos))
+
+                if current_err < PICK_TOLERANCE_STRICT or (current_err < PICK_TOLERANCE_LOOSE_VAL and step_count > MAX_STUCK_STEPS):
+                    nut_label = resolve_nut_assets(nut_index, nut1_xform, nut2_xform)[1]
+                    print(f"[OK] {nut_label} 상공 도착! -> 하강 시작")
+                    phase = "NUT_DESCEND"
+                    step_count = 0
+
+            # [12단계] 너트 파지점 하강
+            elif phase == "NUT_DESCEND":
+                publish_progress("NUT_DESCEND", 40.0)
+                actions = arm_controller.forward(target_end_effector_position=nut_pick_pos, target_end_effector_orientation=quat_nut)
+                robot.apply_action(actions)
+                robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_OPEN))
+
+                cur_pos = world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation()
+                current_err = math.dist(cur_pos, tuple(nut_pick_pos))
+
+                if current_err < PICK_TOLERANCE_STRICT or (current_err < PICK_TOLERANCE_LOOSE_VAL and step_count > MAX_STUCK_STEPS):
+                    nut_label = resolve_nut_assets(nut_index, nut1_xform, nut2_xform)[1]
+                    print(f"[OK] {nut_label} 하강 완료! -> 물리 파지(Gripper Close) 시작")
+                    phase = "NUT_GRASP"
+                    grasp_timer = 0
+
+            # [13단계] 너트 물리 파지 (실제 그리퍼로 파지, Kinematic Glue 미사용)
+            elif phase == "NUT_GRASP":
+                publish_progress("NUT_GRASPING", 60.0)
+                actions = arm_controller.forward(target_end_effector_position=nut_pick_pos, target_end_effector_orientation=quat_nut)
+                robot.apply_action(actions)
+
+                grasp_timer += 1
+                ramp_frac = min(grasp_timer / GRIP_CLOSE_RAMP_STEPS, 1.0)
+                grip_target = ramp_frac * GRIPPER_CLOSE_NUT
+                robot.gripper.apply_action(ArticulationAction(joint_positions=grip_target))
+
+                if grasp_timer >= GRIP_CLOSE_RAMP_STEPS:
+                    nut_label = resolve_nut_assets(nut_index, nut1_xform, nut2_xform)[1]
+                    print(f"[OK] {nut_label} 물리 파지 완료! -> 상공({NUT_APPROACH_Z}m)으로 상승")
+                    phase = "NUT_LIFT"
+                    step_count = 0
+
+            # [14단계] 너트 파지 후 상공 상승
+            elif phase == "NUT_LIFT":
+                publish_progress("NUT_LIFTING", 80.0)
+                actions = arm_controller.forward(target_end_effector_position=nut_approach_pos, target_end_effector_orientation=quat_nut)
+                robot.apply_action(actions)
+                robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_CLOSE_NUT))
+
+                cur_pos = world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation()
+                current_err = math.dist(cur_pos, tuple(nut_approach_pos))
+
+                if current_err < PICK_TOLERANCE_STRICT or (current_err < PICK_TOLERANCE_LOOSE_VAL and step_count > MAX_STUCK_STEPS):
+                    nut_label = resolve_nut_assets(nut_index, nut1_xform, nut2_xform)[1]
+                    print(f"\n★ [PICK_{nut_label} SUCCESS] 너트 파지 및 상승 완수!")
+                    publish_progress("NUT_PICK_COMPLETE", 100.0)
+                    publish_status("SUCCESS")
+                    phase = "IDLE"
+
+            # [15단계] 볼트 상공 이동 (compute_bolt_target_pos()로 동적 산출된 bolt_target_pos 사용)
+            elif phase == "MOVE_TO_BOLT_NUT":
+                publish_progress("MOVE_TO_BOLT", 20.0)
+                bolt_approach_pos = np.array([bolt_target_pos[0], bolt_target_pos[1], BOLT_APPROACH_Z])
+                actions = arm_controller.forward(target_end_effector_position=bolt_approach_pos, target_end_effector_orientation=quat_nut)
+                robot.apply_action(actions)
+                robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_CLOSE_NUT))
+
+                cur_pos = world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation()
+                current_err = math.dist(cur_pos, tuple(bolt_approach_pos))
+
+                if current_err < PICK_TOLERANCE_STRICT or (current_err < PICK_TOLERANCE_LOOSE_VAL and step_count > MAX_STUCK_STEPS):
+                    nut_label = resolve_nut_assets(nut_index, nut1_xform, nut2_xform)[1]
+                    print(f"[OK] 볼트 {nut_index}번 상공 도착! ({nut_label}) -> 착좌 하강 시작")
+                    phase = "NUT_DESCEND_TO_BOLT"
+                    step_count = 0
+                    descend_target_z = BOLT_APPROACH_Z
+
+            # [16단계] 볼트 착좌 하강
+            elif phase == "NUT_DESCEND_TO_BOLT":
+                publish_progress("NUT_DESCEND_TO_BOLT", 40.0)
+                descend_target_z = max(descend_target_z - INSERT_SPEED, bolt_touch_pos[2])
+                step_target_pos = np.array([bolt_touch_pos[0], bolt_touch_pos[1], descend_target_z])
+
+                actions = arm_controller.forward(target_end_effector_position=step_target_pos, target_end_effector_orientation=quat_nut)
+                robot.apply_action(actions)
+                robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_CLOSE_NUT))
+
+                cur_pos = world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation()
+
+                if abs(cur_pos[2] - bolt_touch_pos[2]) < PICK_TOLERANCE_LOOSE_VAL or descend_target_z <= bolt_touch_pos[2]:
+                    ee_now_pos, ee_now_quat = robot.end_effector.get_world_pose()
+                    screw_start_quat = np.asarray(ee_now_quat).copy()
+                    screw_seat_ee_pos = np.asarray(ee_now_pos).copy()
+
+                    screw_sub = "rotate"
+                    screw_pass_idx = 0
+                    screw_pass_theta = 0.0
+                    stuck_counter = 0
+                    prev_ee_z = ee_now_pos[2]
+
+                    nut_label = resolve_nut_assets(nut_index, nut1_xform, nut2_xform)[1]
+                    print(f"[OK] 볼트 {nut_index}번 착좌 완료 ({nut_label})! -> Screwing 시작")
+                    phase = "NUT_SCREW"
+                    step_count = 0
+
+            # [17단계] Screwing (Nut1/Nut2 공용 - 회전 체결 / Regrasp / 토크·Stuck 감지)
+            elif phase == "NUT_SCREW":
+                publish_progress("NUT_SCREWING", 70.0)
+                if screw_sub == "rotate":
+                    screw_pass_theta = min(screw_pass_theta + SCREW_OMEGA_DEG_S * PHYSICS_DT, SCREW_TURNS_DEG)
+                    pass_done = (screw_pass_theta >= SCREW_TURNS_DEG)
+
+                    total_deg = screw_pass_idx * SCREW_TURNS_DEG + screw_pass_theta
+                    depth_m = min((total_deg / 360.0) * NUT_PITCH_M, ENGAGE_LEN)
+
+                    target_pos = screw_seat_ee_pos.copy()
+                    target_pos[2] = screw_seat_ee_pos[2] - depth_m
+                    target_quat = yaw_rotated_quat(screw_start_quat, screw_pass_theta)
+
+                    actions = arm_controller.forward(target_end_effector_position=target_pos, target_end_effector_orientation=target_quat)
+                    robot.apply_action(actions)
+                    robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_CLOSE_NUT))
+
+                    # 실시간 토크 감지 및 Z축 정지(Stuck) 모니터링
+                    cur_ee_pos, _ = robot.end_effector.get_world_pose()
+                    z_movement = abs(prev_ee_z - cur_ee_pos[2])
+                    prev_ee_z = cur_ee_pos[2]
+
+                    joint_efforts = robot.get_measured_joint_efforts()
+                    curr_torque = abs(joint_efforts[-1]) if joint_efforts is not None and len(joint_efforts) > 0 else 0.0
+
+                    if cur_ee_pos[2] <= TCP_FORCE_CHECK_Z:
+                        if z_movement < STUCK_Z_DELTA_THRESH and depth_m > 0.003:
+                            stuck_counter += 1
+                        else:
+                            stuck_counter = max(0, stuck_counter - 1)
+                        is_seated_by_torque = (curr_torque > TORQUE_THRESHOLD) or (stuck_counter >= STUCK_STEP_LIMIT)
+                    else:
+                        is_seated_by_torque = False
+
+                    if step_count % 20 == 0:
+                        print(f"  [NUT{nut_index} SCREW] Pass {screw_pass_idx+1}/{1+REGRASP_CYCLES} | Theta: {screw_pass_theta:.1f}° | 깊이: {depth_m*1000:.2f}mm / 목표 {ENGAGE_LEN*1000:.1f}mm | TCP Z: {cur_ee_pos[2]:.4f}m | 토크: {curr_torque:.1f}Nm")
+
+                    if pass_done or is_seated_by_torque:
+                        if is_seated_by_torque:
+                            print(f"  [체결 감지] 너트 {nut_index}번 완착(Seating) 감지! (TCP Z: {cur_ee_pos[2]:.4f}m, 토크: {curr_torque:.1f}Nm) -> Screwing 조기 종료 및 그리퍼 해제")
+
+                        if depth_m >= ENGAGE_LEN or screw_pass_idx >= REGRASP_CYCLES or is_seated_by_torque:
+                            robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_OPEN))
+                            print(f"\n[OK] 너트 {nut_index}번 체결 완료! -> 꼬인 방향 유지한 채 수직 상승 시작")
+                            phase = "NUT_RETRACT_LIFT"
+                            step_count = 0
+                        else:
+                            screw_pass_end_pos = target_pos.copy()
+                            screw_sub = "release"
+                            screw_release_step = 0
+
+                elif screw_sub == "release":
+                    screw_release_step += 1
+                    rf = min(screw_release_step / GRIP_CLOSE_RAMP_STEPS, 1.0)
+                    release_target = (1.0 - rf) * GRIPPER_CLOSE_NUT[0]
+                    robot.gripper.apply_action(ArticulationAction(joint_positions=np.array([release_target, release_target])))
+
+                    hold_quat = yaw_rotated_quat(screw_start_quat, screw_pass_theta)
+                    actions = arm_controller.forward(target_end_effector_position=screw_pass_end_pos, target_end_effector_orientation=hold_quat)
+                    robot.apply_action(actions)
+
+                    if rf >= 1.0:
+                        screw_sub = "lift_up"
+                        screw_release_step = 0
+
+                elif screw_sub == "lift_up":
+                    lift_target_pos = screw_pass_end_pos + np.array([0.0, 0.0, REGRASP_LIFT_HEIGHT])
+                    hold_quat = yaw_rotated_quat(screw_start_quat, screw_pass_theta)
+                    actions = arm_controller.forward(target_end_effector_position=lift_target_pos, target_end_effector_orientation=hold_quat)
+                    robot.apply_action(actions)
+                    robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_OPEN))
+
+                    cur_pos = world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation()
+                    if math.dist(cur_pos, tuple(lift_target_pos)) < PICK_TOLERANCE_STRICT or screw_release_step > 40:
+                        screw_sub = "unwind"
+                        screw_unwind_deg = screw_pass_theta
+                    screw_release_step += 1
+
+                elif screw_sub == "unwind":
+                    screw_unwind_deg = max(screw_unwind_deg - SCREW_OMEGA_DEG_S * PHYSICS_DT, 0.0)
+                    unwind_done = (screw_unwind_deg <= 0.0)
+
+                    lift_target_pos = screw_pass_end_pos + np.array([0.0, 0.0, REGRASP_LIFT_HEIGHT])
+                    target_quat = yaw_rotated_quat(screw_start_quat, screw_unwind_deg)
+                    actions = arm_controller.forward(target_end_effector_position=lift_target_pos, target_end_effector_orientation=target_quat)
+                    robot.apply_action(actions)
+                    robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_OPEN))
+
+                    if unwind_done:
+                        screw_sub = "descend_down"
+                        screw_release_step = 0
+
+                elif screw_sub == "descend_down":
+                    regrasp_descend_target = screw_pass_end_pos + np.array([0.0, 0.0, REGRASP_Z_OFFSET])
+                    actions = arm_controller.forward(target_end_effector_position=regrasp_descend_target, target_end_effector_orientation=screw_start_quat)
+                    robot.apply_action(actions)
+                    robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_OPEN))
+
+                    cur_pos = world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation()
+                    if math.dist(cur_pos, tuple(regrasp_descend_target)) < PICK_TOLERANCE_STRICT or screw_release_step > 40:
+                        screw_sub = "regrasp"
+                        screw_regrasp_step = 0
+                    screw_release_step += 1
+
+                elif screw_sub == "regrasp":
+                    screw_regrasp_step += 1
+                    rf = min(screw_regrasp_step / GRIP_CLOSE_RAMP_STEPS, 1.0)
+                    grip_target = rf * GRIPPER_CLOSE_NUT[0]
+                    robot.gripper.apply_action(ArticulationAction(joint_positions=np.array([grip_target, grip_target])))
+
+                    regrasp_target_pos = screw_pass_end_pos + np.array([0.0, 0.0, REGRASP_Z_OFFSET])
+                    actions = arm_controller.forward(target_end_effector_position=regrasp_target_pos, target_end_effector_orientation=screw_start_quat)
+                    robot.apply_action(actions)
+
+                    if rf >= 1.0:
+                        screw_pass_idx += 1
+                        screw_pass_theta = 0.0
+                        stuck_counter = 0
+                        screw_sub = "rotate"
+
+            # [18단계] 체결 후 수직 상승 (꼬인 방향 유지)
+            elif phase == "NUT_RETRACT_LIFT":
+                publish_progress("NUT_RETRACT_LIFT", 90.0)
+                ee_now_pos, _ = robot.end_effector.get_world_pose()
+                lift_target_pos = np.array([ee_now_pos[0], ee_now_pos[1], NUT_APPROACH_Z])
+
+                last_screw_quat = yaw_rotated_quat(screw_start_quat, screw_pass_theta)
+                actions = arm_controller.forward(target_end_effector_position=lift_target_pos, target_end_effector_orientation=last_screw_quat)
+                robot.apply_action(actions)
+                robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_OPEN))
+
+                cur_pos = world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation()
+                current_err = math.dist(cur_pos, tuple(lift_target_pos))
+                if current_err < PICK_TOLERANCE_STRICT or (current_err < PICK_TOLERANCE_LOOSE_VAL and step_count > MAX_STUCK_STEPS):
+                    print(f"[OK] 수직 이탈 완료! -> 상공 안전 지대에서 6번 조인트 0도로 되감기(Unwind) 시작")
+                    phase = "NUT_RETRACT_UNWIND"
+                    screw_unwind_deg = screw_pass_theta
+                    step_count = 0
+
+            # [19단계] 상공에서 6번 조인트 0도로 되감기
+            elif phase == "NUT_RETRACT_UNWIND":
+                publish_progress("NUT_RETRACT_UNWIND", 95.0)
+                screw_unwind_deg = max(screw_unwind_deg - SCREW_OMEGA_DEG_S * PHYSICS_DT, 0.0)
+                ee_now_pos, _ = robot.end_effector.get_world_pose()
+                lift_target_pos = np.array([ee_now_pos[0], ee_now_pos[1], NUT_APPROACH_Z])
+
+                target_quat = yaw_rotated_quat(screw_start_quat, screw_unwind_deg)
+                actions = arm_controller.forward(target_end_effector_position=lift_target_pos, target_end_effector_orientation=target_quat)
+                robot.apply_action(actions)
+                robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_OPEN))
+
+                if screw_unwind_deg <= 0.0:
+                    print(f"[OK] 6번 조인트 0도 원점 되감기 완료! -> 기본 방향(quat_nut) 정렬")
+                    phase = "NUT_RETRACT_ROTATE"
+                    step_count = 0
+
+            # [20단계] 기본 오리엔테이션 정렬 후 완료
+            elif phase == "NUT_RETRACT_ROTATE":
+                publish_progress("NUT_RETRACT_ROTATE", 98.0)
+                ee_now_pos, _ = robot.end_effector.get_world_pose()
+                lift_target_pos = np.array([ee_now_pos[0], ee_now_pos[1], NUT_APPROACH_Z])
+
+                actions = arm_controller.forward(target_end_effector_position=lift_target_pos, target_end_effector_orientation=quat_nut)
+                robot.apply_action(actions)
+                robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_OPEN))
+
+                cur_pos = world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation()
+                current_err = math.dist(cur_pos, tuple(lift_target_pos))
+                if current_err < PICK_TOLERANCE_STRICT or (current_err < PICK_TOLERANCE_LOOSE_VAL and step_count > MAX_STUCK_STEPS):
+                    nut_label = resolve_nut_assets(nut_index, nut1_xform, nut2_xform)[1]
+                    print(f"\n★ [ASSEMBLE_{nut_label} SUCCESS] 너트 체결 및 안전 이탈 완료!")
+                    publish_progress("ASSEMBLE_NUT_COMPLETE", 100.0)
+                    publish_status("SUCCESS")
+                    phase = "IDLE"
+
+            # Phase 타임아웃 예외 처리
+            if step_count > MAX_STUCK_STEPS * 4:
+                print(f"\n[ERROR] Phase '{phase}' 진행 시간 초과 - 실패 처리")
+                publish_status("FAILURE:TIMEOUT")
+                phase = "DONE"
+
+            step_count += 1
 
         was_playing = playing
 
-        if playing:
-            # ★ [핵심 해결 2] 매 프레임마다 RMPFlow 베이스 Pose를 실제 base_link World 좌표로 실시간 갱신!
-            base_xf = get_world_transform(stage, M0609_BASE_PATH)
-            base_position = base_xf.ExtractTranslation()
-            base_quaternion = base_xf.ExtractRotationQuat()
-            arm_controller._motion_policy.set_robot_base_pose(
-                robot_position=np.array([base_position[0], base_position[1], base_position[2]]),
-                robot_orientation=np.array([
-                    base_quaternion.GetReal(),
-                    *[float(val) for val in base_quaternion.GetImaginary()]
-                ]),
-            )
-
-            # A. 현재 엔드이펙터 Pose 지속 퍼블리시
-            sub_node.publish_current_ee_pose(stage, ee_path)
-
-            # A-2. 너트 결속/해제 요청 처리 (rmpflow_enabled 여부와 무관하게 항상 처리 -
-            # 결속은 RMPFlow 구간(NUT_GRASP)에서, 해제는 joint 재생 구간(FASTEN)에서 온다)
-            if sub_node.nut_grasp_request is not None:
-                req = sub_node.nut_grasp_request
-                sub_node.nut_grasp_request = None
-                if req:
-                    if engage_grasp(stage, ee_path, req):
-                        print(f"[GRASP] {req} FixedJoint 결속 활성화")
-                    else:
-                        print(f"[GRASP] 알 수 없는 nut_id={req!r}, 결속 요청 무시")
-                else:
-                    release_grasp(stage)
-                    print("[GRASP] FixedJoint 결속 해제")
-
-            # B. 목표 Pose 수신 시 RMPFlow 연산 및 명령 적용
-            # (nut_fasten이 /arm/joint_command로 직접 관절을 제어하는 동안은 건너뛴다 -
-            #  안 그러면 여기서 마지막 target_pose를 계속 재적용해 재생 궤적과 충돌한다)
-            if sub_node.rmpflow_enabled:
-                if sub_node.target_position is not None and sub_node.target_orientation is not None:
-                    action = arm_controller.forward(
-                        target_end_effector_position=sub_node.target_position,
-                        target_end_effector_orientation=sub_node.target_orientation,
-                    )
-                    robot.apply_action(action)
-
-                # C. 그리퍼 상태 제어 (GRIPPER_JOINTS도 nut_fasten 재생 관절 목록에 포함되므로 동일하게 건너뜀)
-                if sub_node.latest_gripper_cmd == 1:
-                    robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_CLOSE))
-                else:
-                    robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_OPEN))
-
-    sub_node.destroy_node()
+    # 리소스 해제
+    if 'world' in locals() and world is not None:
+        world.clear_instance()
+    omni.usd.get_context().close_stage()
+    isaac_node.destroy_node()
     rclpy.shutdown()
     simulation_app.close()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
