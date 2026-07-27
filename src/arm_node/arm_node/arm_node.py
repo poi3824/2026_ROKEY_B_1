@@ -344,8 +344,8 @@ class ArmNode(Node):
             cmd_msg.data = "ASSEMBLE_BUSBAR"
             self.pub_task_command.publish(cmd_msg)
 
-            # Isaac Sim이 하강 체결 후 완료 신호를 보낼 때까지 대기
-            success = self.wait_for_isaac_completion(goal_handle, feedback_msg, timeout_sec=30.0)
+            # Isaac Sim이 하강 체결 후 완료 신호를 보낼 때까지 대기 (타임아웃 없음, 사용자 요청)
+            success = self.wait_for_isaac_completion(goal_handle, feedback_msg, timeout_sec=None)
 
             if success:
                 result_msg.success = True
@@ -452,6 +452,8 @@ class ArmNode(Node):
         스캔 시점의 스냅샷 좌표 하나로는 하강 중 오차가 누적되기 때문 - Isaac Sim
         쪽(execute_isaac.py)이 매 스텝 latest_target_pose를 다시 읽어 목표를 갱신한다.
         고정 카메라 대상 태스크는 기본값(None)으로 두면 기존과 동일하게 동작한다.
+
+        timeout_sec=None이면 타임아웃 없이 SUCCESS/FAILURE 신호가 올 때까지 무한 대기한다.
         """
         start_time = time.time()
         while rclpy.ok():
@@ -468,7 +470,7 @@ class ArmNode(Node):
                 elif "FAILURE" in self.isaac_status:
                     return False
 
-            if time.time() - start_time > timeout_sec:
+            if timeout_sec is not None and time.time() - start_time > timeout_sec:
                 self.get_logger().error("Isaac Sim 응답 시간 초과 (Timeout)")
                 return False
 
