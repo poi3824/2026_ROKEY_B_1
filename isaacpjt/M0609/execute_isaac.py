@@ -462,9 +462,9 @@ def main():
     descend_target_z = None
     target_mid_pos = None
 
-    # ★ 버스바 PI 정렬(assembly_nut_fraction1.py에서 이식)
+    # ★ 버스바 yaw 보정 누적기 - error_fix.py가 /target_pose로 보내는 미세 yaw 스텝을
+    # 누적하는 용도 (assembly_nut_fraction1.py의 YawAligner 클래스를 accumulator로 재사용)
     yaw_aligner = YawAligner(kp=1.0, ki=0.0589, out_limit_deg=15.0)
-    busbar_align_last_used_stamp = 0.0
 
     # ── 너트 조립(Nut Assembly) 상태 변수 (신규 추가) ──
     nut_index      = 0        # 1: 너트 1번, 2: 너트 2번 (NUT_*/MOVE_TO_BOLT_NUT 공용 Phase에서 참조)
@@ -521,7 +521,6 @@ def main():
             grasp_timer = 0
 
             yaw_aligner.reset()
-            busbar_align_last_used_stamp = 0.0
 
             nut_index = 0
             nut_pick_pos = None
@@ -577,7 +576,9 @@ def main():
                 isaac_node.pub_errorfix_command.publish(start_cmd)
 
                 isaac_node.alignment_success = False
-                
+                isaac_node.latest_target_pose = None
+                yaw_aligner.reset()
+
                 # FINE_ALIGNMENT 진입 시 실시간 EE 위치 기준으로 Target 초기화
                 cur_ee = world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation()
                 target_fine_pos = np.array([cur_ee[0], cur_ee[1], BATTERY_CENTER_Z])
@@ -816,29 +817,30 @@ def main():
 
             # [7단계] 비전 보정 노드 피드백 기반 미세 오차 정렬 (Target 상태 유지 보완)
             elif phase == "FINE_ALIGNMENT":
-                # ★ assembly_nut_fraction1.py의 YawAligner(PI) 이식 - 기존 /target_pose+
-                # /errorfix_command+"ALIGNMENT_SUCCESS" 경로는 error_fix_depth1.py가 실제로
-                # 쓰지 않아 연결이 안 돼있었다(항상 대기만 하고 안 끝남). error_fix_depth1.py가
-                # 실제로 퍼블리시하는 /busbar_alignment_error(world dx,dy,dz,dTheta)를 받아
-                # PI로 yaw를 보정하고 XY도 매 스텝 같이 갱신한다.
+                # ★ 실제 기동 중인 error_fix 패키지(src/error_fix/error_fix/error_fix.py)는
+                # world dx,dy를 안 보낸다 - FIXED_STEP(0.2mm)짜리 방향 신호만 /target_pose로
+                # 계속 보내고, 받는 쪽이 누적해야 하는 프로토콜이다(error_fix_depth1.py의
+                # /busbar_alignment_error 프로토콜과는 다름 - 처음에 그걸로 착각해서
+                # 아무 보정도 안 먹히고 있었음, 2026-07-27 실측 확인). 완료는
+                # /task_command="ALIGNMENT_SUCCESS"로 온다(픽셀 0오차+각도 0.5도 이하를
+                # 30프레임 연속 유지했을 때).
                 publish_progress("FINE_ALIGNMENT_TRACKING", 85.0)
 
-                if step_count == 0:
-                    yaw_aligner.reset()
-                    busbar_align_last_used_stamp = 0.0
-                    if target_fine_pos is None and BATTERY_CENTER_POS is not None:
-                        target_fine_pos = np.array([BATTERY_CENTER_POS[0], BATTERY_CENTER_POS[1], BATTERY_CENTER_Z])
-
-                if isaac_node.busbar_align_last_stamp > busbar_align_last_used_stamp and \
-                        (time.time() - isaac_node.busbar_align_last_stamp) <= BUSBAR_ALIGNMENT_MAX_AGE:
-                    busbar_align_last_used_stamp = isaac_node.busbar_align_last_stamp
-                    yaw_aligner.update(math.degrees(isaac_node.busbar_align_dtheta))
-                    # XY도 yaw와 같은 프레임에서 같이 갱신 - 회전축에서 떨어진 지점은 yaw가
-                    # 계속 바뀌는 동안 XY를 한 번만 캡처해서 고정하면 그 뒤 yaw 보정 때문에
-                    # 다시 어긋난다 (assembly_nut_fraction1.py에서 실측 확인된 것과 동일 이유).
-                    target_fine_pos[0] = BATTERY_CENTER_POS[0] - isaac_node.busbar_align_dx
-                    target_fine_pos[1] = BATTERY_CENTER_POS[1] - isaac_node.busbar_align_dy
-                    target_fine_pos[2] = BATTERY_CENTER_Z
+                if isaac_node.latest_target_pose is not None:
+                    offset = isaac_node.latest_target_pose.pose.position
+                    offset_quat = isaac_node.latest_target_pose.pose.orientation
+                    if abs(offset.x) <= 0.0025 and abs(offset.y) <= 0.0025:
+                        target_fine_pos[0] += offset.x
+                        target_fine_pos[1] += offset.y
+                        target_fine_pos[2] = BATTERY_CENTER_Z
+                        # ★ 기존엔 orientation(yaw 스텝)을 통째로 무시하고 있었음 -
+                        # 쿼터니언에서 yaw만 뽑아 누적(±out_limit_deg로 clamp)한다.
+                        step_yaw_deg = math.degrees(2.0 * math.atan2(offset_quat.z, offset_quat.w))
+                        yaw_aligner.correction_deg = max(
+                            -yaw_aligner.out_limit_deg,
+                            min(yaw_aligner.out_limit_deg, yaw_aligner.correction_deg + step_yaw_deg)
+                        )
+                    isaac_node.latest_target_pose = None
 
                 quat_fine = yaw_rotated_quat(euler_to_quaternion_wxyz(0.0, 3.1415, 0.0), yaw_aligner.correction_deg)
 
@@ -851,17 +853,16 @@ def main():
                 robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_CLOSE))
                 glue_busbar_to_ee(robot, busbar_xform, busbar_start_grasp_pos, blend=1.0)
 
-                cur_ee_pos = world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation()
-                current_err = math.dist(cur_ee_pos, tuple(target_fine_pos))
-
                 if step_count % 30 == 0:
+                    cur_ee_pos = world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation()
                     print(f"    [FINE_ALIGNMENT] cur=({cur_ee_pos[0]:.4f},{cur_ee_pos[1]:.4f}) "
                           f"target=({target_fine_pos[0]:.4f},{target_fine_pos[1]:.4f}) "
-                          f"yaw_corr={yaw_aligner.correction_deg:+.2f}deg err={current_err*1000:.1f}mm")
+                          f"yaw_corr={yaw_aligner.correction_deg:+.2f}deg")
 
-                if current_err < INSERT_TOLERANCE_STRICT or (current_err < PICK_TOLERANCE_LOOSE_VAL and step_count > MAX_STUCK_STEPS):
-                    print(f"\n★ [FINE_ALIGNMENT SUCCESS] 미세 오차 보정 완료 (err={current_err*1000:.1f}mm, "
-                          f"yaw_corr={yaw_aligner.correction_deg:+.2f}deg)")
+                if isaac_node.alignment_success:
+                    print(f"\n★ [FINE_ALIGNMENT SUCCESS] 미세 오차 보정 성공 및 정렬 완료! "
+                          f"(yaw_corr={yaw_aligner.correction_deg:+.2f}deg)")
+                    isaac_node.alignment_success = False
                     publish_progress("FINE_ALIGNMENT_COMPLETE", 100.0)
                     publish_status("SUCCESS")
                     phase = "IDLE"
@@ -872,16 +873,11 @@ def main():
 
                 descend_target_z = max(descend_target_z - INSERT_SPEED, target_mid_pos[2])
 
-                # ★ FINE_ALIGNMENT와 동일하게 하강 중에도 XY/yaw를 계속 실시간 갱신
-                # (assembly_nut_fraction1.py의 BUSBAR_DESCEND_TO_BOLT와 동일 이유).
-                if isaac_node.busbar_align_last_stamp > busbar_align_last_used_stamp and \
-                        (time.time() - isaac_node.busbar_align_last_stamp) <= BUSBAR_ALIGNMENT_MAX_AGE:
-                    busbar_align_last_used_stamp = isaac_node.busbar_align_last_stamp
-                    yaw_aligner.update(math.degrees(isaac_node.busbar_align_dtheta))
-                    if BATTERY_CENTER_POS is not None:
-                        target_mid_pos[0] = BATTERY_CENTER_POS[0] - isaac_node.busbar_align_dx
-                        target_mid_pos[1] = BATTERY_CENTER_POS[1] - isaac_node.busbar_align_dy
-
+                # ★ error_fix.py는 ALIGNMENT_SUCCESS를 보내고 나면 is_active=False가 되어
+                # 더 이상 /target_pose를 안 보낸다 - 하강 중엔 새 보정이 안 들어오는 게
+                # 정상이라 XY는 FINE_ALIGNMENT에서 확정된 target_mid_pos를 그대로 쓴다.
+                # yaw만 FINE_ALIGNMENT에서 얻은 보정각을 그대로 유지해서 하강 내내 적용한다
+                # (기존엔 하강 시작하자마자 0도로 초기화돼서 애써 맞춘 각도가 사라졌었음).
                 step_target_pos = np.array([target_mid_pos[0], target_mid_pos[1], descend_target_z])
                 quat_fine = yaw_rotated_quat(euler_to_quaternion_wxyz(0.0, 3.1415, 0.0), yaw_aligner.correction_deg)
 
