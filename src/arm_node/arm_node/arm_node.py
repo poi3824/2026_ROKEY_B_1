@@ -15,6 +15,7 @@ arm_node.py - ROS 2 Arm Control Node (MultiThreaded Executor & Reentrant Group)
 """
 
 import time
+import traceback
 import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionServer
@@ -119,9 +120,30 @@ class ArmNode(Node):
     # Action Callback
     # =========================================================================
     def execute_callback(self, goal_handle):
+        """_execute_task를 감싸는 최상위 안전망 - 예상 못 한 예외가 나도 goal_handle이
+        succeed/abort 없이 방치되는 걸 막는다. 이게 없으면 예외 한 번에 behavior_node가
+        goal 결과를 영원히 못 받고 멈추게 된다."""
+        task_type = goal_handle.request.task_type
+        try:
+            return self._execute_task(goal_handle)
+        except Exception as e:
+            self.get_logger().error(
+                f" -> [{task_type}] 처리 중 예상치 못한 예외 발생: {e!r}\n{traceback.format_exc()}"
+            )
+            result_msg = ExecuteArmTask.Result()
+            result_msg.success = False
+            result_msg.error_code = "UNEXPECTED_EXCEPTION"
+            result_msg.message = f"예외 발생: {e}"
+            try:
+                goal_handle.abort()
+            except Exception:
+                pass  # 이미 succeed/abort/cancel된 상태일 수 있음 - 결과는 그대로 반환
+            return result_msg
+
+    def _execute_task(self, goal_handle):
         task_type = goal_handle.request.task_type
         self.get_logger().info(f"\n================ [Action Goal Received: {task_type}] ================")
-        
+
         feedback_msg = ExecuteArmTask.Feedback()
         result_msg = ExecuteArmTask.Result()
         self.isaac_status = None
