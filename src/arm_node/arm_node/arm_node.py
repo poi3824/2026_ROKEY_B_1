@@ -23,6 +23,8 @@ from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from geometry_msgs.msg import PoseStamped
 from std_msgs.msg import String, Float32
+from rcl_interfaces.srv import SetParameters
+from rcl_interfaces.msg import Parameter, ParameterValue, ParameterType
 
 # Action 및 Custom Interfaces
 from fms_interfaces.action import ExecuteArmTask
@@ -55,6 +57,12 @@ class ArmNode(Node):
         )
         self.client_get_bolt_pair = self.create_client(
             GetBoltPair, '/perception/get_bolt_pair', callback_group=self.cb_group
+        )
+        # perception_node의 use_bolt_roi 파라미터를 원격으로 켜고 끄기 위한 표준
+        # ROS2 파라미터 서비스 클라이언트 (perception_node가 'perception_node'라는
+        # 이름으로 뜨므로 자동 생성되는 서비스 경로).
+        self.client_set_perception_params = self.create_client(
+            SetParameters, '/perception_node/set_parameters', callback_group=self.cb_group
         )
 
         # 3. Perception Node 토픽 백업 구독
@@ -574,6 +582,32 @@ class ArmNode(Node):
 
         return False, None, res.message if res else "GetBoltPair 수신 결과 없음"
 
+    def _set_perception_bolt_roi(self, enabled: bool, timeout_sec: float = 2.0) -> bool:
+        """perception_node의 use_bolt_roi 파라미터를 원격으로 켜고 끈다.
+        SCAN_BATTERY(배터리 전체를 넓게 찍는 구도)용으로 튜닝된 고정 픽셀 ROI가,
+        구도가 다른 시점(예: ASSEMBLE_NUT - 팔이 볼트 바로 위 0도 자세라 화면이
+        반대로 들어감)에 get_bolt_pair를 호출할 때 정상 검출을 막지 않도록 임시로
+        끄기 위함. 실패해도 비치명적(호출부에서 로그만 남기고 그대로 진행)."""
+        if not self.client_set_perception_params.wait_for_service(timeout_sec=timeout_sec):
+            self.get_logger().warn("perception_node set_parameters 서비스 응답 없음 - ROI 전환 스킵")
+            return False
+
+        req = SetParameters.Request()
+        param = Parameter()
+        param.name = 'use_bolt_roi'
+        param.value = ParameterValue(type=ParameterType.PARAMETER_BOOL, bool_value=enabled)
+        req.parameters = [param]
+
+        future = self.client_set_perception_params.call_async(req)
+        start = time.time()
+        while not future.done():
+            if time.time() - start > timeout_sec:
+                self.get_logger().warn("perception_node use_bolt_roi 설정 시간 초과")
+                return False
+            time.sleep(0.05)
+
+        return future.result() is not None
+
     def request_bolt_pose_by_index_async(self, nut_index: int, timeout_sec: float = 5.0):
         """너트 체결(ASSEMBLE_NUT1/2) 직전에 get_bolt_pair로 실측한 볼트 좌표를 nut_index에
         매칭해서 반환한다. get_bolt_pair는 A/B 두 볼트를 이전 tick과의 최근접 매칭으로만
@@ -592,30 +626,38 @@ class ArmNode(Node):
         expected_x = center.x + offset[0]
         expected_y = center.y + offset[1]
 
-        if not self.client_get_bolt_pair.wait_for_service(timeout_sec=2.0):
-            return False, None, "GetBoltPair 서비스 응답 없음 (Timeout)"
+        # ASSEMBLE_NUT 시점엔 화면 구도가 SCAN_BATTERY와 달라(0도 자세) bolt ROI가
+        # 정상 볼트까지 걸러버릴 수 있어서, get_bolt_pair 호출 동안만 꺼뒀다가 끝나면
+        # 반드시(성공/실패 무관하게) 복원한다.
+        roi_was_disabled = self._set_perception_bolt_roi(False)
+        try:
+            if not self.client_get_bolt_pair.wait_for_service(timeout_sec=2.0):
+                return False, None, "GetBoltPair 서비스 응답 없음 (Timeout)"
 
-        req = GetBoltPair.Request()
-        future = self.client_get_bolt_pair.call_async(req)
+            req = GetBoltPair.Request()
+            future = self.client_get_bolt_pair.call_async(req)
 
-        start = time.time()
-        while not future.done():
-            if time.time() - start > timeout_sec:
-                return False, None, "GetBoltPair 서비스 호출 시간 초과"
-            time.sleep(0.05)
+            start = time.time()
+            while not future.done():
+                if time.time() - start > timeout_sec:
+                    return False, None, "GetBoltPair 서비스 호출 시간 초과"
+                time.sleep(0.05)
 
-        res = future.result()
-        if res is None or not res.found:
-            return False, None, res.message if res else "GetBoltPair 수신 결과 없음"
+            res = future.result()
+            if res is None or not res.found:
+                return False, None, res.message if res else "GetBoltPair 수신 결과 없음"
 
-        pos_a = res.pose_a.pose.position
-        pos_b = res.pose_b.pose.position
-        dist_a = math.hypot(pos_a.x - expected_x, pos_a.y - expected_y)
-        dist_b = math.hypot(pos_b.x - expected_x, pos_b.y - expected_y)
-        matched = res.pose_a if dist_a <= dist_b else res.pose_b
-        matched_dist = min(dist_a, dist_b)
+            pos_a = res.pose_a.pose.position
+            pos_b = res.pose_b.pose.position
+            dist_a = math.hypot(pos_a.x - expected_x, pos_a.y - expected_y)
+            dist_b = math.hypot(pos_b.x - expected_x, pos_b.y - expected_y)
+            matched = res.pose_a if dist_a <= dist_b else res.pose_b
+            matched_dist = min(dist_a, dist_b)
 
-        return True, matched, f"{res.message} (예상좌표 대비 매칭거리 {matched_dist:.4f}m)"
+            return True, matched, f"{res.message} (예상좌표 대비 매칭거리 {matched_dist:.4f}m)"
+        finally:
+            if roi_was_disabled:
+                self._set_perception_bolt_roi(True)
 
     def request_vision_pose_async(self, target_label: str, timeout_sec: float = 3.0,
                                    retry_timeout_sec: float = 0.0, retry_interval_sec: float = 0.3):
