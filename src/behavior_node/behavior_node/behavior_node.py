@@ -72,7 +72,7 @@ class BehaviorNode(Node):
         self._fleet_report_pub = self.create_publisher(
             FleetReport, '/fleet/report', 10)
 
-        self.declare_parameter('work_station', 'station_3')
+        self.declare_parameter('work_station', 'station_4')
         self.declare_parameter('amr_move_timeout_sec', 120.0)
         self.declare_parameter('auto_start', False)
         self._work_station = self.get_parameter('work_station').value
