@@ -1,22 +1,32 @@
 """
-01_pick_and_lift.py / 10_busbar_assembly.py (Full Busbar Assembly + Physical Nut Screwing Version)
+01_pick_and_lift.py / 10_busbar_assembly.py (Physically Active Nut Gripping Version + Vision + 버스바 복원)
 ─ AMR 베이스 잠금
 ─ [재시작 초기화 보정] Stop 후 Play 시 너트 및 버스바 위치 초기화 강제 적용
-─ [버스바 공정 활성화] 버스바 픽앤플레이스/체결 -> 너트 1번 체결 -> 너트 2번 체결 전체 시퀀스 통합
-─ [너트 물리 유지] 너트 파지 시 실제 물리 파지 적용
+─ [너트 물리 유지] 너트 파지 시 disable_physics_recursively 및 glue_nut_to_ee 미사용 (실제 물리 파지)
+─ [버스바 복원] origin/assembly의 원래 버전은 버스바 시퀀스를 우회했으나(재시작 핸들러는
+  원래부터 BUSBAR_APPROACH로 리셋했음 - 우회는 초기 phase 한 줄뿐이었다) 여기서는 복원해
+  버스바 장착 -> 너트1 체결 -> 너트2 체결 전체 파이프라인을 돈다.
+─ [비전 연동, 폴백 없음] rclpy로 별도 프로세스의 perception_node(busbar_cam/bolt_cam 각
+  인스턴스)를 표준 geometry_msgs/PoseStamped 토픽으로 구독(fms_interfaces 커스텀
+  msg/srv는 Isaac 내장 rclpy와 Python 버전이 달라 import 불가 - 실측 확인) -
+  BUSBAR_APPROACH_POS/BUSBAR_PICK_POS는 /vision/busbar_grasp_pose, BOLT1_POS/BOLT2_POS는
+  /vision/bolt_a_pose·bolt_b_pose로 대체한다. 하드코딩 값으로 조용히 넘어가지 않는다 -
+  검출될 때까지 무기한 대기하고, 검출되면 하드코딩 값과의 차이(mm)만 로그로 남긴다
+  (resolve_vision_positions). 같은 프로세스에 YOLO(ultralytics/torch)를 얹지 않는다 -
+  yaw_sweep_render.py가 이미 문서화한 대로 Isaac Sim 번들
+  파이썬과 의존성 충돌 위험이 있어, execute_isaac.py와 동일하게 rclpy만 이 프로세스에
+  두고 실제 추론은 별도 python3 프로세스(perception_node)에 맡긴다.
 ─ [수정 완료] Screwing Regrasp 시 상공 상승(+0.05m) 후 역회전/하강 적용
 ─ [수정 완료] 너트 1, 2번 체결 후 상공(Z=0.8m)에서 6번 조인트를 정확히 0도가 되도록 Unwind 적용
-─ [추가 완료] TCP Z 높이 0.37m 이하 조건 추가: 토크 및 Z축 Sticking 감지 시 Screwing 조기 종료 및 그리퍼 해제
+─ [추가 완료] TCP Z 높이 0.37m 이하 조건 추가: 토크 및 Z축 Sticking 감지 시 Screwing 조기 종료 및 그리퍼 해제 (튕김 방지)
 ─ [수정 완료] Screwing Regrasp 하강/재파지 시 Z축 높이를 미세(3mm) 상승 적용
-─ [기능 추가] 버스바/볼트/너트 물리 마찰력(Static/Dynamic Friction, Restitution) 설정 적용
-─ [오류 수정] SimulationApp 구동 후 다중 sys.path 등록으로 ModuleNotFoundError 완벽 예방
+─ [수정 완료] Nut1 체결 후 Retract 시 오리엔테이션 매개변수 오류 수정 및 팔 꼬임 방지 보정
 """
 
 import os
 import sys
 import math
 import gc
-import csv
 import time
 from pathlib import Path
 
@@ -26,48 +36,16 @@ from isaacsim import SimulationApp
 _HEADLESS = os.environ.get("AMR_HEADLESS") == "1"
 simulation_app = SimulationApp({"headless": _HEADLESS})
 
-# ROS2 Bridge 활성화 (execute_isaac.py / assembly_vision.py와 동일 패턴 -
-# "isaacsim.ros2.bridge"는 import는 성공하지만 enable_extension이 조용히 no-op되어
-# rclpy가 로드되지 않는 환경이 확인됨. 실제로 rclpy를 사용하려면 이 방식이어야 함)
 from omni.isaac.core.utils.extensions import enable_extension
 enable_extension("omni.isaac.ros2_bridge")
+
 simulation_app.update()
+
 sys.stdout.reconfigure(line_buffering=True)
-
-import rclpy
-from rclpy.node import Node
-from geometry_msgs.msg import Twist
-
-# ══════════════════════════════════════════════════════════════════════════
-# ★ 다중 경로 자동 탐색 (Isaac Sim 초기화 시 경로 리셋 및 위치 불일치 예방) ★
-# ══════════════════════════════════════════════════════════════════════════
-_THIS_DIR = Path(__file__).resolve().parent
-candidate_paths = [
-    _THIS_DIR,
-    _THIS_DIR / "rmpflow",
-    Path("/home/rokey/junhyeok_version/isaacpjt/M0609"),
-    Path("/home/rokey/junhyeok_version/isaacpjt/M0609/rmpflow"),
-    Path("/home/rokey/isaac_nut/isaacpjt/M0609/rmpflow"),
-    Path("/home/rokey/EV_combine/src/rmpflow"),
-]
-
-for p in candidate_paths:
-    if p.exists() and str(p) not in sys.path:
-        sys.path.insert(0, str(p))
-
-try:
-    from m0609_rmpflow_controller import RMPFlowController  # noqa: E402
-except ModuleNotFoundError:
-    try:
-        from rmpflow.m0609_rmpflow_controller import RMPFlowController  # noqa: E402
-    except ModuleNotFoundError as e:
-        print(f"\n[ERROR] RMPFlowController 모듈을 찾지 못했습니다!")
-        print(f"탐색 경로: {[str(cp) for cp in candidate_paths]}")
-        raise e
 
 import numpy as np
 import omni.usd
-from pxr import Usd, UsdGeom, UsdPhysics, PhysxSchema, UsdShade, Gf, Sdf
+from pxr import Usd, UsdGeom, UsdPhysics, Gf
 from scipy.spatial.transform import Rotation as R
 
 from isaacsim.core.api import World
@@ -76,10 +54,28 @@ from isaacsim.robot.manipulators.grippers import ParallelGripper
 from isaacsim.robot.manipulators.manipulators import SingleManipulator
 from isaacsim.core.utils.types import ArticulationAction
 
+# 비전 연동: 같은 프로세스에 YOLO(ultralytics/torch)를 얹지 않는다 - isaacpjt/M0609/
+# yaw_sweep_render.py가 이미 문서화한 대로 Isaac Sim 번들 파이썬과 의존성이 충돌할
+# 위험이 있다. execute_isaac.py와 동일한 패턴으로 rclpy만 이 프로세스에 두고, 실제
+# YOLO 추론은 별도 python3 프로세스(src/perception_node, ultralytics 포함)에 맡긴 뒤
+# ROS2 토픽/서비스로 결과만 받는다.
+import rclpy  # noqa: E402
+from rclpy.node import Node  # noqa: E402
+from geometry_msgs.msg import PoseStamped  # noqa: E402
+# 주의: fms_interfaces(커스텀 msg/srv)는 여기서 import하지 않는다. Isaac Sim 내장
+# rclpy(kit python 3.11)는 시스템 콜론 워크스페이스(python 3.10용으로 빌드됨)의
+# 커스텀 패키지를 ABI 불일치로 import할 수 없다(source setup.bash로도 해결 안 됨,
+# 내장 rclpy는 PYTHONPATH를 참조하지 않는다 - 실측 확인됨: ModuleNotFoundError).
+# 그래서 perception_node가 병행 발행하는 표준 geometry_msgs/PoseStamped 토픽만 쓴다.
+
+_THIS_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(_THIS_DIR / "rmpflow"))
+from m0609_rmpflow_controller import RMPFlowController  # noqa: E402
+
 # ══════════════════════════════════════════════════════════════════════════
 #  [A] 설정 및 파라미터
 # ══════════════════════════════════════════════════════════════════════════
-USD_PATH = "/home/rokey/EV_combine/src/Collected_Busbar/Busbar.usd"
+USD_PATH = "/home/rokey/EV_combine/src/Collected_World_0123/World0123.usd"
 
 NOVA_CARTER_ROOT = "/World/Nova_Carter/chassis_link"
 M0609_PATH       = "/World/m0609"
@@ -95,15 +91,6 @@ NUT1_ROOT_PATH      = "/World/nut1"
 NUT2_ROOT_PATH      = "/World/nut2"
 NUT1_POLYSHAPE_PATH = "/World/nut1/geo/PolyShape"
 NUT2_POLYSHAPE_PATH = "/World/nut2/geo/PolyShape"
-
-# 볼트 Prim 경로
-BOLT1_ROOT_PATH     = "/World/bolt1"
-BOLT2_ROOT_PATH     = "/World/bolt2"
-
-# ★ [물리 마찰력 설정 파라미터] ★
-BOLT_NUT_STATIC_FRICTION  = 1.0   # 정적 마찰 계수
-BOLT_NUT_DYNAMIC_FRICTION = 1.0   # 동적 마찰 계수
-BOLT_NUT_RESTITUTION       = 0.0   # 반발 계수
 
 # 그리퍼 파라미터
 GRIPPER_OPEN      = np.array([0.0, 0.0])
@@ -121,7 +108,8 @@ BUSBAR_REST_ORIENTATION = np.array([0.5, -0.5, 0.5, 0.5])
 NUT_HEIGHT = 0.0095
 NUT_GRASP_Z_LOCAL = NUT_HEIGHT + 0.023
 
-# ★ 버스바 및 체결 중심 파라미터 ★
+# ★ 버스바 및 체결 중심 파라미터 (하드코딩 기본값 - resolve_vision_positions가
+# busbar_cam 검출값이 있으면 덮어씀) ★
 _POS_GRAB_PICK          = np.array([0.5136, 0.7299, 0.455])
 BUSBAR_APPROACH_POS     = _POS_GRAB_PICK + np.array([0.0, 0.0, 0.145])
 BUSBAR_PICK_POS         = _POS_GRAB_PICK.copy()
@@ -131,7 +119,7 @@ target_mid_pos          = np.array([1.1606, 0.1836, 0.0693])
 TARGET_DESTINATION_POS  = np.array([target_mid_pos[0], target_mid_pos[1], 0.6])
 TARGET_INSERT_POS       = np.array([target_mid_pos[0], target_mid_pos[1], target_mid_pos[2]])
 
-# ★ ArmNode 허용 오차 조건 ★
+# ★ ArmNode 원본 오차 조건 ★
 PICK_TOLERANCE_STRICT   = 0.01     # Pick 단계: 0.01m (10mm)
 INSERT_TOLERANCE_STRICT = 0.001    # Insert 단계: 0.001m (1mm)
 BUSBAR_RELEASE_Z        = 0.37     # 그리퍼 해제 임계 높이
@@ -139,9 +127,6 @@ INSERT_SPEED            = 0.0005   # Step당 수직 하강 거리
 
 PICK_TOLERANCE_LOOSE_VAL = 0.015
 MAX_STUCK_STEPS          = 60
-
-# ★ 비전 정렬 보정(error_fix_depth.py의 /busbar_alignment_error) 유효 시간 ★
-BUSBAR_ALIGNMENT_MAX_AGE = 1.0   # 초 단위, 이보다 오래된 보정값은 사용하지 않고 기본 좌표로 폴백
 
 # ★ 볼트 좌표 ★
 BOLT1_POS = np.array([1.0576, 0.3653, 0.152])
@@ -162,39 +147,19 @@ BOLT2_TOUCH_POS    = np.array([BOLT2_POS[0], BOLT2_POS[1], BOLT2_POS[2] + EE_OFF
 
 # 체결(SCREW) 파라미터
 ENGAGE_LEN        = 0.0125    # 체결 깊이 (12.5mm)
-SCREW_TURNS_DEG   = 350.0     # 1패스당 350도
-SCREW_OMEGA_DEG_S = 240.0     # 초당 240도 회전 (실제 피치 적용으로 늘어난 회전수 보상, 2배 가속)
+SCREW_TURNS_DEG   = 350.0     # 1회전당 350도
+REGRASP_CYCLES    = 1         # 총 2회전
+SCREW_OMEGA_DEG_S = 120.0     # 초당 120도 회전
 PHYSICS_DT        = 1.0 / 60.0
 REGRASP_LIFT_HEIGHT = 0.05    # Regrasp 시 수직 상승 높이 (5cm)
 REGRASP_Z_OFFSET    = 0.005   # Regrasp 하강/재파지 시 너트를 잡는 위치 보정 높이 (3mm 상승)
 
-# ★ 나사산 피치를 bolt.usd 메쉬에서 직접 실측(고정각도 슬라이스, root-to-root 간격)해서
-#   사용한다 - 기존엔 ENGAGE_LEN을 임의 회전수(2회전)로 나눠 역산한 가짜 피치였고,
-#   실제 나사산 형상/간섭과 무관했다(그래서 체결 중 반력 토크가 거의 0이었음).
-#   bolt.usd 자체(mm 단위) 실측 피치=0.9066mm/rev, 메이저지름=6.35mm(1/4인치) ->
-#   1/4인치-28 UNF 이론 피치(25.4/28=0.9071mm)와 거의 정확히 일치.
-#   다만 World0123.usd에서 nut1/nut2는 이 원본 자산 대비 1.78배로 스케일돼 배치돼
-#   있어(실측), 실제 체결 대상 크기에 맞춰 그 배율을 반영한다.
-_BOLT_NATIVE_PITCH_M = (25.4 / 28.0) / 1000.0   # 1/4인치-28 UNF 이론 피치(m)
-_NUT_WORLD_SCALE     = 1.78                     # World0123.usd nut1/nut2 xformOp:scale 실측값
-NUT_PITCH_M = _BOLT_NATIVE_PITCH_M * _NUT_WORLD_SCALE   # ≈ 1.6147mm/rev
-
-# 실제 피치로 ENGAGE_LEN까지 도달하는 데 필요한 회전수를 역산해 REGRASP_CYCLES를 정한다
-# (기존엔 회전수를 고정하고 피치를 거꾸로 맞췄지만, 이제 피치가 실측 고정값이므로 반대 방향).
-# +1패스는 부동소수 오차/여유 마진 - depth_m >= ENGAGE_LEN 도달 시 그 전에 조기 종료된다.
-_TOTAL_REV_NEEDED = ENGAGE_LEN / NUT_PITCH_M                              # ≈ 7.74회전
-REGRASP_CYCLES    = math.ceil(_TOTAL_REV_NEEDED * 360.0 / SCREW_TURNS_DEG)  # ≈ 8 (총 9패스)
+TOTAL_REV   = (SCREW_TURNS_DEG / 360.0) * (1 + REGRASP_CYCLES)
+NUT_PITCH_M = ENGAGE_LEN / TOTAL_REV
 
 # ★ 완착/토크 감지 파라미터 ★
 TORQUE_THRESHOLD      = 45.0   # 6번 조인트 반력 임계값 (Nm)
-# STUCK_Z_DELTA_THRESH: 실제 나사산 피치 적용 후 회전당 Z 하강량이 훨씬 작아져서
-# (기존 가짜 피치 6.43mm/rev -> 실측 1.61mm/rev) 고정값(0.1mm)을 쓰면 정상 진행 중
-# 스텝당 하강량(≈0.018mm)마저 이 값보다 작아 매 스텝 stuck_counter가 증가하고, 결국
-# 목표 깊이(12.5mm)의 절반(6.22mm)도 못 가서 조기 완착으로 오검출됨(실측 확인).
-# SCREW_OMEGA_DEG_S/NUT_PITCH_M이 나중에 또 바뀌어도 항상 유효하도록, 정상 진행 시
-# 스텝당 예상 하강량의 30%를 기준으로 동적 계산한다(진짜 정체는 이보다 훨씬 작음).
-_NOMINAL_Z_STEP_M     = (SCREW_OMEGA_DEG_S * PHYSICS_DT / 360.0) * NUT_PITCH_M
-STUCK_Z_DELTA_THRESH  = 0.3 * _NOMINAL_Z_STEP_M  # ≈ 5.4um
+STUCK_Z_DELTA_THRESH  = 0.0001  # Z축 하강 멈춤 판정 기준 (0.1mm)
 STUCK_STEP_LIMIT      = 12      # Z축 변화 없이 토크 지속되는 Step 수
 TCP_FORCE_CHECK_Z     = 0.378   # TCP(EE) 높이가 0.37m 이하일 때만 힘/토크 감지 활성화
 
@@ -202,77 +167,122 @@ URDF_PATH        = str(_THIS_DIR / "doosan-robot2/urdf/m0609_isaac_sim.urdf")
 ROBOT_DESC_PATH  = str(_THIS_DIR / "rmpflow/m0609_description.yaml")
 RMPFLOW_CFG_PATH = str(_THIS_DIR / "rmpflow/m0609_rmpflow_common.yaml")
 
-# ★ Screwing 체결 로그 저장 경로 (후처리 시각화용, plot_screw_log.py 참고) ★
-LOG_DIR       = _THIS_DIR / "logs"
-SCREW_LOG_CSV = LOG_DIR / "screw_log.csv"
-SCREW_LOG_FIELDS = ["nut_id", "step", "pass_idx", "theta_deg", "total_deg", "depth_mm", "tcp_z", "torque_nm", "stuck_counter", "seated"]
+# ★ 비전 연동 파라미터 ★ src/perception_node를 busbar_cam/bolt_cam 각각 별도
+# 인스턴스로(rgb_topic/depth_topic/camera_info_topic/camera_frame_override 파라미터만
+# 다르게, node 이름도 다르게) 띄워둬야 아래 토픽이 채워진다 - 실행 방법은
+# reposition_bolt_camera.py 옆의 실행 안내 참고. 하드코딩 좌표는 더 이상 폴백(대체
+# 사용)이 아니라 비교 기준으로만 쓴다 - 비전이 응답할 때까지 무기한 대기한다.
+# 퍼셉션이 안 떠 있으면 여기서 계속 멈춰 있는 게 의도된 동작(하드코딩으로 몰래
+# 넘어가서 비전이 실제로 동작하는지 착각하는 걸 막기 위함). 서비스(get_bolt_pair)
+# 대신 표준 geometry_msgs/PoseStamped 토픽만 쓴다 - fms_interfaces는 Isaac 내장
+# rclpy에서 import 불가(파일 상단 주석 참고).
+# 토픽명이 인스턴스 구분 없이 perception_node.py에 하드코딩돼 있어(퍼블리셔 코드
+# 참고), busbar_cam/bolt_cam 두 인스턴스를 네임스페이스 없이 그냥 띄우면 서로 다른
+# 카메라의 검출값이 같은 토픽에 뒤섞여 들어온다(실측: rosbag에서 busbar_grasp_pose에
+# 두 개의 완전히 다른 좌표가 500ms 주기로 번갈아 찍힘 -> "파지 위치가 무작위" 증상의
+# 원인). 그래서 각 perception_node 인스턴스는 -r __ns:=/busbar_cam,
+# -r __ns:=/bolt_cam 로 띄우고(실행 방법 문서 참고), 여기서는 그 네임스페이스가
+# 붙은 토픽만 구독한다.
+BUSBAR_GRASP_POSE_TOPIC = "/busbar_cam/vision/busbar_grasp_pose"
+BOLT_A_POSE_TOPIC = "/bolt_cam/vision/bolt_a_pose"
+BOLT_B_POSE_TOPIC = "/bolt_cam/vision/bolt_b_pose"
+VISION_POLL_LOG_SEC = 3.0   # "아직 대기 중" 로그 출력 간격
 
-# ★ YawAligner(PI) 실시간 모니터링 로그 저장 경로 (plot_yaw_align_log.py 참고) ★
-YAW_ALIGN_LOG_CSV = LOG_DIR / "yaw_align_log.csv"
-YAW_ALIGN_LOG_FIELDS = ["t_s", "step", "phase", "error_deg", "correction_deg", "dx_mm", "dy_mm", "saturated"]
+
+class VisionBridge(Node):
+    """assembly_nut_physics.py 전용 최소 rclpy 노드. YOLO 추론은 하지 않고,
+    별도 프로세스의 perception_node가 이미 계산해 발행하는 world 좌표(표준
+    geometry_msgs/PoseStamped)만 구독한다(같은 프로세스에 ultralytics를 얹지 않는
+    이유, fms_interfaces를 안 쓰는 이유는 파일 상단 주석 참고)."""
+
+    def __init__(self):
+        super().__init__("assembly_vision_bridge")
+        self.latest_busbar_xy = None  # (x, y) world, 최신 수신값
+        self.latest_bolt_a_xy = None
+        self.latest_bolt_b_xy = None
+        self._busbar_sub = self.create_subscription(
+            PoseStamped, BUSBAR_GRASP_POSE_TOPIC, self._on_busbar_pose, 10)
+        self._bolt_a_sub = self.create_subscription(
+            PoseStamped, BOLT_A_POSE_TOPIC, self._on_bolt_a_pose, 10)
+        self._bolt_b_sub = self.create_subscription(
+            PoseStamped, BOLT_B_POSE_TOPIC, self._on_bolt_b_pose, 10)
+
+    def _on_busbar_pose(self, msg: PoseStamped):
+        self.latest_busbar_xy = (msg.pose.position.x, msg.pose.position.y)
+
+    def _on_bolt_a_pose(self, msg: PoseStamped):
+        self.latest_bolt_a_xy = (msg.pose.position.x, msg.pose.position.y)
+
+    def _on_bolt_b_pose(self, msg: PoseStamped):
+        self.latest_bolt_b_xy = (msg.pose.position.x, msg.pose.position.y)
+
+
+def resolve_vision_positions(vision_node: "VisionBridge"):
+    """시작 시 1회, 비전 실측 좌표를 받을 때까지 무기한 대기한 뒤 BUSBAR_*_POS/
+    BOLT*_POS 및 파생 좌표를 덮어쓴다. 폴백 없음 - busbar_cam/bolt_cam
+    perception_node가 응답하기 전까지는 여기서 멈춰 있는다. 원래 하드코딩 값은
+    실제 목표로는 쓰지 않고, 검출값과 비교해 차이(mm)를 로그로만 남긴다."""
+    global BUSBAR_APPROACH_POS, BUSBAR_PICK_POS, BUSBAR_LIFT_MOVE_POS
+    global BOLT1_POS, BOLT2_POS, BOLT1_APPROACH_POS, BOLT1_TOUCH_POS
+    global BOLT2_APPROACH_POS, BOLT2_TOUCH_POS
+
+    hardcoded_busbar_xy = BUSBAR_PICK_POS[:2].copy()
+    hardcoded_bolt1_xy = BOLT1_POS[:2].copy()
+    hardcoded_bolt2_xy = BOLT2_POS[:2].copy()
+
+    print("[vision] busbar_cam 검출 대기 중 (perception_node busbar_cam 인스턴스 필요)...")
+    t0, last_log = time.time(), 0.0
+    while vision_node.latest_busbar_xy is None:
+        # simulation_app.update()를 안 부르면 Isaac Sim 자체 UI 이벤트 루프가 안 돌아서
+        # 뷰포트/조작이 먹통이 된다(대기 중에도 화면이 살아있어야 함) - 실측 확인된 버그.
+        simulation_app.update()
+        rclpy.spin_once(vision_node, timeout_sec=0.0)
+        if time.time() - last_log > VISION_POLL_LOG_SEC:
+            last_log = time.time()
+            print(f"  -> 아직 미검출... ({time.time() - t0:.0f}s 경과)")
+    busbar_xy = vision_node.latest_busbar_xy
+    diff_mm = (np.array(busbar_xy) - hardcoded_busbar_xy) * 1000.0
+    print(f"[vision] busbar 검출 좌표=({busbar_xy[0]:.4f},{busbar_xy[1]:.4f}) "
+          f"| 하드코딩 대비 차이=({diff_mm[0]:+.1f},{diff_mm[1]:+.1f})mm")
+    pick_z = BUSBAR_PICK_POS[2]
+    new_pick = np.array([busbar_xy[0], busbar_xy[1], pick_z])
+    BUSBAR_PICK_POS = new_pick
+    BUSBAR_APPROACH_POS = new_pick + np.array([0.0, 0.0, 0.145])
+    BUSBAR_LIFT_MOVE_POS = new_pick + np.array([0.0, 0.1, 0.145])
+
+    print("[vision] bolt_cam 볼트쌍 검출 대기 중 (perception_node bolt_cam 인스턴스 필요)...")
+    t0, last_log = time.time(), 0.0
+    while vision_node.latest_bolt_a_xy is None or vision_node.latest_bolt_b_xy is None:
+        simulation_app.update()
+        rclpy.spin_once(vision_node, timeout_sec=0.0)
+        if time.time() - last_log > VISION_POLL_LOG_SEC:
+            last_log = time.time()
+            print(f"  -> 아직 미검출... ({time.time() - t0:.0f}s 경과)")
+
+    cand_a = np.array(vision_node.latest_bolt_a_xy)
+    cand_b = np.array(vision_node.latest_bolt_b_xy)
+    d_same = np.linalg.norm(cand_a - hardcoded_bolt1_xy) + np.linalg.norm(cand_b - hardcoded_bolt2_xy)
+    d_cross = np.linalg.norm(cand_a - hardcoded_bolt2_xy) + np.linalg.norm(cand_b - hardcoded_bolt1_xy)
+    new_bolt1_xy, new_bolt2_xy = (cand_a, cand_b) if d_same <= d_cross else (cand_b, cand_a)
+    diff1_mm = (new_bolt1_xy - hardcoded_bolt1_xy) * 1000.0
+    diff2_mm = (new_bolt2_xy - hardcoded_bolt2_xy) * 1000.0
+    print(f"[vision] BOLT1 검출=({new_bolt1_xy[0]:.4f},{new_bolt1_xy[1]:.4f}) "
+          f"차이=({diff1_mm[0]:+.1f},{diff1_mm[1]:+.1f})mm | "
+          f"BOLT2 검출=({new_bolt2_xy[0]:.4f},{new_bolt2_xy[1]:.4f}) "
+          f"차이=({diff2_mm[0]:+.1f},{diff2_mm[1]:+.1f})mm")
+    BOLT1_POS = np.array([new_bolt1_xy[0], new_bolt1_xy[1], BOLT1_POS[2]])
+    BOLT2_POS = np.array([new_bolt2_xy[0], new_bolt2_xy[1], BOLT2_POS[2]])
+    BOLT1_APPROACH_POS = np.array([BOLT1_POS[0], BOLT1_POS[1], 0.6])
+    BOLT1_TOUCH_POS = np.array(
+        [BOLT1_POS[0], BOLT1_POS[1], BOLT1_POS[2] + EE_OFFSET[2] + NUT_GRASP_Z_LOCAL])
+    BOLT2_APPROACH_POS = np.array([BOLT2_POS[0], BOLT2_POS[1], 0.6])
+    BOLT2_TOUCH_POS = np.array(
+        [BOLT2_POS[0], BOLT2_POS[1], BOLT2_POS[2] + EE_OFFSET[2] + NUT_GRASP_Z_LOCAL])
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  [B] 헬퍼 및 Kinematic Pose-Glue / Screwing / 마찰력 생성 함수
+#  [B] 헬퍼 및 Kinematic Pose-Glue / Screwing 계산 함수
 # ══════════════════════════════════════════════════════════════════════════
-def set_physx_scene_limits(stage):
-    scene_prim = stage.GetPrimAtPath("/World/PhysicsScene")
-    if not scene_prim.IsValid():
-        scene_prim = stage.DefinePrim("/World/PhysicsScene", "PhysicsScene")
-
-    PhysxSchema.PhysxSceneAPI.Apply(scene_prim)
-
-    attr_max_patches = scene_prim.GetAttribute("physxScene:maxFrictionPatches")
-    if not attr_max_patches.IsValid():
-        attr_max_patches = scene_prim.CreateAttribute("physxScene:maxFrictionPatches", Sdf.ValueTypeNames.Int)
-    attr_max_patches.Set(128)
-
-    attr_gpu_found = scene_prim.GetAttribute("physxScene:gpuFoundLostPairsCapacity")
-    if not attr_gpu_found.IsValid():
-        attr_gpu_found = scene_prim.CreateAttribute("physxScene:gpuFoundLostPairsCapacity", Sdf.ValueTypeNames.Int)
-    attr_gpu_found.Set(2 ** 21)
-
-    attr_gpu_total = scene_prim.GetAttribute("physxScene:gpuTotalAggregatePairsCapacity")
-    if not attr_gpu_total.IsValid():
-        attr_gpu_total = scene_prim.CreateAttribute("physxScene:gpuTotalAggregatePairsCapacity", Sdf.ValueTypeNames.Int)
-    attr_gpu_total.Set(2 ** 21)
-
-    attr_time_steps = scene_prim.GetAttribute("physxScene:timeStepsPerSecond")
-    if not attr_time_steps.IsValid():
-        attr_time_steps = scene_prim.CreateAttribute("physxScene:timeStepsPerSecond", Sdf.ValueTypeNames.Int)
-    attr_time_steps.Set(int(1.0 / PHYSICS_DT))
-
-    print("[INFO] PhysX Scene 연산 한계 확장 완료 (MaxFrictionPatches: 128, GPU Buffers Expanded)")
-
-
-def set_friction_material(stage, material_path, target_prim_path, static_friction, dynamic_friction, restitution):
-    target_prim = stage.GetPrimAtPath(target_prim_path)
-    if not target_prim.IsValid():
-        return None
-
-    material_prim = stage.GetPrimAtPath(material_path)
-    if not material_prim.IsValid():
-        material_prim = stage.DefinePrim(material_path, "Material")
-
-    phys_mat_api = UsdPhysics.MaterialAPI.Apply(material_prim)
-    phys_mat_api.CreateStaticFrictionAttr(static_friction)
-    phys_mat_api.CreateDynamicFrictionAttr(dynamic_friction)
-    phys_mat_api.CreateRestitutionAttr(restitution)
-
-    physx_mat_api = PhysxSchema.PhysxMaterialAPI.Apply(material_prim)
-    physx_mat_api.CreateFrictionCombineModeAttr("average")
-    physx_mat_api.CreateRestitutionCombineModeAttr("average")
-
-    shade_material = UsdShade.Material(material_prim)
-    for prim in Usd.PrimRange(target_prim):
-        if prim.HasAPI(UsdPhysics.CollisionAPI):
-            binding_api = UsdShade.MaterialBindingAPI.Apply(prim)
-            binding_api.Bind(shade_material, UsdShade.Tokens.strongerThanDescendants, "physics")
-
-    print(f"[INFO] 마찰 재질 적용 완료 -> Prim: {target_prim_path} | Static: {static_friction}, Dynamic: {dynamic_friction}")
-    return material_prim
-
-
 def euler_to_quaternion_wxyz(roll, pitch, yaw):
     cy, sy = np.cos(yaw * 0.5), np.sin(yaw * 0.5)
     cp, sp = np.cos(pitch * 0.5), np.sin(pitch * 0.5)
@@ -376,76 +386,6 @@ def initialize_robot(robot, world):
     )
 
 
-class BusbarAlignmentListener(Node):
-    """error_fix_depth.py가 퍼블리시하는 /busbar_alignment_error(Twist)를 non-blocking으로 구독.
-    linear.xy = world dx,dy[m] (busbar 구멍 - 기준 볼트), angular.z = dTheta[rad].
-    """
-    def __init__(self):
-        super().__init__("assembly_alignment_listener")
-        self.dx = 0.0
-        self.dy = 0.0
-        self.dtheta = 0.0
-        self.last_stamp = 0.0
-        self.create_subscription(Twist, "/busbar_alignment_error", self._callback, 10)
-
-    def _callback(self, msg):
-        self.dx = msg.linear.x
-        self.dy = msg.linear.y
-        self.dtheta = msg.angular.z
-        self.last_stamp = time.time()
-
-class YawAligner:
-    """버스바 yaw 정렬 오차(dTheta)를 0으로 미는 증분형(incremental) PI 보정기.
-
-    이 문제는 "고정된 기하학적 오정렬(D) - 지금까지 명령한 누적 보정량(C)" = 잔여오차
-    구조라, 매 스텝 오차를 새로 계산해서 명령을 통째로 덮어쓰는 표준 위치형(positional)
-    PID는 맞지 않는다 - 시뮬레이션해보면 위치형 P만으로는 0으로 수렴하지 않고, D항은
-    물리스텝 dt(1/60s)에서 게인이 과도하게 커져 ±한계각에 튕기며 진동한다(RMPFlow
-    전달함수를 정식으로 동정하지 않고 D항을 썼을 때 실측됨).
-    대신 증분형(velocity-form) PI를 쓴다: 매 "새" 비전 샘플마다
-        C += Ki * error + Kp * (error - 직전 error)
-
-    ★ 게인은 감이 아니라 RMPFlow 실제 플랜트(목표 yaw 커맨드 -> EE 실제 yaw)의 스텝응답을
-    직접 측정해서 설계했다 (run_yaw_step_response_test/YAW_SYSID=1, logs/yaw_step_response.csv).
-    실측 결과: 오버슈트 없는 순수 1차계, 시간상수 τ≈0.283s, DC게인 K≈1.0.
-
-    ⚠ 주의: 이 τ=0.283s는 "커맨드→EE 실제 자세" 만 측정한 값이고, 실제 폐루프에는
-    로봇 이동→버스바 회전→카메라 촬영→OpenCV 처리(error_fix_depth1.py)→ROS 퍼블리시/
-    구독까지의 비전 왕복 지연시간(θ)이 추가로 들어간다. 이 θ를 측정하지 않고 θ=0으로
-    가정한 채 λ=τ/3(Kp=3.0)까지 대역폭을 밀어붙였더니 실측(2026-07-26)에서 진동 심화 +
-    정상상태 미수렴이 실제로 관측됨 - 미지의 지연시간이 있는 루프에서 λ를 과도하게
-    작게 잡으면 전형적으로 나타나는 증상. θ를 정식으로 재측정하기 전까지는 안전 마진이
-    큰 λ=τ(Kp=1.0)로 되돌린다.
-
-    SIMC 튜닝법(Skogestad, FOPDT): Kp = τ/(K·(λ+θ)), τI = min(τ, 4(λ+θ)).
-    λ=τ (θ=0 가정 시 가장 보수적인 선택, τ/1 ≥ τ/4라 τI=τ 그대로 적용):
-        Kp = τ/(K·λ) = τ/(K·τ) = 1/K = 1.0
-        Ki(연속) = Kp/τI = Kp/τ ≈ 3.534,  Ki(코드, 스텝당) = Ki(연속) × Δt(1/60s) ≈ 0.0589
-    로 산출 - 재시뮬레이션(실측 τ 기반 1차 플랜트 폐루프, θ=0 가정)에서 D=-1.86deg 기준
-    약 1.6초 안에 0.05deg 이하로 단조 수렴(오버슈트 없음)하는 것을 확인. 실제 θ>0이므로
-    이보다 다소 느리거나 약간의 오버슈트가 있을 수 있음 - 그래도 여전히 진동/발산하면
-    θ를 실측해서 다시 설계해야 한다.
-    """
-
-    def __init__(self, kp, ki, out_limit_deg):
-        self.kp = kp
-        self.ki = ki
-        self.out_limit_deg = out_limit_deg
-        self.correction_deg = 0.0
-        self.prev_error = None
-
-    def reset(self):
-        self.correction_deg = 0.0
-        self.prev_error = None
-
-    def update(self, error_deg):
-        delta_error = 0.0 if self.prev_error is None else (error_deg - self.prev_error)
-        self.correction_deg += self.ki * error_deg + self.kp * delta_error
-        self.correction_deg = max(-self.out_limit_deg, min(self.out_limit_deg, self.correction_deg))
-        self.prev_error = error_deg
-        return self.correction_deg
-
-
 def glue_busbar_to_ee(robot, busbar_xform, rest_pick_pos, blend):
     if busbar_xform is None or rest_pick_pos is None:
         return
@@ -456,41 +396,6 @@ def glue_busbar_to_ee(robot, busbar_xform, rest_pick_pos, blend):
 
     busbar_pos = rest_pick_pos + blend * (target_pos - rest_pick_pos)
     busbar_xform.set_world_pose(position=busbar_pos, orientation=np.asarray(ee_quat))
-
-
-def run_yaw_step_response_test(world, robot, arm_controller, hold_pos, quat_base, step_deg,
-                                hold_steps, log_steps, csv_path):
-    """YawAligner 게인을 감으로 잡지 않고, RMPFlow 실제 플랜트(목표 yaw 커맨드 -> EE 실제
-    yaw)의 스텝응답을 직접 측정해서 CSV로 남긴다 - 여기서 얻은 시간상수/게인으로 PI를
-    설계한다(YAW_SYSID=1 환경변수로만 실행되는 진단 전용 경로, 본 조립 시퀀스와 무관)."""
-    rows = []
-    # 1) 기준 자세로 정지 유지하며 정착 (스텝 인가 전 초기 과도응답 제거)
-    for _ in range(hold_steps):
-        actions = arm_controller.forward(target_end_effector_position=hold_pos, target_end_effector_orientation=quat_base)
-        robot.apply_action(actions)
-        world.step(render=False)
-
-    step_quat = yaw_rotated_quat(quat_base, step_deg)
-    r_base = R.from_quat([quat_base[1], quat_base[2], quat_base[3], quat_base[0]])
-
-    # 2) step_deg 만큼 목표 yaw를 계단형으로 바꾸고 EE 실제 yaw 응답을 매 스텝 로깅
-    for i in range(log_steps):
-        actions = arm_controller.forward(target_end_effector_position=hold_pos, target_end_effector_orientation=step_quat)
-        robot.apply_action(actions)
-        world.step(render=False)
-
-        _, actual_quat = robot.end_effector.get_world_pose()
-        r_actual = R.from_quat([actual_quat[1], actual_quat[2], actual_quat[3], actual_quat[0]])
-        r_rel = r_actual * r_base.inv()
-        yaw_deg = math.degrees(r_rel.as_rotvec()[2])
-        rows.append({"step": i, "t_s": i * PHYSICS_DT, "target_deg": step_deg, "actual_deg": yaw_deg})
-
-    csv_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(csv_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["step", "t_s", "target_deg", "actual_deg"])
-        writer.writeheader()
-        writer.writerows(rows)
-    print(f"[SYSID] yaw step-response 저장 완료 -> {csv_path} ({len(rows)} rows)")
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -512,20 +417,7 @@ def main():
 
     world = World(stage_units_in_meters=1.0, physics_dt=PHYSICS_DT)
 
-    set_physx_scene_limits(stage)
     lock_amr_base(stage, NOVA_CARTER_ROOT)
-
-    mat_path = "/World/Looks/BoltNutMaterial"
-    # 버스바(BUSBAR_ROOT_PATH) 포함 마찰 재질 적용
-    for target_path in [BUSBAR_ROOT_PATH, NUT1_ROOT_PATH, NUT2_ROOT_PATH, BOLT1_ROOT_PATH, BOLT2_ROOT_PATH]:
-        set_friction_material(
-            stage=stage,
-            material_path=mat_path,
-            target_prim_path=target_path,
-            static_friction=BOLT_NUT_STATIC_FRICTION,
-            dynamic_friction=BOLT_NUT_DYNAMIC_FRICTION,
-            restitution=BOLT_NUT_RESTITUTION,
-        )
 
     busbar_xform = SingleXFormPrim(BUSBAR_POLYSHAPE_PATH, name="busbar_poly") if stage.GetPrimAtPath(BUSBAR_POLYSHAPE_PATH).IsValid() else None
     nut1_xform   = SingleXFormPrim(NUT1_POLYSHAPE_PATH, name="nut1_poly") if stage.GetPrimAtPath(NUT1_POLYSHAPE_PATH).IsValid() else None
@@ -573,6 +465,12 @@ def main():
     q_nut   = rot_nut.as_quat()
     quat_nut = np.array([q_nut[3], q_nut[0], q_nut[1], q_nut[2]])
 
+    # 비전 연동: busbar_cam/bolt_cam 전용 perception_node 인스턴스를 구독해 시작 시
+    # 1회 위치를 실측 좌표로 덮어쓴다. 폴백 없음 - 둘 다 검출될 때까지 여기서 대기한다.
+    rclpy.init()
+    vision_node = VisionBridge()
+    resolve_vision_positions(vision_node)
+
     arm_controller = RMPFlowController(
         name="m0609_hardcoded_controller",
         robot_articulation=robot,
@@ -590,42 +488,21 @@ def main():
         robot_orientation=np.array([base_quat.GetReal(), *[float(x) for x in base_quat.GetImaginary()]]),
     )
 
-    if os.environ.get("YAW_SYSID") == "1":
-        print("[SYSID] Yaw 스텝응답 측정 모드 - 본 조립 시퀀스는 건너뜀")
-        run_yaw_step_response_test(
-            world, robot, arm_controller,
-            hold_pos=TARGET_DESTINATION_POS, quat_base=quat_busbar_0deg,
-            step_deg=5.0, hold_steps=120, log_steps=180,
-            csv_path=LOG_DIR / "yaw_step_response.csv",
-        )
-        simulation_app.close()
-        return
-
-    # ★ error_fix_depth.py가 퍼블리시하는 /busbar_alignment_error 구독용 non-blocking 리스너 ★
-    if not rclpy.ok():
-        rclpy.init()
-    alignment_listener = BusbarAlignmentListener()
-    # λ=τ 보수적 SIMC 설계값 (YawAligner 클래스 문서 참고 - 비전 왕복 지연시간을
-    # 아직 실측 못 해서 안전 마진을 크게 둠) - Kp=1.0, Ki=0.0589(스텝당).
-    # 출력은 ±15deg로 클램프해 급격한 점프 방지.
-    yaw_aligner = YawAligner(kp=1.0, ki=0.0589, out_limit_deg=15.0)
-    last_dtheta_stamp = 0.0
-    yaw_align_start_time = None  # yaw_aligner.reset() 시점에 찍는 기준 시각 (t_s 축 기준)
-
     print("[대기] Isaac Sim UI에서 Play 버튼을 누르면 시퀀스를 시작합니다.")
 
     step_count = 0
     grasp_timer = 0
     was_playing = False
-
-    # ★ [수정 완료] 버스바 장착 공정(BUSBAR_APPROACH)부터 시작되도록 복원 ★
+    
+    # 버스바 장착부터 전체 시퀀스 시작 (원래 이 버전은 너트 물리파지 검증을 위해
+    # 버스바를 건너뛰고 NUT1_APPROACH부터 시작했으나, 여기서는 전체 파이프라인을
+    # 돌리기 위해 복원한다 - 재시작 핸들러는 원래부터 BUSBAR_APPROACH로 리셋했다).
     phase = "BUSBAR_APPROACH"
     current_err = 0.0
 
     busbar_start_grasp_pos = None
     descend_target_z       = None
-    busbar_insert_xy       = TARGET_INSERT_POS[:2].copy()  # 비전 보정 적용 전 기본값 (하강 시점에 갱신됨)
-
+    
     screw_sub = "rotate"
     screw_pass_idx = 0
     screw_pass_theta = 0.0
@@ -638,19 +515,13 @@ def main():
     screw_regrasp_step = 0
     screw_unwind_deg = 0.0
 
-    # 완착 감지용 모니터링 변수
+    # ★ 완착 감지용 모니터링 변수 ★
     prev_ee_z = 0.0
     stuck_counter = 0
 
-    # ★ 체결(Screwing) 로그 버퍼 (torque-angle 등 후처리 시각화용) ★
-    screw_records = []
-
-    # ★ YawAligner(PI) 실시간 모니터링 로그 버퍼 (error/correction 수렴 확인용) ★
-    yaw_align_records = []
-
     while simulation_app.is_running():
         world.step(render=True)
-        rclpy.spin_once(alignment_listener, timeout_sec=0.0)
+        rclpy.spin_once(vision_node, timeout_sec=0.0)
         playing = world.is_playing()
 
         # Stop 후 Play 재시작 시
@@ -675,26 +546,22 @@ def main():
                 pass
             step_count = 0
             grasp_timer = 0
-            # 재시작 시에도 버스바 장착 공정부터 다시 시작
+            # ★ 재시작 시에도 너트 1번부터 시작 ★
             phase = "BUSBAR_APPROACH"
             current_err = 0.0
             busbar_start_grasp_pos = None
             descend_target_z       = None
-            busbar_insert_xy       = TARGET_INSERT_POS[:2].copy()
-
+            
             screw_sub = "rotate"
             screw_pass_idx = 0
             screw_pass_theta = 0.0
             stuck_counter = 0
-            screw_records = []
-            yaw_align_records = []
-            yaw_align_start_time = None
             print(f"\n[Play] 시퀀스 재시작 (모든 객체 포즈 및 오차 조건 초기화 완료)")
 
         if playing and phase != "DONE":
 
             # ════════════════════════════════════════════════════════════════
-            # [1] 버스바 픽앤플레이스 + 장착 시퀀스 (활성화 완료)
+            # [1] 버스바 픽앤플레이스 + 장착 시퀀스
             # ════════════════════════════════════════════════════════════════
             if phase == "BUSBAR_APPROACH":
                 actions = arm_controller.forward(target_end_effector_position=BUSBAR_APPROACH_POS, target_end_effector_orientation=quat_busbar)
@@ -757,40 +624,12 @@ def main():
                     step_count = 0
             
             elif phase == "MOVE_TO_BOLT_APPROACH":
-                if step_count == 0:
-                    yaw_aligner.reset()
-                    last_dtheta_stamp = 0.0
-                    yaw_align_start_time = time.time()
-                if alignment_listener.last_stamp > last_dtheta_stamp and \
-                        (time.time() - alignment_listener.last_stamp) <= BUSBAR_ALIGNMENT_MAX_AGE:
-                    last_dtheta_stamp = alignment_listener.last_stamp
-                    _raw_error_deg = math.degrees(alignment_listener.dtheta)
-                    yaw_aligner.update(_raw_error_deg)
-                    # XY도 yaw와 같은 프레임에서 같이 갱신 - 버스바 구멍은 회전축에서
-                    # 떨어져 있어서, yaw가 계속 바뀌는 동안 XY를 한 번만 캡처해서 고정하면
-                    # 그 뒤 yaw 보정 때문에 구멍 위치가 다시 어긋난다(실측 확인됨).
-                    busbar_insert_xy = np.array([
-                        TARGET_INSERT_POS[0] - alignment_listener.dx,
-                        TARGET_INSERT_POS[1] - alignment_listener.dy,
-                    ])
-                    yaw_align_records.append({
-                        "t_s": time.time() - yaw_align_start_time,
-                        "step": step_count,
-                        "phase": phase,
-                        "error_deg": _raw_error_deg,
-                        "correction_deg": yaw_aligner.correction_deg,
-                        "dx_mm": alignment_listener.dx * 1000.0,
-                        "dy_mm": alignment_listener.dy * 1000.0,
-                        "saturated": abs(yaw_aligner.correction_deg) >= yaw_aligner.out_limit_deg,
-                    })
-                quat_busbar_yawfix = yaw_rotated_quat(quat_busbar_0deg, yaw_aligner.correction_deg)
-
-                actions = arm_controller.forward(target_end_effector_position=TARGET_DESTINATION_POS, target_end_effector_orientation=quat_busbar_yawfix)
+                actions = arm_controller.forward(target_end_effector_position=TARGET_DESTINATION_POS, target_end_effector_orientation=quat_busbar_0deg)
                 robot.apply_action(actions)
                 robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_CLOSE))
-
+            
                 glue_busbar_to_ee(robot, busbar_xform, busbar_start_grasp_pos, blend=1.0)
-
+            
                 cur_pos = world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation()
                 current_err = math.dist(cur_pos, tuple(TARGET_DESTINATION_POS))
                 if current_err < INSERT_TOLERANCE_STRICT or (current_err < PICK_TOLERANCE_LOOSE_VAL and step_count > MAX_STUCK_STEPS):
@@ -798,43 +637,20 @@ def main():
                     phase = "BUSBAR_DESCEND_TO_BOLT"
                     step_count = 0
                     descend_target_z = TARGET_DESTINATION_POS[2]
-
+            
             elif phase == "BUSBAR_DESCEND_TO_BOLT":
                 descend_target_z = max(descend_target_z - INSERT_SPEED, TARGET_INSERT_POS[2])
-                step_target_pos = np.array([busbar_insert_xy[0], busbar_insert_xy[1], descend_target_z])
-
-                if alignment_listener.last_stamp > last_dtheta_stamp and \
-                        (time.time() - alignment_listener.last_stamp) <= BUSBAR_ALIGNMENT_MAX_AGE:
-                    last_dtheta_stamp = alignment_listener.last_stamp
-                    _raw_error_deg = math.degrees(alignment_listener.dtheta)
-                    yaw_aligner.update(_raw_error_deg)
-                    # 하강 중에도 XY를 계속 실시간으로 추적(위와 동일한 이유)
-                    busbar_insert_xy = np.array([
-                        TARGET_INSERT_POS[0] - alignment_listener.dx,
-                        TARGET_INSERT_POS[1] - alignment_listener.dy,
-                    ])
-                    yaw_align_records.append({
-                        "t_s": time.time() - yaw_align_start_time,
-                        "step": step_count,
-                        "phase": phase,
-                        "error_deg": _raw_error_deg,
-                        "correction_deg": yaw_aligner.correction_deg,
-                        "dx_mm": alignment_listener.dx * 1000.0,
-                        "dy_mm": alignment_listener.dy * 1000.0,
-                        "saturated": abs(yaw_aligner.correction_deg) >= yaw_aligner.out_limit_deg,
-                    })
-                quat_busbar_yawfix = yaw_rotated_quat(quat_busbar_0deg, yaw_aligner.correction_deg)
-
-                actions = arm_controller.forward(target_end_effector_position=step_target_pos, target_end_effector_orientation=quat_busbar_yawfix)
+                step_target_pos = np.array([TARGET_INSERT_POS[0], TARGET_INSERT_POS[1], descend_target_z])
+            
+                actions = arm_controller.forward(target_end_effector_position=step_target_pos, target_end_effector_orientation=quat_busbar_0deg)
                 robot.apply_action(actions)
                 robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_CLOSE))
-
+            
                 glue_busbar_to_ee(robot, busbar_xform, busbar_start_grasp_pos, blend=1.0)
-
+            
                 cur_pos = world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation()
-                corrected_insert_pos = np.array([busbar_insert_xy[0], busbar_insert_xy[1], TARGET_INSERT_POS[2]])
-                dist_err = math.dist(cur_pos, tuple(corrected_insert_pos))
-
+                dist_err = math.dist(cur_pos, tuple(TARGET_INSERT_POS))
+            
                 if cur_pos[2] <= BUSBAR_RELEASE_Z or dist_err < INSERT_TOLERANCE_STRICT:
                     if busbar_xform is not None:
                         busbar_xform.set_world_pose(position=target_mid_pos, orientation=BUSBAR_REST_ORIENTATION)
@@ -857,7 +673,7 @@ def main():
             # ════════════════════════════════════════════════════════════════
             # [2] 너트 1번 물리 파지 및 상승 (nut1 -> bolt1)
             # ════════════════════════════════════════════════════════════════
-            elif phase == "NUT1_APPROACH":
+            if phase == "NUT1_APPROACH":
                 actions = arm_controller.forward(target_end_effector_position=NUT1_APPROACH_POS, target_end_effector_orientation=quat_nut)
                 robot.apply_action(actions)
                 robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_OPEN))
@@ -876,9 +692,6 @@ def main():
                 current_err = math.dist(cur_pos, tuple(NUT1_PICK_POS))
                 if current_err < PICK_TOLERANCE_STRICT or (current_err < PICK_TOLERANCE_LOOSE_VAL and step_count > MAX_STUCK_STEPS):
                     print(f"[OK] 너트 1번 하강 완료! -> 물리 파지(Gripper Close) 시작")
-                    if nut1_xform is not None:
-                        _dbg_pos, _ = nut1_xform.get_world_pose()
-                        print(f"[DEBUG-PHASE0] NUT1_DESCEND 종료(파지 직전, baseline) nut1 world pos={_dbg_pos}")
                     phase = "NUT1_GRASP"
                     grasp_timer = 0
 
@@ -893,9 +706,6 @@ def main():
 
                 if grasp_timer >= 50:
                     print(f"[OK] 너트 1번 물리 파지 완료! -> 상공({NUT_APPROACH_Z}m)으로 상승")
-                    if nut1_xform is not None:
-                        _dbg_pos, _ = nut1_xform.get_world_pose()
-                        print(f"[DEBUG-PHASE0] NUT1_GRASP 종료 시점 nut1 world pos={_dbg_pos}, EE pos={NUT1_PICK_POS}")
                     phase = "NUT1_LIFT"
                     step_count = 0
 
@@ -908,9 +718,6 @@ def main():
                 current_err = math.dist(cur_pos, tuple(NUT1_APPROACH_POS))
                 if current_err < PICK_TOLERANCE_STRICT or (current_err < PICK_TOLERANCE_LOOSE_VAL and step_count > MAX_STUCK_STEPS):
                     print(f"[OK] 너트 1번 상승 완료! -> 볼트 1번 상공({BOLT1_APPROACH_POS})으로 이동 시작")
-                    if nut1_xform is not None:
-                        _dbg_pos, _ = nut1_xform.get_world_pose()
-                        print(f"[DEBUG-PHASE0] NUT1_LIFT 종료 시점 nut1 world pos={_dbg_pos}, EE pos={tuple(cur_pos)} (target {NUT1_APPROACH_POS})")
                     phase = "MOVE_TO_BOLT1"
                     step_count = 0
 
@@ -926,9 +733,6 @@ def main():
                 current_err = math.dist(cur_pos, tuple(BOLT1_APPROACH_POS))
                 if current_err < PICK_TOLERANCE_STRICT or (current_err < PICK_TOLERANCE_LOOSE_VAL and step_count > MAX_STUCK_STEPS):
                     print(f"[OK] 볼트 1번 상공 도착! -> 착좌 하강 시작")
-                    if nut1_xform is not None:
-                        _dbg_pos, _ = nut1_xform.get_world_pose()
-                        print(f"[DEBUG-PHASE0] MOVE_TO_BOLT1 종료 시점 nut1 world pos={_dbg_pos}, EE pos={tuple(cur_pos)} (target {BOLT1_APPROACH_POS})")
                     phase = "NUT1_DESCEND_TO_BOLT1"
                     step_count = 0
                     descend_target_z = BOLT1_APPROACH_POS[2]
@@ -985,7 +789,7 @@ def main():
                     robot.apply_action(actions)
                     robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_CLOSE_NUT))
 
-                    # 실시간 토크 감지 및 Z축 정지(Stuck) 모니터링
+                    # ★ 실시간 토크 감지 및 Z축 정지(Stuck) 모니터링 ★
                     cur_ee_pos, _ = robot.end_effector.get_world_pose()
                     z_movement = abs(prev_ee_z - cur_ee_pos[2])
                     prev_ee_z = cur_ee_pos[2]
@@ -993,6 +797,7 @@ def main():
                     joint_efforts = robot.get_measured_joint_efforts()
                     curr_torque = abs(joint_efforts[-1]) if joint_efforts is not None and len(joint_efforts) > 0 else 0.0
 
+                    # ★ TCP Z 높이가 0.378m 이하일 때만 힘/토크 감지 적용 ★
                     if cur_ee_pos[2] <= TCP_FORCE_CHECK_Z:
                         if z_movement < STUCK_Z_DELTA_THRESH and depth_m > 0.003:
                             stuck_counter += 1
@@ -1002,19 +807,6 @@ def main():
                         is_seated_by_torque = (curr_torque > TORQUE_THRESHOLD) or (stuck_counter >= STUCK_STEP_LIMIT)
                     else:
                         is_seated_by_torque = False
-
-                    screw_records.append({
-                        "nut_id": 1,
-                        "step": step_count,
-                        "pass_idx": screw_pass_idx,
-                        "theta_deg": screw_pass_theta,
-                        "total_deg": total_deg,
-                        "depth_mm": depth_m * 1000.0,
-                        "tcp_z": float(cur_ee_pos[2]),
-                        "torque_nm": float(curr_torque),
-                        "stuck_counter": stuck_counter,
-                        "seated": bool(is_seated_by_torque),
-                    })
 
                     if step_count % 20 == 0:
                         print(f"  [NUT1 SCREW] Pass {screw_pass_idx+1}/{1+REGRASP_CYCLES} | Theta: {screw_pass_theta:.1f}° | 깊이: {depth_m*1000:.2f}mm / 목표 {ENGAGE_LEN*1000:.1f}mm | TCP Z: {cur_ee_pos[2]:.4f}m | 토크: {curr_torque:.1f}Nm")
@@ -1075,6 +867,7 @@ def main():
                         screw_release_step = 0
 
                 elif screw_sub == "descend_down":
+                    # ★ Regrasp 하강 시 Z축 높이를 미세 상승 보정 (+REGRASP_Z_OFFSET) ★
                     regrasp_descend_target = screw_pass_end_pos + np.array([0.0, 0.0, REGRASP_Z_OFFSET])
                     actions = arm_controller.forward(target_end_effector_position=regrasp_descend_target, target_end_effector_orientation=screw_start_quat)
                     robot.apply_action(actions)
@@ -1092,6 +885,7 @@ def main():
                     grip_target = rf * GRIPPER_CLOSE_NUT[0]
                     robot.gripper.apply_action(ArticulationAction(joint_positions=np.array([grip_target, grip_target])))
 
+                    # ★ Regrasp 재파지 시에도 Z축 높이를 미세 상승 보정 (+REGRASP_Z_OFFSET) ★
                     regrasp_target_pos = screw_pass_end_pos + np.array([0.0, 0.0, REGRASP_Z_OFFSET])
                     actions = arm_controller.forward(target_end_effector_position=regrasp_target_pos, target_end_effector_orientation=screw_start_quat)
                     robot.apply_action(actions)
@@ -1141,6 +935,8 @@ def main():
                 ee_now_pos, _ = robot.end_effector.get_world_pose()
                 lift_target_pos = np.array([ee_now_pos[0], ee_now_pos[1], NUT_APPROACH_Z])
 
+                # [수정 완료] 인자 명칭 오류 수정 (target_end_orientation -> target_end_effector_orientation)
+                # quat_nut (너트 1번 접근 때와 동일한 오리엔테이션)으로 완전 정렬
                 actions = arm_controller.forward(target_end_effector_position=lift_target_pos, target_end_effector_orientation=quat_nut)
                 robot.apply_action(actions)
                 robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_OPEN))
@@ -1271,7 +1067,7 @@ def main():
                     robot.apply_action(actions)
                     robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_CLOSE_NUT))
 
-                    # 실시간 토크 감지 및 Z축 정지(Stuck) 모니터링
+                    # ★ 실시간 토크 감지 및 Z축 정지(Stuck) 모니터링 ★
                     cur_ee_pos, _ = robot.end_effector.get_world_pose()
                     z_movement = abs(prev_ee_z - cur_ee_pos[2])
                     prev_ee_z = cur_ee_pos[2]
@@ -1279,6 +1075,7 @@ def main():
                     joint_efforts = robot.get_measured_joint_efforts()
                     curr_torque = abs(joint_efforts[-1]) if joint_efforts is not None and len(joint_efforts) > 0 else 0.0
 
+                    # ★ TCP Z 높이가 0.378m 이하일 때만 힘/토크 감지 적용 ★
                     if cur_ee_pos[2] <= TCP_FORCE_CHECK_Z:
                         if z_movement < STUCK_Z_DELTA_THRESH and depth_m > 0.003:
                             stuck_counter += 1
@@ -1288,19 +1085,6 @@ def main():
                         is_seated_by_torque = (curr_torque > TORQUE_THRESHOLD) or (stuck_counter >= STUCK_STEP_LIMIT)
                     else:
                         is_seated_by_torque = False
-
-                    screw_records.append({
-                        "nut_id": 2,
-                        "step": step_count,
-                        "pass_idx": screw_pass_idx,
-                        "theta_deg": screw_pass_theta,
-                        "total_deg": total_deg,
-                        "depth_mm": depth_m * 1000.0,
-                        "tcp_z": float(cur_ee_pos[2]),
-                        "torque_nm": float(curr_torque),
-                        "stuck_counter": stuck_counter,
-                        "seated": bool(is_seated_by_torque),
-                    })
 
                     if step_count % 20 == 0:
                         print(f"  [NUT2 SCREW] Pass {screw_pass_idx+1}/{1+REGRASP_CYCLES} | Theta: {screw_pass_theta:.1f}° | 깊이: {depth_m*1000:.2f}mm / 목표 {ENGAGE_LEN*1000:.1f}mm | TCP Z: {cur_ee_pos[2]:.4f}m | 토크: {curr_torque:.1f}Nm")
@@ -1361,6 +1145,7 @@ def main():
                         screw_release_step = 0
 
                 elif screw_sub == "descend_down":
+                    # ★ Regrasp 하강 시 Z축 높이를 미세 상승 보정 (+REGRASP_Z_OFFSET) ★
                     regrasp_descend_target = screw_pass_end_pos + np.array([0.0, 0.0, REGRASP_Z_OFFSET])
                     actions = arm_controller.forward(target_end_effector_position=regrasp_descend_target, target_end_effector_orientation=screw_start_quat)
                     robot.apply_action(actions)
@@ -1378,6 +1163,7 @@ def main():
                     grip_target = rf * GRIPPER_CLOSE_NUT[0]
                     robot.gripper.apply_action(ArticulationAction(joint_positions=np.array([grip_target, grip_target])))
 
+                    # ★ Regrasp 재파지 시에도 Z축 높이를 미세 상승 보정 (+REGRASP_Z_OFFSET) ★
                     regrasp_target_pos = screw_pass_end_pos + np.array([0.0, 0.0, REGRASP_Z_OFFSET])
                     actions = arm_controller.forward(target_end_effector_position=regrasp_target_pos, target_end_effector_orientation=screw_start_quat)
                     robot.apply_action(actions)
@@ -1434,7 +1220,7 @@ def main():
                 cur_pos = world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation()
                 current_err = math.dist(cur_pos, tuple(lift_target_pos))
                 if current_err < PICK_TOLERANCE_STRICT or (current_err < PICK_TOLERANCE_LOOSE_VAL and step_count > MAX_STUCK_STEPS):
-                    print(f"\n[전체 시퀀스 최종 성공] 버스바 장착 + 너트 1, 2번 체결 및 로봇 후퇴 완료!")
+                    print(f"\n[전체 시퀀스 최종 성공] 너트 1번 체결 + 너트 2번 체결 및 로봇 후퇴 완료!")
                     phase = "DONE"
 
             # 실시간 로그 출력
@@ -1446,30 +1232,13 @@ def main():
 
         was_playing = playing
 
-    if screw_records:
-        LOG_DIR.mkdir(parents=True, exist_ok=True)
-        with open(SCREW_LOG_CSV, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=SCREW_LOG_FIELDS)
-            writer.writeheader()
-            writer.writerows(screw_records)
-        print(f"[INFO] 체결(Screwing) 로그 저장 완료 -> {SCREW_LOG_CSV} ({len(screw_records)} rows)")
-
-    if yaw_align_records:
-        LOG_DIR.mkdir(parents=True, exist_ok=True)
-        with open(YAW_ALIGN_LOG_CSV, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=YAW_ALIGN_LOG_FIELDS)
-            writer.writeheader()
-            writer.writerows(yaw_align_records)
-        print(f"[INFO] YawAligner(PI) 모니터링 로그 저장 완료 -> {YAW_ALIGN_LOG_CSV} ({len(yaw_align_records)} rows)")
-
-    alignment_listener.destroy_node()
-    if rclpy.ok():
-        rclpy.shutdown()
-
     if 'world' in locals() and world is not None:
         world.clear_instance()
     omni.usd.get_context().close_stage()
     gc.collect()
+
+    vision_node.destroy_node()
+    rclpy.shutdown()
 
     simulation_app.close()
 

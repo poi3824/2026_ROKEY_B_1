@@ -47,6 +47,7 @@ camera_frame_override 파라미터가 설정되어 있으면 그 값을 대신 �
 경우(예: 이미지는 sim_camera, tf는 camera_color_optical_frame)를 위한 것.
 """
 import collections
+import math
 import os
 
 import numpy as np
@@ -65,11 +66,12 @@ from tf2_ros.transform_listener import TransformListener
 from vision_msgs.msg import Detection3D, Detection3DArray, ObjectHypothesisWithPose
 
 from perception_node import overlay
-from perception_node.camera_geometry import make_camera_model, transform_pixel_to_world
-from perception_node.detector import YoloPoseDetector
+from perception_node.camera_geometry import (
+    busbar_pnp_world_pose, dual_path_discrepancy_m, make_camera_model, transform_pixel_to_world)
+from perception_node.detector import BUSBAR_KEYPOINT_ORDER, YoloPoseDetector
 
 DEFAULT_MODEL_PATH = os.path.join(
-    get_package_share_directory('perception_node'), 'models', 'keypoints_best.pt')
+    get_package_share_directory('perception_node'), 'models', 'keypoints_busbar6pt_v1.pt')
 
 BUSBAR_LABEL = 'busbar'
 NUT_LABEL = 'nut'
@@ -79,6 +81,10 @@ BOLT_LABEL = 'bolt'
 SMOOTHING_WINDOW_SEC = 2.0
 SMOOTHING_MIN_SAMPLES = 2
 SMOOTHING_STD_WARN_MM = 5.0
+
+# Stage3 이중경로(PnP vs depth) 불일치 게이트. vision_pipeline_summary.md 2.2절 실측:
+# 이 값은 볼트 콜리전의 실제 PhysX contactOffset(2.0mm)과 일치 — 근거 있는 값.
+BUSBAR_DUAL_PATH_GATE_M = 0.002
 
 
 class PerceptionNode(Node):
@@ -161,6 +167,18 @@ class PerceptionNode(Node):
         self._busbar_grasp_pub = self.create_publisher(BusbarGrasp, '/vision/busbar_grasp', 10)
         self._nut_pose_pub = self.create_publisher(NutPose, '/vision/nut_pose', 10)
 
+        # Isaac Sim 내장 rclpy(kit python, 3.11)는 시스템 콜론 워크스페이스에서 빌드한
+        # fms_interfaces(시스템 python 3.10용으로 컴파일됨)를 import할 수 없다 - Python
+        # 버전이 달라 typesupport .so가 ABI 호환이 안 됨(source setup.bash로도 해결 안 됨,
+        # 내장 rclpy는 PYTHONPATH를 안 본다). isaacpjt/M0609/assembly_nut_physics.py처럼
+        # Isaac Sim 프로세스 안에서 직접 구독해야 하는 곳을 위해, 표준 geometry_msgs만
+        # 쓰는 병행 토픽을 같이 발행한다(execute_isaac.py가 이미 PoseStamped/Bool/Int32/
+        # String을 문제없이 쓰는 걸로 표준 메시지는 내장 rclpy에도 있음이 확인됨).
+        self._busbar_grasp_pose_pub = self.create_publisher(
+            PoseStamped, '/vision/busbar_grasp_pose', 10)
+        self._bolt_a_pose_pub = self.create_publisher(PoseStamped, '/vision/bolt_a_pose', 10)
+        self._bolt_b_pose_pub = self.create_publisher(PoseStamped, '/vision/bolt_b_pose', 10)
+
         self._timer = self.create_timer(detection_period_sec, self._detect_and_publish)
 
         self.get_logger().info(
@@ -192,10 +210,16 @@ class PerceptionNode(Node):
         debug_image = rgb.copy() if self._debug_image_pub is not None else None
         best_this_tick = {}  # label -> (score, world_point), 이번 tick 안에서만 비교
         bolt_this_tick = []  # 'bolt'는 tick당 여러 개(보통 2개)일 수 있어 따로 전부 모음
+        busbar_yaw_this_tick = None  # best_this_tick[busbar]가 갱신될 때만 같이 갱신
 
         for det in self._detector.detect(rgb, self._conf_threshold, self._iou_threshold):
-            camera_point, world_point, status = self._transform_pixel(
-                det['pixel'], depth, header.stamp)
+            if det['label'] == BUSBAR_LABEL:
+                world_point, yaw_rad, status = self._resolve_busbar_pose(det, depth, header.stamp)
+                camera_point = None  # PnP 경로는 단일 카메라 포인트 개념이 없어 오버레이만 생략
+            else:
+                camera_point, world_point, status = self._transform_pixel(
+                    det['pixel'], depth, header.stamp)
+                yaw_rad = None
 
             if debug_image is not None:
                 overlay.draw_detection(debug_image, det, camera_point, world_point, status)
@@ -206,6 +230,8 @@ class PerceptionNode(Node):
                 label, score = det['label'], det['score']
                 if label not in best_this_tick or score > best_this_tick[label][0]:
                     best_this_tick[label] = (score, world_point)
+                    if label == BUSBAR_LABEL:
+                        busbar_yaw_this_tick = yaw_rad
                 if label == BOLT_LABEL:
                     bolt_this_tick.append((score, world_point))
 
@@ -216,7 +242,8 @@ class PerceptionNode(Node):
             mean_point, _n = self._update_smoothed(label, world_point, now)
             # 라벨별 최신값 캐시를 이번 tick 결과로 갱신(덮어쓰기) — /perception/get_grasp_pose가 참조.
             self._latest_by_label[label] = (score, mean_point, now)
-            self._publish_vision_topic(label, mean_point, header.stamp)
+            yaw_rad = busbar_yaw_this_tick if label == BUSBAR_LABEL else None
+            self._publish_vision_topic(label, mean_point, header.stamp, yaw_rad)
 
         self._update_bolt_pair(bolt_this_tick, now)
 
@@ -227,10 +254,13 @@ class PerceptionNode(Node):
             debug_msg.header = header
             self._debug_image_pub.publish(debug_msg)
 
-    def _publish_vision_topic(self, label, world_point, stamp):
+    def _publish_vision_topic(self, label, world_point, stamp, yaw_rad=None):
         """behavior_node/arm_node가 구독하는 /vision/* 토픽에 이번 tick 최고점 검출을
-        실어 보낸다. keypoints 모델은 위치(Center)만 내므로 orientation은 항상
-        identity(w=1)로 채운다."""
+        실어 보낸다. busbar이고 yaw_rad가 주어지면(Stage3 PnP 성공) Z축 기준 실제
+        orientation을 채운다 — top-down 접근이라 azimuth(yaw)만 의미 있고 roll/pitch는
+        다루지 않는다. bolt/nut은 keypoint가 위치(top_center) 하나뿐이라 orientation
+        정보가 없으므로 항상 identity. yaw_rad는 위치(mean_point)와 달리 롤링 평균 없이
+        이번 tick 값을 그대로 쓴다(Phase3 스코프 — 오차가 크면 후속에서 스칼라 평균 추가)."""
         wx, wy, wz = world_point
         if label == BUSBAR_LABEL:
             msg = BusbarGrasp()
@@ -239,8 +269,13 @@ class PerceptionNode(Node):
             msg.pose.pose.position.x = wx
             msg.pose.pose.position.y = wy
             msg.pose.pose.position.z = wz
-            msg.pose.pose.orientation.w = 1.0
+            if yaw_rad is not None:
+                msg.pose.pose.orientation.z = math.sin(yaw_rad / 2.0)
+                msg.pose.pose.orientation.w = math.cos(yaw_rad / 2.0)
+            else:
+                msg.pose.pose.orientation.w = 1.0
             self._busbar_grasp_pub.publish(msg)
+            self._busbar_grasp_pose_pub.publish(msg.pose)
         elif label == NUT_LABEL:
             msg = NutPose()
             msg.id = 0
@@ -266,9 +301,11 @@ class PerceptionNode(Node):
         return mean, std, len(bucket)
 
     def _update_smoothed(self, label, world_point, now) -> tuple:
-        """라벨 하나의 롤링 평균/표준편차를 갱신하고 터미널에 로그를 남긴다.
-        반환값(mean_point, sample_count)을 캐시/토픽 발행에 그대로 쓴다 — 단발성
-        YOLO+depth tick 값을 곧바로 신뢰하지 않기 위함."""
+        """라벨 하나의 롤링 평균/표준편차를 갱신한다. 반환값(mean_point, sample_count)을
+        캐시/토픽 발행에 그대로 쓴다 — 단발성 YOLO+depth tick 값을 곧바로 신뢰하지
+        않기 위함. 이 값 자체가 "검출 결과"이자 다른 노드가 실제로 받게 될 값이므로
+        로그는 매 tick(기본 0.5초)마다가 아니라 throttle로 주기적으로만 남긴다 —
+        detection_period_sec가 짧아도 터미널이 같은 정보로 도배되지 않게."""
         bucket = self._recent_detections[label]
         mean, std, n = self._smooth_bucket(bucket, world_point, now)
         std_mm = std * 1000.0
@@ -276,12 +313,13 @@ class PerceptionNode(Node):
         self.get_logger().info(
             f"[{label}] raw=({world_point[0]:.4f},{world_point[1]:.4f},{world_point[2]:.4f}) "
             f"mean=({mean[0]:.4f},{mean[1]:.4f},{mean[2]:.4f}) "
-            f"std=({std_mm[0]:.1f},{std_mm[1]:.1f},{std_mm[2]:.1f})mm n={n}"
-        )
+            f"std=({std_mm[0]:.1f},{std_mm[1]:.1f},{std_mm[2]:.1f})mm n={n}",
+            throttle_duration_sec=3.0)
         if std_mm.max() > SMOOTHING_STD_WARN_MM:
             self.get_logger().warn(
                 f"[{label}] 검출 흔들림 큼 (표준편차 최대 {std_mm.max():.1f}mm > "
-                f"{SMOOTHING_STD_WARN_MM:.0f}mm) — 조명/거리/각도 또는 conf_threshold 확인 필요"
+                f"{SMOOTHING_STD_WARN_MM:.0f}mm) — 조명/거리/각도 또는 conf_threshold 확인 필요",
+                throttle_duration_sec=3.0
             )
         return tuple(mean), n
 
@@ -307,13 +345,21 @@ class PerceptionNode(Node):
         mean_b, std_b, n_b = self._smooth_bucket(self._recent_bolt_b, points[1], now)
         mid_xy = ((mean_a[0] + mean_b[0]) / 2, (mean_a[1] + mean_b[1]) / 2)
 
+        # get_bolt_pair 서비스가 그대로 반환하는 값이라 "검출 결과" 로그이지만, 이것도
+        # 매 tick 찍으면 스팸이므로 위 _update_smoothed와 동일하게 throttle.
         self.get_logger().info(
             f"[bolt-pair] A mean=({mean_a[0]:.4f},{mean_a[1]:.4f},{mean_a[2]:.4f}) "
             f"std_max={std_a.max()*1000:.1f}mm n={n_a} | "
             f"B mean=({mean_b[0]:.4f},{mean_b[1]:.4f},{mean_b[2]:.4f}) "
-            f"std_max={std_b.max()*1000:.1f}mm n={n_b} | mid_xy=({mid_xy[0]:.4f},{mid_xy[1]:.4f})"
+            f"std_max={std_b.max()*1000:.1f}mm n={n_b} | mid_xy=({mid_xy[0]:.4f},{mid_xy[1]:.4f})",
+            throttle_duration_sec=3.0
         )
         self._latest_bolt_pair = (tuple(mean_a), tuple(mean_b), now, min(n_a, n_b))
+        # fms_interfaces 없이도 쓸 수 있는 표준 geometry_msgs 병행 발행(위 publisher
+        # 생성부 주석 참고) - assembly_nut_physics.py 같은 Isaac Sim 내장 rclpy
+        # 프로세스가 이 두 토픽을 직접 구독한다.
+        self._bolt_a_pose_pub.publish(self._make_pose_stamped(mean_a, now))
+        self._bolt_b_pose_pub.publish(self._make_pose_stamped(mean_b, now))
 
     def _make_pose_stamped(self, world_point, stamp) -> PoseStamped:
         wx, wy, wz = world_point
@@ -326,15 +372,58 @@ class PerceptionNode(Node):
         pose.pose.orientation.w = 1.0
         return pose
 
-    def _transform_pixel(self, pixel_uv, depth_image, stamp):
-        def log_tf_error(ex):
-            self.get_logger().warn(
-                f'{self._world_frame} <- {self._camera_frame_id} tf 조회 실패, 검출 skip: {ex}',
-                throttle_duration_sec=5.0)
+    def _log_tf_error(self, ex):
+        self.get_logger().warn(
+            f'{self._world_frame} <- {self._camera_frame_id} tf 조회 실패, 검출 skip: {ex}',
+            throttle_duration_sec=5.0)
 
+    def _transform_pixel(self, pixel_uv, depth_image, stamp):
         return transform_pixel_to_world(
             self._camera_model, depth_image, pixel_uv, self._tf_buffer,
-            self._world_frame, self._camera_frame_id, stamp, on_tf_error=log_tf_error)
+            self._world_frame, self._camera_frame_id, stamp, on_tf_error=self._log_tf_error)
+
+    def _resolve_busbar_pose(self, det, depth_image, stamp):
+        """busbar 검출 1건 -> (world_point, yaw_rad, status).
+
+        Stage3 이중경로: (A) 6-keypoint PnP(camera_geometry.busbar_pnp_world_pose),
+        (B) hole_A/hole_B 픽셀 각각의 depth 역투영. (A)가 성공하면 그 mid_xy/yaw를
+        쓰고 (B)와 비교해 BUSBAR_DUAL_PATH_GATE_M을 넘으면 경고 로그를 남긴다 —
+        실제 접근 중단은 이번 스코프 밖(arm_node/behavior_node의 후속 과제)이라
+        지금은 안전장치로 로그만 남긴다. (A)가 실패하면(가림/반사 등) 기존 방식대로
+        6-keypoint 중심 픽셀의 depth 역투영으로 폴백한다(orientation 없이).
+        """
+        pnp = busbar_pnp_world_pose(
+            self._camera_model, det['keypoints_px'], self._tf_buffer,
+            self._world_frame, self._camera_frame_id, stamp, on_tf_error=self._log_tf_error)
+
+        if pnp['status'] == '':
+            hole_a_px = tuple(det['keypoints_px'][BUSBAR_KEYPOINT_ORDER.index('hole_A')])
+            hole_b_px = tuple(det['keypoints_px'][BUSBAR_KEYPOINT_ORDER.index('hole_B')])
+            _, hole_a_depth_world, _status_a = self._transform_pixel(hole_a_px, depth_image, stamp)
+            _, hole_b_depth_world, _status_b = self._transform_pixel(hole_b_px, depth_image, stamp)
+            if hole_a_depth_world is not None and hole_b_depth_world is not None:
+                depth_mid_xy = ((hole_a_depth_world[0] + hole_b_depth_world[0]) / 2.0,
+                                 (hole_a_depth_world[1] + hole_b_depth_world[1]) / 2.0)
+                discrepancy_m = dual_path_discrepancy_m(pnp['mid_xy'], depth_mid_xy)
+                msg = (f"[busbar] PnP-depth 이중경로 불일치={discrepancy_m*1000:.2f}mm "
+                       f"(게이트 {BUSBAR_DUAL_PATH_GATE_M*1000:.0f}mm), "
+                       f"reproj_err={pnp['reprojection_error_px']:.2f}px")
+                # 같은 호출 지점(소스 라인)에서 throttle_duration_sec를 쓰면 rclpy가 내부적으로
+                # 호출 지점별 상태를 캐싱하는데, 그 상태에 severity도 같이 묶여있어 매번
+                # warn/info를 오갈 경우 "Logger severity cannot be changed between calls"로
+                # 죽는다(실측, 2026-07-25). 그래서 호출 지점을 아예 분리해야 한다.
+                if discrepancy_m > BUSBAR_DUAL_PATH_GATE_M:
+                    self.get_logger().warn(msg, throttle_duration_sec=3.0)
+                else:
+                    self.get_logger().info(msg, throttle_duration_sec=3.0)
+
+            za = pnp['hole_world']['hole_A'][2]
+            zb = pnp['hole_world']['hole_B'][2]
+            world_point = (pnp['mid_xy'][0], pnp['mid_xy'][1], (za + zb) / 2.0)
+            return world_point, pnp['yaw_rad'], ''
+
+        _, world_point, status = self._transform_pixel(det['pixel'], depth_image, stamp)
+        return world_point, None, status
 
     def _make_detection3d(self, det, world_point, stamp) -> Detection3D:
         detection = Detection3D()
