@@ -79,7 +79,7 @@ from isaacsim.core.utils.types import ArticulationAction
 # ══════════════════════════════════════════════════════════════════════════
 #  [A] 설정 및 파라미터
 # ══════════════════════════════════════════════════════════════════════════
-USD_PATH = "/home/rokey/EV_combine/src/Collected_Busbar/Busbar.usd"
+USD_PATH = "/home/rokey/EV_combine/isaacpjt/M0609/Collected_Busbar/Busbar.usd"
 
 NOVA_CARTER_ROOT = "/World/Nova_Carter/chassis_link"
 M0609_PATH       = "/World/m0609"

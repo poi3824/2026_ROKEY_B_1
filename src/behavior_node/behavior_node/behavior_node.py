@@ -14,6 +14,7 @@ accept 응답 -> 실행 결과 세 단계에 각각 타임아웃을 둔다(_Pend
 실행 타임아웃 발생 시 goal 취소와 최종 result를 확인한 뒤에만 RECOVER로 진입한다.
 취소 여부를 확인할 수 없으면 중복 로봇 동작을 막기 위해 해당 job을 안전 실패 처리한다.
 """
+import math
 from enum import Enum, auto
 
 import rclpy
@@ -30,12 +31,64 @@ from fms_interfaces.msg import (
     StudPose, BusbarGrasp, NutPose,
 )
 
-# 스테이션 좌표 (Isaac Sim 월드 기준). TODO: 실제 스테이션 배치로 교체.
+# 아래 값은 Isaac Sim Property 패널에서 읽은 고정 월드 좌표다. behavior_node는 이 값을
+# 변경하지 않고 AmrGoal로 보낸다. /odom의 HOME 상대 좌표를 월드 좌표로 바꾸는 책임은
+# amr_node에 두어, 사용자가 지정한 목표 좌표와 로그에 표시되는 목표 좌표가 항상 같게 한다.
 STATION_POSES = {
-    'station_1': (1.0, 0.0, 0.0),
-    'station_2': (2.0, 0.0, 0.0),
-    'station_3': (3.0, 0.0, 0.0),
+    'station_1': (0.66594, -0.04555, -math.pi / 2),
+    'station_2': (0.66594, -0.64732, -math.pi / 2),
+    'station_3': (0.66594, -1.17289, -math.pi / 2),
+    'station_4': (1.98852, -1.17289, -math.pi / 2),
+    'station_5': (1.98852, -0.64732, -math.pi / 2),
+    'station_6': (1.98852, -0.1118, -math.pi / 2),
+    # ST3→ST4 직선은 배터리 모듈팩 하단 모서리를 관통한다. ST3에서 남쪽으로 충분히
+    # 이탈한 뒤 가로질러, ST4 남쪽에서 -90도 자세로 직선 후진 진입한다.
+    'scan_3_exit': (0.66594, -1.75, 0.0),
+    # ST4 열보다 10cm 더 전진한 뒤 반시계 정렬을 시작해야 차체 후미가 모듈팩
+    # 모서리를 충분히 벗어나고, 회전 후 ST4~ST6 직선과 나란히 설 수 있다.
+    'scan_4_approach': (2.08852, -1.75, math.pi / 2),
+    # 스캔 구간에서는 ST4 아래에서 반시계로 정렬한 +90도 자세를 유지한 채
+    # ST4→ST5→ST6을 한 줄로 전진한다. 실제 체결용 station_4~6 자세(-90도)는 보존한다.
+    'scan_station_4': (1.98852, -1.17289, math.pi / 2),
+    'scan_station_5': (1.98852, -0.64732, math.pi / 2),
+    'scan_station_6': (1.98852, -0.1118, math.pi / 2),
+    # 전체 스캔 후 ST4 쪽에서 ST3 쪽으로 되돌아올 때 사용하는 동일 위치/복귀 자세.
+    # 여기서 -90도로 정렬하면 ST3까지 직선 후진할 수 있어 스테이션 앞 회전을 피한다.
+    'scan_3_return': (0.66594, -1.75, -math.pi / 2),
+    # 전체 스캔 종료 후 그림의 빨간 경로처럼 모듈팩 오른쪽과 위쪽을 돌아 BUS1으로 간다.
+    # 각 코너에서 다음 직선 구간 방향으로 미리 자세를 맞춰 전진 주행을 유지한다.
+    # ST6 스캔 직후에는 회전하지 않는다. ST4→ST5→ST6에서 유지한 +90도 방향으로
+    # 모듈팩 끝보다 0.66m 더 직진한 뒤에만 BUS1 상단 우회를 시작한다.
+    'scan_6_straight_exit': (1.98852, 0.55, math.pi / 2),
+    'scan_6_right_exit': (3.10, 0.55, 0.0),
+    'scan_6_top_right': (3.10, 1.92483, math.pi / 2),
+    'busbar_return_approach': (-1.47361, 1.92483, math.pi),
+    # ST1과 BUS1 사이 안전 중간점. 여기서 바로 BUS1로 가지 않고 아래 도킹 정렬점을 거친다.
+    'busbar_approach': (-1.47361, 1.92483, 0.0),
+    # BUS1 왼쪽 1.2m 지점. 기존 -1.20211은 테이블 왼쪽 모서리와 너무 가까워 팔이
+    # 제자리 회전 중 테이블에 닿았다. 충분히 왼쪽으로 빠진 이 위치에서 -180도로 정렬한 뒤
+    # BUS1까지 직선 후진하여 실제 파지 자세를 유지한다.
+    'busbar_dock_approach': (-1.70211, 2.37274, -math.pi),
+    'busbar_table': (-0.50211, 2.37274, -math.pi),  # BUS1
+    # BUS1 파지 후 복귀 전용 통과점. 진입용 좌표와 위치는 같지만 amr_node에서 최종
+    # 제자리 회전을 생략하도록 별도 ID를 사용한다.
+    'busbar_dock_exit': (-1.70211, 2.37274, -math.pi),
+    'busbar_return_mid': (-1.47361, 1.92483, 0.0),
+    'station_1_return': (0.66594, -0.04555, -math.pi / 2),
+    # 수정본 좌표: 평행주차 없이 -90도 자세로 남쪽에서 북쪽 방향으로 직선 후진 진입.
+    'busbar_2_approach': (0.48533, 1.47778, -math.pi / 2),
+    'busbar_table_2': (0.48533, 2.07778, -math.pi / 2),
+    'busbar_3_approach': (1.38165, 1.47778, -math.pi / 2),
+    'busbar_table_3': (1.38165, 2.07778, -math.pi / 2),
 }
+
+# arm_node/perception_node를 이번 라운드에서는 아직 실행/연결하지 않는다 - 스캔/버스바 파지/
+# 체결은 SCAN_STUB/GRASP_STUB/FASTEN_STUB(제자리 대기)로 대체한다. 새 씬(Collected_Busbar3,
+# onrobot_rg2 그리퍼)에 맞게 arm_node의 하드코딩 좌표를 재보정한 뒤 True로 바꾸면, 아래
+# _on_amr_status의 분기를 통해 기존 GRASP_BUSBAR/NUT_* 액션 흐름이 그대로 다시 활성화된다.
+ARM_ACTIONS_ENABLED = False
+
+STUB_WAIT_SEC = 2.0
 
 MAX_RETRY = 3
 
@@ -93,6 +146,26 @@ class State(Enum):
     IDLE = auto()
     FAULT = auto()
     MOVE_TO_STATION = auto()
+    MOVE_TO_SCAN_STATION = auto()
+    SCAN_STUB = auto()
+    MOVE_TO_BUS_APPROACH = auto()
+    MOVE_TO_BUS_DOCK_APPROACH = auto()
+    MOVE_TO_BUSBAR_TABLE = auto()
+    GRASP_STUB = auto()
+    MOVE_BACK_TO_BUS_DOCK_APPROACH = auto()
+    MOVE_BACK_TO_BUS_APPROACH = auto()
+    MOVE_BACK_TO_STATION = auto()
+    FASTEN_STUB = auto()
+    MOVE_TO_BUSBAR2_APPROACH = auto()
+    MOVE_TO_BUSBAR2_TABLE = auto()
+    GRASP2_STUB = auto()
+    MOVE_TO_STATION2 = auto()
+    FASTEN2_STUB = auto()
+    MOVE_TO_BUSBAR3_APPROACH = auto()
+    MOVE_TO_BUSBAR3_TABLE = auto()
+    GRASP3_STUB = auto()
+    MOVE_TO_STATION3 = auto()
+    FASTEN3_STUB = auto()
     WAIT_BUSBAR_VISION = auto()
     GRASP_BUSBAR = auto()
     INSERT_BUSBAR = auto()
@@ -103,6 +176,34 @@ class State(Enum):
     FASTEN = auto()
     RECOVER = auto()
     REPORT = auto()
+
+
+STATE_DISPLAY = {
+    State.IDLE: ('대기', '-'),
+    State.FAULT: ('오류 정지', '!'),
+    State.MOVE_TO_STATION: ('ST1 스캔 위치로 이동', '1/31'),
+    State.MOVE_TO_SCAN_STATION: ('다음 스캔 위치로 이동', '스캔'),
+    State.SCAN_STUB: ('비전 스캔', '스캔'),
+    State.MOVE_TO_BUS_APPROACH: ('BUS1 중간 접근점으로 이동', '13/31'),
+    State.MOVE_TO_BUS_DOCK_APPROACH: ('BUS1 도킹 자세 정렬점으로 이동', '14/31'),
+    State.MOVE_TO_BUSBAR_TABLE: ('BUS1 파지 위치로 정밀 이동', '15/31'),
+    State.GRASP_STUB: ('BUS1 버스바 파지', '16/31'),
+    State.MOVE_BACK_TO_BUS_DOCK_APPROACH: ('BUS1에서 직선으로 이탈', '17/31'),
+    State.MOVE_BACK_TO_BUS_APPROACH: ('BUS1 중간점으로 복귀', '18/31'),
+    State.MOVE_BACK_TO_STATION: ('ST1으로 복귀', '19/31'),
+    State.FASTEN_STUB: ('ST1 버스바·너트 체결', '20/31'),
+    State.MOVE_TO_BUSBAR2_APPROACH: ('BUS2 직선 접근점으로 이동', '21/31'),
+    State.MOVE_TO_BUSBAR2_TABLE: ('BUS2 파지 위치로 정밀 이동', '22/31'),
+    State.GRASP2_STUB: ('BUS2 버스바 파지', '23/31'),
+    State.MOVE_TO_STATION2: ('ST2로 이동', '24/31'),
+    State.FASTEN2_STUB: ('ST2 버스바·너트 체결', '25/31'),
+    State.MOVE_TO_BUSBAR3_APPROACH: ('BUS3 직선 접근점으로 이동', '26/31'),
+    State.MOVE_TO_BUSBAR3_TABLE: ('BUS3 파지 위치로 정밀 이동', '27/31'),
+    State.GRASP3_STUB: ('BUS3 버스바 파지', '28/31'),
+    State.MOVE_TO_STATION3: ('ST3로 이동', '29/31'),
+    State.FASTEN3_STUB: ('ST3 버스바·너트 체결', '30/31'),
+    State.REPORT: ('1·2·3차 작업 완료 보고', '31/31'),
+}
 
 
 class BehaviorNode(Node):
@@ -140,10 +241,25 @@ class BehaviorNode(Node):
         self._latest_nut_pose = None
         self._pending = None  # type: _PendingGoal | None
         self._attempt_counts = {}  # command(str) -> 이번 job에서 몇 번째 시도인지
+        self._stub_deadline = None  # SCAN_STUB/GRASP_STUB/FASTEN_STUB 공용 대기 타이머
+        self._stub_label = None
+        self._stub_last_remaining_sec = None
+        self._scan_station_number = 1
+        self._scan_route_queue = []
+        self._active_scan_waypoint = None
+        self._bus1_route_queue = []
+        self._active_bus1_waypoint = None
+        self._bus3_route_queue = []
+        self._active_bus3_waypoint = None
+        self._station3_route_queue = []
+        self._active_station3_waypoint = None
 
         self._timer = self.create_timer(0.5, self._step)
 
-        self.get_logger().info('behavior_node started')
+        self.get_logger().info(
+            '\n' + '=' * 72 +
+            '\n[BEHAVIOR] 작업 지휘 노드 시작 — 새 작업을 기다립니다.' +
+            '\n' + '=' * 72)
 
     # --- job 해석 ---------------------------------------------------------
     def _on_job(self, msg: FleetJob):
@@ -161,11 +277,32 @@ class BehaviorNode(Node):
         self._latest_nut_pose = None
         self._pending = None
         self._attempt_counts = {}
+        self._scan_station_number = 1
+        self._scan_route_queue = []
+        self._active_scan_waypoint = None
+        self._bus1_route_queue = []
+        self._active_bus1_waypoint = None
+        self._bus3_route_queue = []
+        self._active_bus3_waypoint = None
+        self._station3_route_queue = []
+        self._active_station3_waypoint = None
         self._set_state(State.MOVE_TO_STATION)
 
     # --- 조립 FSM 상태 전이 -------------------------------------------------
     def _set_state(self, new_state: State):
-        self.get_logger().info(f'[FSM] {self._state.name} -> {new_state.name}')
+        old_label = STATE_DISPLAY.get(self._state, (self._state.name, '?'))[0]
+        new_label, step = STATE_DISPLAY.get(new_state, (new_state.name, '?'))
+        if new_state == State.MOVE_TO_SCAN_STATION:
+            new_label = f'ST{self._scan_station_number} 스캔 위치로 이동'
+            step = f'{self._scan_station_number * 2 - 1}/31'
+        elif new_state == State.SCAN_STUB:
+            new_label = f'ST{self._scan_station_number} 비전 스캔'
+            step = f'{self._scan_station_number * 2}/31'
+        self.get_logger().info(
+            '\n' + '=' * 72 +
+            f'\n[단계 {step}] {new_label}' +
+            f'\n상태 전환: {old_label}  →  {new_label}' +
+            '\n' + '=' * 72)
         self._state = new_state
 
     def _step(self):
@@ -176,6 +313,46 @@ class BehaviorNode(Node):
 
         if self._state == State.MOVE_TO_STATION:
             self._enter_move_to_station()
+        elif self._state == State.MOVE_TO_SCAN_STATION:
+            self._enter_move_to_scan_station()
+        elif self._state == State.SCAN_STUB:
+            self._enter_scan_stub()
+        elif self._state == State.MOVE_TO_BUS_APPROACH:
+            self._enter_move_to_bus_approach()
+        elif self._state == State.MOVE_TO_BUS_DOCK_APPROACH:
+            self._enter_move_to_bus_dock_approach()
+        elif self._state == State.MOVE_TO_BUSBAR_TABLE:
+            self._enter_move_to_busbar_table()
+        elif self._state == State.GRASP_STUB:
+            self._enter_grasp_stub()
+        elif self._state == State.MOVE_BACK_TO_BUS_DOCK_APPROACH:
+            self._enter_move_back_to_bus_dock_approach()
+        elif self._state == State.MOVE_BACK_TO_BUS_APPROACH:
+            self._enter_move_back_to_bus_approach()
+        elif self._state == State.MOVE_BACK_TO_STATION:
+            self._enter_move_back_to_station()
+        elif self._state == State.FASTEN_STUB:
+            self._enter_fasten_stub()
+        elif self._state == State.MOVE_TO_BUSBAR2_APPROACH:
+            self._enter_move_to_busbar2_approach()
+        elif self._state == State.MOVE_TO_BUSBAR2_TABLE:
+            self._enter_move_to_busbar2_table()
+        elif self._state == State.GRASP2_STUB:
+            self._enter_grasp2_stub()
+        elif self._state == State.MOVE_TO_STATION2:
+            self._enter_move_to_station2()
+        elif self._state == State.FASTEN2_STUB:
+            self._enter_fasten2_stub()
+        elif self._state == State.MOVE_TO_BUSBAR3_APPROACH:
+            self._enter_move_to_busbar3_approach()
+        elif self._state == State.MOVE_TO_BUSBAR3_TABLE:
+            self._enter_move_to_busbar3_table()
+        elif self._state == State.GRASP3_STUB:
+            self._enter_grasp3_stub()
+        elif self._state == State.MOVE_TO_STATION3:
+            self._enter_move_to_station3()
+        elif self._state == State.FASTEN3_STUB:
+            self._enter_fasten3_stub()
         elif self._state == State.WAIT_BUSBAR_VISION:
             if self._latest_busbar_grasp is not None:
                 self._set_state(State.GRASP_BUSBAR)
@@ -185,35 +362,257 @@ class BehaviorNode(Node):
                 self._set_state(State.NUT_APPROACH)
                 self._send_fasten_goal('NUT_APPROACH')
         elif self._state == State.REPORT:
-            self._send_report(success=True, message='조립 완료')
+            self._send_report(success=True, message='전체 비전 스캔 및 ST1·ST2·ST3 버스바·너트 체결 완료')
             self._set_state(State.IDLE)
             self._job = None
 
     # --- 이동 -------------------------------------------------------------
-    def _enter_move_to_station(self):
+    # MOVE_TO_STATION / MOVE_TO_BUSBAR_TABLE / MOVE_BACK_TO_STATION 3개 state가 공유하는
+    # "waypoint_id로 AmrGoal 1회 발행 후 도착 대기" 로직.
+    def _enter_travel(self, waypoint_id: str):
         if getattr(self, '_move_goal_sent', False):
             return
-        x, y, theta = STATION_POSES.get(self._job.station_id, (0.0, 0.0, 0.0))
+        pose = STATION_POSES.get(waypoint_id)
+        if pose is None:
+            self.get_logger().error(f'알 수 없는 AMR waypoint: {waypoint_id}')
+            return
+        x, y, theta = pose
         goal = AmrGoal()
-        goal.station_id = self._job.station_id
+        goal.station_id = waypoint_id
         goal.x, goal.y, goal.theta = x, y, theta
         self._amr_goal_pub.publish(goal)
         self._move_goal_sent = True
-        self.get_logger().info(f'PUB /amr/goal -> {goal.station_id}')
+        self.get_logger().info(
+            f'[이동 명령] 목적지={goal.station_id} | '
+            f'월드 좌표 X={x:.3f}, Y={y:.3f}, 방향={math.degrees(theta):.1f}°')
+
+    def _enter_move_to_station(self):
+        self._enter_travel(self._job.station_id)
+
+    def _enter_move_to_scan_station(self):
+        if self._active_scan_waypoint is None:
+            if not self._scan_route_queue:
+                waypoint_prefix = (
+                    'scan_station'
+                    if self._scan_station_number >= 4
+                    else 'station'
+                )
+                self._scan_route_queue = [
+                    f'{waypoint_prefix}_{self._scan_station_number}'
+                ]
+            self._active_scan_waypoint = self._scan_route_queue.pop(0)
+        self._enter_travel(self._active_scan_waypoint)
+
+    def _enter_move_to_bus_approach(self):
+        if self._active_bus1_waypoint is None:
+            if not self._bus1_route_queue:
+                self._bus1_route_queue = ['busbar_approach']
+            self._active_bus1_waypoint = self._bus1_route_queue.pop(0)
+        self._enter_travel(self._active_bus1_waypoint)
+
+    def _enter_move_to_bus_dock_approach(self):
+        self._enter_travel('busbar_dock_approach')
+
+    def _enter_move_to_busbar_table(self):
+        self._enter_travel('busbar_table')
+
+    def _enter_move_back_to_bus_dock_approach(self):
+        self._enter_travel('busbar_dock_exit')
+
+    def _enter_move_back_to_bus_approach(self):
+        self._enter_travel('busbar_return_mid')
+
+    def _enter_move_back_to_station(self):
+        self._enter_travel('station_1_return')
+
+    def _enter_move_to_busbar2_approach(self):
+        self._enter_travel('busbar_2_approach')
+
+    def _enter_move_to_busbar2_table(self):
+        self._enter_travel('busbar_table_2')
+
+    def _enter_move_to_station2(self):
+        self._enter_travel('station_2')
+
+    def _enter_move_to_busbar3_approach(self):
+        if self._active_bus3_waypoint is None:
+            if not self._bus3_route_queue:
+                self._bus3_route_queue = [
+                    'station_1',
+                    'busbar_2_approach',
+                    'busbar_3_approach',
+                ]
+            self._active_bus3_waypoint = self._bus3_route_queue.pop(0)
+        self._enter_travel(self._active_bus3_waypoint)
+
+    def _enter_move_to_busbar3_table(self):
+        self._enter_travel('busbar_table_3')
+
+    def _enter_move_to_station3(self):
+        if self._active_station3_waypoint is None:
+            if not self._station3_route_queue:
+                self._station3_route_queue = [
+                    'busbar_3_approach',
+                    'busbar_2_approach',
+                    'station_1',
+                    'station_2',
+                    'station_3',
+                ]
+            self._active_station3_waypoint = self._station3_route_queue.pop(0)
+        self._enter_travel(self._active_station3_waypoint)
+
+    # state 도착 시 다음 state로 - ARM_ACTIONS_ENABLED=True로 arm_node 연동을 켜기 전까지는
+    # MOVE_TO_STATION 도착 후에도 (WAIT_BUSBAR_VISION/GRASP_BUSBAR 대신) SCAN_STUB으로 간다.
+    _TRAVEL_NEXT_STATE = {
+        State.MOVE_TO_STATION: State.SCAN_STUB,
+        State.MOVE_TO_SCAN_STATION: State.SCAN_STUB,
+        State.MOVE_TO_BUS_APPROACH: State.MOVE_TO_BUS_DOCK_APPROACH,
+        State.MOVE_TO_BUS_DOCK_APPROACH: State.MOVE_TO_BUSBAR_TABLE,
+        State.MOVE_TO_BUSBAR_TABLE: State.GRASP_STUB,
+        State.MOVE_BACK_TO_BUS_DOCK_APPROACH: State.MOVE_BACK_TO_BUS_APPROACH,
+        State.MOVE_BACK_TO_BUS_APPROACH: State.MOVE_BACK_TO_STATION,
+        State.MOVE_BACK_TO_STATION: State.FASTEN_STUB,
+        State.MOVE_TO_BUSBAR2_APPROACH: State.MOVE_TO_BUSBAR2_TABLE,
+        State.MOVE_TO_BUSBAR2_TABLE: State.GRASP2_STUB,
+        State.MOVE_TO_STATION2: State.FASTEN2_STUB,
+        State.MOVE_TO_BUSBAR3_APPROACH: State.MOVE_TO_BUSBAR3_TABLE,
+        State.MOVE_TO_BUSBAR3_TABLE: State.GRASP3_STUB,
+        State.MOVE_TO_STATION3: State.FASTEN3_STUB,
+    }
 
     def _on_amr_status(self, msg: AmrStatus):
-        if self._state != State.MOVE_TO_STATION:
+        if self._state not in self._TRAVEL_NEXT_STATE:
             return
         if msg.state == AmrStatus.STATE_ARRIVED:
             self._move_goal_sent = False
-            if VISION_ENABLED:
-                self._set_state(State.WAIT_BUSBAR_VISION)
+            if self._state == State.MOVE_TO_SCAN_STATION:
+                self._active_scan_waypoint = None
+                if self._scan_route_queue:
+                    self.get_logger().info(
+                        f'[안전 우회] 다음 경유지로 이동 | '
+                        f'남은 경유지={len(self._scan_route_queue)}개')
+                    return
+            elif self._state == State.MOVE_TO_BUS_APPROACH:
+                self._active_bus1_waypoint = None
+                if self._bus1_route_queue:
+                    self.get_logger().info(
+                        f'[ST6→BUS1 안전 복귀] 외곽 경로의 다음 지점으로 이동 | '
+                        f'남은 경유지={len(self._bus1_route_queue)}개')
+                    return
+            elif self._state == State.MOVE_TO_BUSBAR3_APPROACH:
+                self._active_bus3_waypoint = None
+                if self._bus3_route_queue:
+                    self.get_logger().info(
+                        f'[ST2→BUS3 안전 이동] 외곽 경로의 다음 지점으로 이동 | '
+                        f'남은 경유지={len(self._bus3_route_queue)}개')
+                    return
+            elif self._state == State.MOVE_TO_STATION3:
+                self._active_station3_waypoint = None
+                if self._station3_route_queue:
+                    self.get_logger().info(
+                        f'[BUS3→ST3 안전 복귀] 외곽 경로의 다음 지점으로 이동 | '
+                        f'남은 경유지={len(self._station3_route_queue)}개')
+                    return
+            if self._state == State.MOVE_TO_STATION and ARM_ACTIONS_ENABLED:
+                if VISION_ENABLED:
+                    self._set_state(State.WAIT_BUSBAR_VISION)
+                else:
+                    self._set_state(State.GRASP_BUSBAR)
+                    self._send_busbar_goal('GRASP')
             else:
-                self._set_state(State.GRASP_BUSBAR)
-                self._send_busbar_goal('GRASP')
+                next_state = self._TRAVEL_NEXT_STATE[self._state]
+                self._set_state(next_state)
+                # BUS1 복귀 통과점은 다음 0.5초 FSM tick을 기다리지 않고 즉시 다음
+                # 목표를 발행해 정지 시간이 눈에 띄지 않게 한다.
+                if next_state == State.MOVE_BACK_TO_BUS_APPROACH:
+                    self._enter_move_back_to_bus_approach()
+                elif next_state == State.MOVE_BACK_TO_STATION:
+                    self._enter_move_back_to_station()
         elif msg.state == AmrStatus.STATE_ERROR:
             self._move_goal_sent = False
-            self._enter_recover(State.MOVE_TO_STATION, msg.message)
+            self._enter_recover(self._state, msg.message)
+
+    # --- 스캔/파지/체결 스텁 (arm_node/perception_node 연결 전 임시 동작) --------------
+    # STUB_WAIT_SEC만큼 제자리 대기만 하고 다음 단계로 넘어간다. arm_node 쪽 좌표가 새 씬
+    # (Collected_Busbar3)에 맞게 준비되면, 아래 3개 메서드 내부만 실제 액션 호출
+    # (_send_busbar_goal/_send_fasten_goal)로 바꾸면 되고 FSM 흐름 자체는 안 건드려도 된다.
+    def _enter_stub_wait(self, label: str) -> bool:
+        """대기가 끝난 첫 tick에만 True. 반환 후 타이머를 리셋해 다음 스텁 state가 이어서
+        새로 잡을 수 있게 한다."""
+        if self._stub_deadline is None:
+            self._stub_deadline = self.get_clock().now() + Duration(seconds=STUB_WAIT_SEC)
+            self._stub_label = label
+            self._stub_last_remaining_sec = math.ceil(STUB_WAIT_SEC)
+            self.get_logger().info(
+                f'[{label} 중...] 로봇 정지 유지 | 예상 시간 {STUB_WAIT_SEC:.1f}초')
+            return False
+
+        now = self.get_clock().now()
+        if now >= self._stub_deadline:
+            self.get_logger().info(f'[{label} 완료] 다음 단계로 이동합니다.')
+            self._stub_deadline = None
+            self._stub_label = None
+            self._stub_last_remaining_sec = None
+            return True
+
+        remaining = max(0.0, (self._stub_deadline - now).nanoseconds / 1e9)
+        remaining_sec = math.ceil(remaining)
+        if remaining_sec != self._stub_last_remaining_sec:
+            self._stub_last_remaining_sec = remaining_sec
+            self.get_logger().info(f'[{label} 중...] 남은 시간 약 {remaining_sec}초')
+        return False
+
+    def _enter_scan_stub(self):
+        station_number = self._scan_station_number
+        if self._enter_stub_wait(f'ST{station_number} 비전 스캔'):
+            if station_number < 6:
+                self._scan_station_number += 1
+                if station_number == 3:
+                    self._scan_route_queue = [
+                        'scan_3_exit',
+                        'scan_4_approach',
+                        'scan_station_4',
+                    ]
+                    self.get_logger().info(
+                        '[ST3→ST4 안전 우회] 모듈팩 하단을 피해 '
+                        'ST3 이탈점 → ST4 접근점 → ST4 순서로 이동합니다.')
+                self._set_state(State.MOVE_TO_SCAN_STATION)
+            else:
+                self.get_logger().info(
+                    '[전체 스캔 완료] ST1 → ST2 → ST3 → ST4 → ST5 → ST6')
+                self._bus1_route_queue = [
+                    'scan_6_straight_exit',
+                    'busbar_return_approach',
+                ]
+                self.get_logger().info(
+                    '[ST6→BUS1 직행] ST6에서 모듈팩 끝까지 짧게 직진한 뒤 '
+                    '반시계 방향으로 BUS1 방향을 맞추며 기존 BUS1 중간점까지 '
+                    '곧바로 전진합니다.')
+                self._set_state(State.MOVE_TO_BUS_APPROACH)
+
+    def _enter_grasp_stub(self):
+        if self._enter_stub_wait('버스바 파지'):
+            self._set_state(State.MOVE_BACK_TO_BUS_DOCK_APPROACH)
+
+    def _enter_fasten_stub(self):
+        if self._enter_stub_wait('ST1 버스바·너트 체결'):
+            self._set_state(State.MOVE_TO_BUSBAR2_APPROACH)
+
+    def _enter_grasp2_stub(self):
+        if self._enter_stub_wait('BUS2 버스바 파지'):
+            self._set_state(State.MOVE_TO_STATION2)
+
+    def _enter_fasten2_stub(self):
+        if self._enter_stub_wait('ST2 버스바·너트 체결'):
+            self._set_state(State.MOVE_TO_BUSBAR3_APPROACH)
+
+    def _enter_grasp3_stub(self):
+        if self._enter_stub_wait('BUS3 버스바 파지'):
+            self._set_state(State.MOVE_TO_STATION3)
+
+    def _enter_fasten3_stub(self):
+        if self._enter_stub_wait('ST3 버스바·너트 체결'):
+            self._set_state(State.REPORT)
 
     # --- arm_node 서버 연결 · 응답 · 실행 결과 타임아웃 -------------------------
     def _next_attempt_id(self, command: str) -> str:
@@ -528,6 +927,32 @@ class BehaviorNode(Node):
         self._set_state(self._recover_target_state)
         if failed_state == State.MOVE_TO_STATION:
             self._enter_move_to_station()
+        elif failed_state == State.MOVE_TO_SCAN_STATION:
+            self._enter_move_to_scan_station()
+        elif failed_state == State.MOVE_TO_BUS_APPROACH:
+            self._enter_move_to_bus_approach()
+        elif failed_state == State.MOVE_TO_BUS_DOCK_APPROACH:
+            self._enter_move_to_bus_dock_approach()
+        elif failed_state == State.MOVE_TO_BUSBAR_TABLE:
+            self._enter_move_to_busbar_table()
+        elif failed_state == State.MOVE_BACK_TO_BUS_DOCK_APPROACH:
+            self._enter_move_back_to_bus_dock_approach()
+        elif failed_state == State.MOVE_BACK_TO_BUS_APPROACH:
+            self._enter_move_back_to_bus_approach()
+        elif failed_state == State.MOVE_BACK_TO_STATION:
+            self._enter_move_back_to_station()
+        elif failed_state == State.MOVE_TO_BUSBAR2_APPROACH:
+            self._enter_move_to_busbar2_approach()
+        elif failed_state == State.MOVE_TO_BUSBAR2_TABLE:
+            self._enter_move_to_busbar2_table()
+        elif failed_state == State.MOVE_TO_STATION2:
+            self._enter_move_to_station2()
+        elif failed_state == State.MOVE_TO_BUSBAR3_APPROACH:
+            self._enter_move_to_busbar3_approach()
+        elif failed_state == State.MOVE_TO_BUSBAR3_TABLE:
+            self._enter_move_to_busbar3_table()
+        elif failed_state == State.MOVE_TO_STATION3:
+            self._enter_move_to_station3()
         elif failed_state in (State.GRASP_BUSBAR, State.INSERT_BUSBAR):
             self._send_busbar_goal('GRASP' if failed_state == State.GRASP_BUSBAR else 'INSERT')
         elif failed_state in (State.NUT_APPROACH, State.NUT_GRASP,

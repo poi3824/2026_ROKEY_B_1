@@ -255,6 +255,8 @@ training/eval/results/
 !/isaacpjt/M0609/assembly_nut_fraction1.py
 !/isaacpjt/M0609/error_fix_depth1.py
 !/isaacpjt/M0609/plot_yaw_align_log.py
+!/isaacpjt/M0609/execute_isaac_busbar_amr.py
+!/isaacpjt/M0609/AMR_HANDOFF_2026-07-27.md
 /src/Collected_World0123/
 
 # 궤적 녹화 스크립트 실행 로그 (재현 시 매번 새로 생성됨, 로컬 절대경로 포함)
