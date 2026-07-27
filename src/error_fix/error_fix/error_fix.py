@@ -142,8 +142,9 @@ class BatteryAssemblyVisionNode(Node):
         # ★ Kp를 더 낮춤(2026-07-27, 노이즈 증폭 완화): Kp*(error-prev_error)항이 픽셀
         # 노이즈를 그대로 증폭시키는 게 확인돼서 0.15->0.075로 절반 인하. Ki(적분/수렴
         # 속도)는 그대로 유지.
-        self.pi_x = IncrementalPI(kp=0.05, ki=0.35, out_limit=0.002)   # m/cycle
-        self.pi_y = IncrementalPI(kp=0.05, ki=0.35, out_limit=0.002)   # m/cycle
+        # ★ 버스바 체결 성공 확인된 최초 PI 값으로 복귀 (2026-07-27, 사용자 요청)
+        self.pi_x = IncrementalPI(kp=0.15, ki=0.35, out_limit=0.002)   # m/cycle
+        self.pi_y = IncrementalPI(kp=0.15, ki=0.35, out_limit=0.002)   # m/cycle
         # ★ yaw 오실레이션 튜닝(2026-07-27): assembly_nut_fraction1.py의 Kp=1.0/Ki=0.0589는
         # RMPFlow 플랜트(τ≈0.283s)만 실측하고 비전 왕복지연 θ=0으로 가정한 λ=τ 값인데,
         # 여기 dtheta는 그 소스(/busbar_alignment_error, 스무딩됨)가 아니라 매 프레임 Hough
@@ -151,7 +152,7 @@ class BatteryAssemblyVisionNode(Node):
         # "θ=0 가정하고 밀어붙이면 진동"이라 경고된 상황이 재현됨. 대역폭을 절반(λ=2τ)으로
         # 낮췄었으나(Kp=0.5) 스무딩 추가 후에도 노이즈 증폭이 남아 Kp만 추가로 절반 인하.
         # Ki(수렴 속도)는 유지.
-        self.pi_yaw = IncrementalPI(kp=0.25, ki=0.0295, out_limit=0.5)  # deg/cycle
+        self.pi_yaw = IncrementalPI(kp=1.0, ki=0.0589, out_limit=0.5)  # deg/cycle
 
         # 연속 30 Step 유지 카운터
         self.hold_count = 0
