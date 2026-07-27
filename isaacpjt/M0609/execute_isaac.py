@@ -50,8 +50,8 @@ from isaacsim.core.utils.types import ArticulationAction
 # 3. ROS 2 Imports
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import PoseStamped
-from std_msgs.msg import String, Float32
+from geometry_msgs.msg import PoseStamped, Pose2D
+from std_msgs.msg import String, Float32, Empty
 
 # RMPFlow Controller 경로 설정
 _THIS_DIR = Path(__file__).resolve().parent
@@ -61,12 +61,18 @@ from m0609_rmpflow_controller import RMPFlowController
 # ══════════════════════════════════════════════════════════════════════════
 #  [A] 설정 및 파라미터
 # ══════════════════════════════════════════════════════════════════════════
-USD_PATH = "/home/rokey/junhyeok_version/isaacpjt/M0609/Collected_Busbar/Busbar.usd"
+USD_PATH = "/home/rokey/junhyeok_version/isaacpjt/M0609/Collected_Busbar_AMR/Busbar.usd"
 
 NOVA_CARTER_ROOT = "/World/Nova_Carter/chassis_link"
 M0609_PATH       = "/World/m0609"
 EE_LINK_NAME     = "link_6"
 GRIPPER_JOINTS   = ["finger_joint", "right_inner_knuckle_joint"]
+
+# AMR 이동 파라미터 (amr_node의 arrival_tolerance_m 기본값 0.05m보다 더 정확히 세워서 도착)
+AMR_LINEAR_SPEED  = 0.3    # m/s
+AMR_ANGULAR_SPEED = 1.0    # rad/s
+AMR_POS_TOL       = 0.02   # m
+AMR_YAW_TOL       = 0.03   # rad
 
 BUSBAR_ROOT_PATH      = "/World/busbar"
 BUSBAR_POLYSHAPE_PATH = "/World/busbar/geo/PolyShape"
@@ -176,6 +182,17 @@ class Execute_Isaac_Busar(Node):
             String, '/task_command', self._on_task_command, 10
         )
 
+        # amr_node 연동 (amr_node.py: PUB /amr/goal_pose, SUB /amr/sim_pose, SUB /amr/cancel)
+        self.amr_goal_pose = None
+        self.amr_cancel_requested = False
+        self.sub_amr_goal_pose = self.create_subscription(
+            PoseStamped, '/amr/goal_pose', self._on_amr_goal_pose, 10
+        )
+        self.sub_amr_cancel = self.create_subscription(
+            Empty, '/amr/cancel', self._on_amr_cancel, 10
+        )
+        self.pub_amr_sim_pose = self.create_publisher(Pose2D, '/amr/sim_pose', 10)
+
         self.pub_phase = self.create_publisher(String, '/isaac_phase', 10)
         self.pub_progress = self.create_publisher(Float32, '/isaac_progress', 10)
         self.pub_status = self.create_publisher(String, '/isaac_status', 10)
@@ -183,6 +200,12 @@ class Execute_Isaac_Busar(Node):
 
     def _on_target_pose(self, msg: PoseStamped):
         self.latest_target_pose = msg
+
+    def _on_amr_goal_pose(self, msg: PoseStamped):
+        self.amr_goal_pose = msg
+
+    def _on_amr_cancel(self, msg: Empty):
+        self.amr_cancel_requested = True
 
     def _on_task_command(self, msg: String):
         self.get_logger().info(f"[Task Command 수신]: {msg.data}")
@@ -242,6 +265,8 @@ def find_prim_path(stage, root_path, name):
 
 
 def lock_amr_base(stage, amr_root_path):
+    """로봇팔 작업 중 AMR 바퀴를 고정(브레이크)한다 - 팔의 반력으로 베이스가
+    흔들리는 것을 방지."""
     amr_prim = stage.GetPrimAtPath(amr_root_path).GetParent()
     if not amr_prim.IsValid():
         amr_prim = stage.GetPrimAtPath(amr_root_path)
@@ -255,6 +280,28 @@ def lock_amr_base(stage, amr_root_path):
                 drive.GetMaxForceAttr().Set(1.0e9)
                 if drive.GetTargetVelocityAttr():
                     drive.GetTargetVelocityAttr().Set(0.0)
+
+
+def unlock_amr_base(stage, amr_root_path):
+    """AMR 이동 시작 전 바퀴 구동부를 풀어준다 (lock_amr_base의 반대) - 베이스를
+    set_world_pose로 직접 이동시키므로 바퀴 조인트가 그 이동에 저항하지 않도록 함."""
+    amr_prim = stage.GetPrimAtPath(amr_root_path).GetParent()
+    if not amr_prim.IsValid():
+        amr_prim = stage.GetPrimAtPath(amr_root_path)
+
+    for prim in Usd.PrimRange(amr_prim):
+        for dt in ("angular", "linear"):
+            drive = UsdPhysics.DriveAPI.Get(prim, dt)
+            if drive:
+                drive.GetStiffnessAttr().Set(0.0)
+                drive.GetDampingAttr().Set(0.0)
+                drive.GetMaxForceAttr().Set(0.0)
+
+
+def quat_wxyz_to_yaw(quat_wxyz):
+    """월드 Z축 기준 yaw(rad)만 추출 (AMR은 평면 위를 움직이므로 roll/pitch는 무시)."""
+    w, x, y, z = quat_wxyz
+    return math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
 
 
 def glue_busbar_to_ee(robot, busbar_xform, rest_pick_pos, blend):
@@ -417,6 +464,11 @@ def main():
     prev_ee_z           = 0.0
     stuck_counter       = 0
 
+    # ── AMR 이동 상태 (amr_node <-> /amr/goal_pose, /amr/sim_pose) ──
+    amr_moving = False
+    amr_target_xy_theta = None
+    wheels_locked = True  # main() 시작 시 lock_amr_base() 이미 호출됨
+
     def publish_status(status_str: str):
         msg = String()
         msg.data = status_str
@@ -463,10 +515,98 @@ def main():
             screw_pass_theta = 0.0
             stuck_counter = 0
 
+            amr_moving = False
+            amr_target_xy_theta = None
+
+        # 1.5. AMR 이동 처리 (behavior_node -> amr_node -> /amr/goal_pose)
+        #      팔 작업 중에는 바퀴를 잠그고(lock), AMR 이동 중에는 풀어준다(unlock).
+        if playing:
+            if isaac_node.amr_cancel_requested:
+                isaac_node.amr_cancel_requested = False
+                if amr_moving:
+                    print("\n[AMR] 이동 취소 수신 -> 정지 및 바퀴 잠금")
+                amr_moving = False
+                amr_target_xy_theta = None
+                if not wheels_locked:
+                    lock_amr_base(stage, NOVA_CARTER_ROOT)
+                    wheels_locked = True
+
+            if isaac_node.amr_goal_pose is not None:
+                goal_msg = isaac_node.amr_goal_pose
+                isaac_node.amr_goal_pose = None
+                g_pos = goal_msg.pose.position
+                g_ori = goal_msg.pose.orientation
+                g_theta = quat_wxyz_to_yaw([g_ori.w, g_ori.x, g_ori.y, g_ori.z])
+                amr_target_xy_theta = (g_pos.x, g_pos.y, g_theta)
+                amr_moving = True
+                if wheels_locked:
+                    unlock_amr_base(stage, NOVA_CARTER_ROOT)
+                    wheels_locked = False
+                print(f"\n>>> [AMR] 이동 목표 수신 (X={g_pos.x:.4f}, Y={g_pos.y:.4f}, "
+                      f"Theta={g_theta:.4f}) -> 바퀴 잠금 해제, 이동 시작")
+
+            amr_pos, amr_quat = robot.get_world_pose()
+            amr_yaw = quat_wxyz_to_yaw(amr_quat)
+
+            if amr_moving and amr_target_xy_theta is not None:
+                tx, ty, ttheta = amr_target_xy_theta
+                dx, dy = tx - amr_pos[0], ty - amr_pos[1]
+                dist = math.hypot(dx, dy)
+                dyaw = math.atan2(math.sin(ttheta - amr_yaw), math.cos(ttheta - amr_yaw))
+
+                if dist > 1e-6:
+                    step_dist = min(dist, AMR_LINEAR_SPEED * PHYSICS_DT)
+                    new_x = amr_pos[0] + dx / dist * step_dist
+                    new_y = amr_pos[1] + dy / dist * step_dist
+                else:
+                    new_x, new_y = amr_pos[0], amr_pos[1]
+
+                step_yaw = max(-AMR_ANGULAR_SPEED * PHYSICS_DT, min(AMR_ANGULAR_SPEED * PHYSICS_DT, dyaw))
+                new_yaw = amr_yaw + step_yaw
+
+                robot.set_world_pose(
+                    position=np.array([new_x, new_y, amr_pos[2]]),
+                    orientation=euler_to_quaternion_wxyz(0.0, 0.0, new_yaw),
+                )
+                amr_pos = np.array([new_x, new_y, amr_pos[2]])
+                amr_yaw = new_yaw
+
+                if dist < AMR_POS_TOL and abs(dyaw) < AMR_YAW_TOL:
+                    amr_moving = False
+                    amr_target_xy_theta = None
+                    print(f"\n[AMR] 목표 지점 도착 (X={new_x:.4f}, Y={new_y:.4f}) -> 바퀴 잠금")
+                    lock_amr_base(stage, NOVA_CARTER_ROOT)
+                    wheels_locked = True
+
+                    # AMR이 이동했으므로 팔 IK가 가정하는 베이스 위치도 갱신해야 한다.
+                    base_link_xf = world_xf(stage, f"{M0609_PATH}/base_link")
+                    base_pos = base_link_xf.ExtractTranslation()
+                    base_quat = base_link_xf.ExtractRotationQuat()
+                    arm_controller._motion_policy.set_robot_base_pose(
+                        robot_position=np.array([base_pos[0], base_pos[1], base_pos[2]]),
+                        robot_orientation=np.array(
+                            [base_quat.GetReal(), *[float(v) for v in base_quat.GetImaginary()]]
+                        ),
+                    )
+
+            sim_pose_msg = Pose2D()
+            sim_pose_msg.x = float(amr_pos[0])
+            sim_pose_msg.y = float(amr_pos[1])
+            sim_pose_msg.theta = float(amr_yaw)
+            isaac_node.pub_amr_sim_pose.publish(sim_pose_msg)
+
         # 2. BehaviorNode / ArmNode 명령 분기 처리
         if playing and isaac_node.requested_task:
             task = isaac_node.requested_task
             isaac_node.requested_task = None
+
+            # 안전장치: 팔 Task는 AMR이 도착해 바퀴가 잠긴 상태에서만 수행되어야 한다.
+            if not wheels_locked:
+                print(f"\n[WARN] [{task}] 바퀴가 아직 안 잠긴 상태 -> 강제 잠금 후 진행")
+                lock_amr_base(stage, NOVA_CARTER_ROOT)
+                wheels_locked = True
+                amr_moving = False
+                amr_target_xy_theta = None
 
             if task == "SCAN_BATTERY":
                 phase = "INIT_POSE"

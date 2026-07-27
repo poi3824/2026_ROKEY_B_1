@@ -1,70 +1,221 @@
-"""amr_node
-실행 계층 · 목표 스테이션으로 이동, 도착·이동·오류 상태 보고.
+"""FMS의 AMR 명령과 Isaac Sim AMR 브리지를 연결한다.
 
-SUB /amr/goal      (fms_interfaces/AmrGoal)     <- behavior_node
-PUB /amr/status    (fms_interfaces/AmrStatus)   -> behavior_node
+다른 ``src`` 노드는 커스텀 메시지인 ``/amr/goal``과 ``/amr/status``만 사용한다.
+Isaac Sim 프로세스는 커스텀 인터페이스를 import하지 않고 표준 메시지 토픽만
+사용한다. 이 노드가 두 영역 사이에서 메시지 변환, 상태 추적, 오류 처리를 맡는다.
 
-PUB /amr/cmd_vel   (geometry_msgs/Twist)        -> Isaac Sim (이동 명령)
-SUB /amr/sim_pose  (geometry_msgs/Pose2D)       <- Isaac Sim (위치 상태)
+SUB /amr/goal        (fms_interfaces/AmrGoal)     <- behavior/test node
+PUB /amr/status      (fms_interfaces/AmrStatus)   -> behavior/test node
+PUB /amr/goal_pose   (geometry_msgs/PoseStamped)  -> Isaac Sim
+SUB /amr/sim_pose    (geometry_msgs/Pose2D)       <- Isaac Sim
+SUB /amr/drive_state (std_msgs/String, optional)  <- physics bridge
+PUB /amr/cancel      (std_msgs/Empty)              -> physics bridge
+
+``scripts/execute_isaac.py``처럼 ``/amr/sim_pose``만 발행하는 단순 브리지에서는
+위치 허용 오차로 도착을 판단한다. ``/amr/drive_state``를 지원하는 물리 브리지에서는
+위치뿐 아니라 최종 자세 정렬과 실패 여부까지 브리지가 판정한 결과를 사용한다.
 """
+import json
 import math
+import time
 
 import rclpy
+from geometry_msgs.msg import Pose2D, PoseStamped
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
-from geometry_msgs.msg import Twist
+from std_msgs.msg import Empty, String
 
 from fms_interfaces.msg import AmrGoal, AmrStatus
 
-ARRIVAL_TOLERANCE_M = 0.05
+DEFAULT_ARRIVAL_TOLERANCE_M = 0.05
+DEFAULT_BRIDGE_TIMEOUT_SEC = 10.0
+GOAL_FRAME_ID = 'amr_baseline'
+ACTIVE_DRIVE_STATES = {'ACTIVE', 'DRIVING'}
+TERMINAL_DRIVE_STATES = {'ARRIVED', 'FAILED', 'CANCELED'}
+
+
+def _stamp_key(msg: PoseStamped) -> str:
+    """Return the bridge correlation key encoded in a goal header."""
+    return f'{int(msg.header.stamp.sec)}:{int(msg.header.stamp.nanosec)}'
+
+
+def _goal_error(station_id: str, x: float, y: float, theta: float):
+    """Return a user-facing validation error, or ``None`` for a valid goal."""
+    if not station_id.strip():
+        return 'station_id가 비어 있습니다'
+    if not all(math.isfinite(float(value)) for value in (x, y, theta)):
+        return '목표 좌표에 NaN/inf가 포함돼 있습니다'
+    return None
 
 
 class AmrNode(Node):
+    """Translate FMS goals and report the corresponding Isaac drive result."""
 
     def __init__(self):
+        """Create the FMS-facing and Isaac-facing ROS interfaces."""
         super().__init__('amr_node')
 
-        self._goal_sub = self.create_subscription(AmrGoal, '/amr/goal', self._on_goal, 10)
-        self._status_pub = self.create_publisher(AmrStatus, '/amr/status', 10)
+        self.declare_parameter(
+            'arrival_tolerance_m', DEFAULT_ARRIVAL_TOLERANCE_M)
+        self.declare_parameter(
+            'bridge_timeout_sec', DEFAULT_BRIDGE_TIMEOUT_SEC)
+        self._arrival_tolerance = float(
+            self.get_parameter('arrival_tolerance_m').value)
+        self._bridge_timeout = float(
+            self.get_parameter('bridge_timeout_sec').value)
+        if self._arrival_tolerance <= 0.0:
+            raise ValueError('arrival_tolerance_m must be greater than zero')
+        if self._bridge_timeout < 0.0:
+            raise ValueError('bridge_timeout_sec must be zero or greater')
 
-        # Isaac Sim 연동 인터페이스
-        self._cmd_vel_pub = self.create_publisher(Twist, '/amr/cmd_vel', 10)
-        # TODO: Isaac Sim에서 실제 AMR 위치를 퍼블리시하면 이 콜백에서 도착 판정을 갱신.
+        self._goal_sub = self.create_subscription(
+            AmrGoal, '/amr/goal', self._on_goal, 10)
+        self._status_pub = self.create_publisher(
+            AmrStatus, '/amr/status', 10)
+        self._goal_pose_pub = self.create_publisher(
+            PoseStamped, '/amr/goal_pose', 10)
+        self._cancel_pub = self.create_publisher(
+            Empty, '/amr/cancel', 10)
+        self._sim_pose_sub = self.create_subscription(
+            Pose2D, '/amr/sim_pose', self._on_sim_pose, 10)
+        self._drive_state_sub = self.create_subscription(
+            String, '/amr/drive_state', self._on_drive_state, 10)
+
         self._current_pose = (0.0, 0.0, 0.0)
-
-        self._goal = None
+        self._goal_station_id = ''
+        self._goal_xy = None
+        self._goal_stamp = ''
         self._moving = False
+        self._drive_state_seen = False
+        self._last_bridge_activity = 0.0
+        self._watchdog = self.create_timer(1.0, self._on_watchdog)
 
-        self.declare_parameter('sim_move_duration_sec', 3.0)
-
-        self.get_logger().info('amr_node started')
+        self.get_logger().info(
+            'amr_node started: FMS(/amr/goal, /amr/status) <-> '
+            'Isaac(/amr/goal_pose, /amr/sim_pose)')
 
     def _on_goal(self, msg: AmrGoal):
-        self.get_logger().info(f'SUB /amr/goal <- {msg.station_id} ({msg.x:.2f}, {msg.y:.2f})')
-        self._goal = msg
-        self._moving = True
-        self._publish_status(AmrStatus.STATE_MOVING, msg.station_id, '이동 중')
-
-        # TODO: 실제 경로 계획/제어 대신, 지금은 목표 방향으로 cmd_vel을 흉내내어 발행하고
-        # 일정 시간 뒤 Isaac Sim의 위치 피드백 없이 도착으로 간주한다.
-        dx = msg.x - self._current_pose[0]
-        dy = msg.y - self._current_pose[1]
-        twist = Twist()
-        twist.linear.x = math.copysign(0.3, dx) if abs(dx) > ARRIVAL_TOLERANCE_M else 0.0
-        twist.linear.y = math.copysign(0.3, dy) if abs(dy) > ARRIVAL_TOLERANCE_M else 0.0
-        self._cmd_vel_pub.publish(twist)
-
-        duration = self.get_parameter('sim_move_duration_sec').value
-        self._arrival_timer = self.create_timer(duration, self._on_arrived)
-
-    def _on_arrived(self):
-        self._arrival_timer.cancel()
-        if self._goal is None:
+        error = _goal_error(msg.station_id, msg.x, msg.y, msg.theta)
+        if error is not None:
+            self.get_logger().error(
+                f'/amr/goal 거부 ({msg.station_id!r}): {error}')
+            self._publish_status(
+                AmrStatus.STATE_ERROR, msg.station_id, error)
             return
-        self._current_pose = (self._goal.x, self._goal.y, self._goal.theta)
-        self._cmd_vel_pub.publish(Twist())  # 정지
+
+        station_id = msg.station_id.strip()
+        self.get_logger().info(
+            f'SUB /amr/goal <- {station_id} '
+            f'({msg.x:.4f}, {msg.y:.4f}, {msg.theta:.4f})')
+
+        if self._moving:
+            old_station = self._goal_station_id
+            self._moving = False
+            self._cancel_pub.publish(Empty())
+            self.get_logger().warn(
+                f'새 목표 {station_id} 수신: 기존 목표 {old_station} 취소')
+
+        goal_pose = PoseStamped()
+        goal_pose.header.stamp = self.get_clock().now().to_msg()
+        goal_pose.header.frame_id = GOAL_FRAME_ID
+        goal_pose.pose.position.x = float(msg.x)
+        goal_pose.pose.position.y = float(msg.y)
+        goal_pose.pose.orientation.z = math.sin(float(msg.theta) * 0.5)
+        goal_pose.pose.orientation.w = math.cos(float(msg.theta) * 0.5)
+
+        self._goal_station_id = station_id
+        self._goal_xy = (float(msg.x), float(msg.y))
+        self._goal_stamp = _stamp_key(goal_pose)
+        self._moving = True
+        self._drive_state_seen = False
+        self._last_bridge_activity = time.monotonic()
+
+        self._publish_status(
+            AmrStatus.STATE_MOVING,
+            station_id,
+            'Isaac Sim에 이동 목표 전송')
+        self._goal_pose_pub.publish(goal_pose)
+        self.get_logger().info(
+            f'PUB /amr/goal_pose [{GOAL_FRAME_ID}] -> '
+            f'({msg.x:.4f}, {msg.y:.4f}, {msg.theta:.4f}), '
+            f'stamp={self._goal_stamp}')
+
+    def _on_sim_pose(self, msg: Pose2D):
+        self._current_pose = (msg.x, msg.y, msg.theta)
+
+        if not self._moving or self._goal_xy is None:
+            return
+        self._last_bridge_activity = time.monotonic()
+
+        # drive_state가 온 물리 브리지는 최종 yaw와 안정화 프레임까지 검사한다.
+        if self._drive_state_seen:
+            return
+
+        dx = self._goal_xy[0] - msg.x
+        dy = self._goal_xy[1] - msg.y
+        distance = math.hypot(dx, dy)
+        if distance <= self._arrival_tolerance:
+            self._finish(
+                AmrStatus.STATE_ARRIVED,
+                f'도착 (위치 오차 {distance:.3f} m)')
+
+    def _on_drive_state(self, msg: String):
+        try:
+            payload = json.loads(msg.data)
+            state = str(payload['state']).upper()
+            stamp = str(payload.get('goal_stamp', ''))
+            message = str(payload.get('message', ''))
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+            self.get_logger().warn(
+                f'잘못된 /amr/drive_state JSON 무시: {exc}')
+            return
+
+        if not self._moving or stamp != self._goal_stamp:
+            return
+        if state not in ACTIVE_DRIVE_STATES | TERMINAL_DRIVE_STATES:
+            self.get_logger().warn(
+                f'알 수 없는 /amr/drive_state 상태 무시: {state}')
+            return
+
+        self._drive_state_seen = True
+        self._last_bridge_activity = time.monotonic()
+        if state == 'ARRIVED':
+            self._finish(
+                AmrStatus.STATE_ARRIVED,
+                message or 'Isaac Sim 주행 완료')
+        elif state in {'FAILED', 'CANCELED'}:
+            self._finish(
+                AmrStatus.STATE_ERROR,
+                message or f'Isaac Sim 주행 {state.lower()}')
+
+    def _on_watchdog(self):
+        if not self._moving or self._bridge_timeout == 0.0:
+            return
+        silence = time.monotonic() - self._last_bridge_activity
+        if silence <= self._bridge_timeout:
+            return
+
+        self._cancel_pub.publish(Empty())
+        self._finish(
+            AmrStatus.STATE_ERROR,
+            f'Isaac Sim 브리지 응답이 {silence:.1f}초 동안 없습니다')
+
+    def _finish(self, state: int, message: str):
+        if not self._moving:
+            return
+        station_id = self._goal_station_id
         self._moving = False
-        self._publish_status(AmrStatus.STATE_ARRIVED, self._goal.station_id, '도착')
+        self._goal_xy = None
+        self._goal_stamp = ''
+        self._drive_state_seen = False
+        self._publish_status(state, station_id, message)
+
+    def cancel(self):
+        """Cancel an active bridge goal during node shutdown."""
+        if not self._moving:
+            return
+        self._moving = False
+        self._cancel_pub.publish(Empty())
 
     def _publish_status(self, state: int, station_id: str, message: str):
         status = AmrStatus()
@@ -72,10 +223,12 @@ class AmrNode(Node):
         status.station_id = station_id
         status.message = message
         self._status_pub.publish(status)
-        self.get_logger().info(f'PUB /amr/status -> {station_id} state={state}')
+        self.get_logger().info(
+            f'PUB /amr/status -> {station_id} state={state}: {message}')
 
 
 def main(args=None):
+    """Run the AMR integration node."""
     rclpy.init(args=args)
     node = AmrNode()
     try:
@@ -83,12 +236,13 @@ def main(args=None):
     except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
-        if rclpy.ok():
-            try:
+        try:
+            if rclpy.ok():
+                node.cancel()
                 node.destroy_node()
+        finally:
+            if rclpy.ok():
                 rclpy.shutdown()
-            except KeyboardInterrupt:
-                pass
 
 
 if __name__ == '__main__':
