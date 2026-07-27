@@ -39,7 +39,7 @@ sys.stdout.reconfigure(line_buffering=True)
 
 # 2. USD 및 Isaac Core Imports
 import omni.usd
-from pxr import Usd, UsdGeom, UsdPhysics, Gf
+from pxr import Usd, UsdGeom, UsdPhysics, Gf, Sdf
 from isaacsim.core.api import World
 from isaacsim.core.prims import SingleXFormPrim
 from isaacsim.robot.manipulators.grippers import ParallelGripper
@@ -64,6 +64,19 @@ USD_PATH = os.environ.get(
     "INTEGRATED_USD_PATH",
     str(_THIS_DIR.parents[1] / "src/Collected_Busbar_amr/Busbar.usd"),
 )
+
+# 고정 카메라 영상은 실제 Camera prim에서 렌더링하고, TF만 그 아래의 ROS optical
+# frame에서 발행해야 한다. optical Xform을 RenderProduct의 cameraPrim으로 지정하면
+# 렌즈 속성을 찾지 못한 Isaac이 다른 Camera로 fallback하여 영상과 TF가 어긋난다.
+FIXED_CAMERA_RENDER_PRODUCTS = {
+    "/World/Graph/camera_graph/RenderProduct_busbar": "/World/Camera_busbar",
+    "/World/Graph/camera_graph/RenderProduct_bolt": "/World/Camera_bolt",
+}
+FIXED_CAMERA_OPTICAL_FRAMES = (
+    "/World/Camera_busbar/busbar_cam_optical_frame",
+    "/World/Camera_bolt/bolt_cam_optical_frame",
+)
+TF_PUBLISH_NODE = "/World/ActionGraph/ros2_publish_transform_tree"
 
 NOVA_CARTER_ROOT = "/World/Nova_Carter/chassis_link"
 M0609_PATH       = "/World/m0609"
@@ -179,6 +192,44 @@ PHYSICS_DT               = 1.0 / 60.0
 URDF_PATH        = str(_THIS_DIR / "doosan-robot2/urdf/m0609_isaac_sim.urdf")
 ROBOT_DESC_PATH  = str(_THIS_DIR / "rmpflow/m0609_description.yaml")
 RMPFLOW_CFG_PATH = str(_THIS_DIR / "rmpflow/m0609_rmpflow_common.yaml")
+
+
+def configure_fixed_camera_bridges(stage):
+    """현재 USD 카메라 자세를 유지한 채 RenderProduct와 optical TF 관계만 보정한다."""
+    for render_product_path, camera_path in FIXED_CAMERA_RENDER_PRODUCTS.items():
+        render_product = stage.GetPrimAtPath(render_product_path)
+        camera = stage.GetPrimAtPath(camera_path)
+        if not render_product.IsValid() or not camera.IsValid():
+            raise RuntimeError(
+                f"고정 카메라 prim 누락: render_product={render_product_path}, "
+                f"camera={camera_path}"
+            )
+
+        camera_rel = render_product.GetRelationship("inputs:cameraPrim")
+        expected = [Sdf.Path(camera_path)]
+        if list(camera_rel.GetTargets()) != expected:
+            camera_rel.SetTargets(expected)
+            print(f"[camera] {render_product_path} -> {camera_path} 보정")
+
+    tf_node = stage.GetPrimAtPath(TF_PUBLISH_NODE)
+    if not tf_node.IsValid():
+        raise RuntimeError(f"TF publish node 누락: {TF_PUBLISH_NODE}")
+
+    for optical_path in FIXED_CAMERA_OPTICAL_FRAMES:
+        if not stage.GetPrimAtPath(optical_path).IsValid():
+            raise RuntimeError(f"고정 카메라 optical frame 누락: {optical_path}")
+
+    target_rel = tf_node.GetRelationship("inputs:targetPrims")
+    fixed_related = set(FIXED_CAMERA_RENDER_PRODUCTS.values()) | set(FIXED_CAMERA_OPTICAL_FRAMES)
+    targets = [
+        target for target in target_rel.GetTargets()
+        if str(target) not in fixed_related
+    ]
+    targets.extend(Sdf.Path(path) for path in FIXED_CAMERA_OPTICAL_FRAMES)
+    if list(target_rel.GetTargets()) != targets:
+        target_rel.SetTargets(targets)
+        print("[camera] busbar/bolt optical TF target 보정")
+
 
 # ══════════════════════════════════════════════════════════════════════════
 #  [B] 비전 브릿지 및 유틸리티 함수
@@ -456,6 +507,7 @@ def main():
     stage = ctx.get_stage()
     if not stage:
         raise RuntimeError(f"[ERROR] Stage를 로드하지 못했습니다: {usd_file_path}")
+    configure_fixed_camera_bridges(stage)
 
     world = World(stage_units_in_meters=1.0, physics_dt=PHYSICS_DT)
     lock_amr_base(stage, NOVA_CARTER_ROOT)

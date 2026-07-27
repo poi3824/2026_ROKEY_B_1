@@ -49,11 +49,15 @@ class ArmNode(Node):
         )
 
         # 2. Perception Node 서비스 클라이언트들
-        self.client_get_grasp_pose = self.create_client(
+        self.client_get_nut_pose = self.create_client(
             GetGraspPose, '/perception/get_grasp_pose', callback_group=self.cb_group
         )
+        self.client_get_busbar_pose = self.create_client(
+            GetGraspPose, '/busbar_cam/perception/get_grasp_pose',
+            callback_group=self.cb_group
+        )
         self.client_get_bolt_pair = self.create_client(
-            GetBoltPair, '/perception/get_bolt_pair', callback_group=self.cb_group
+            GetBoltPair, '/bolt_cam/perception/get_bolt_pair', callback_group=self.cb_group
         )
 
         # 3. Perception Node 토픽 백업 구독
@@ -531,10 +535,15 @@ class ArmNode(Node):
     def request_vision_pose_async(self, target_label: str, timeout_sec: float = 3.0):
         """Action Thread 안전한 Service 비동기 호출"""
         if target_label in ["busbar", "nut"]:
-            if self.client_get_grasp_pose.wait_for_service(timeout_sec=1.0):
+            client = (
+                self.client_get_busbar_pose
+                if target_label == "busbar"
+                else self.client_get_nut_pose
+            )
+            if client.wait_for_service(timeout_sec=1.0):
                 req = GetGraspPose.Request()
                 req.label = target_label
-                future = self.client_get_grasp_pose.call_async(req)
+                future = client.call_async(req)
                 
                 start = time.time()
                 while not future.done():

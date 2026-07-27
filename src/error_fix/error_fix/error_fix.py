@@ -22,10 +22,10 @@ class BatteryAssemblyVisionNode(Node):
         # ROS 2 Subscribers & Publishers
         # ----------------------------------------------------------------------
         self.rgb_sub = self.create_subscription(
-            Image, '/camera_bolt/rgb', self.rgb_callback, 10
+            Image, '/bolt_cam/rgb', self.rgb_callback, 10
         )
         self.depth_sub = self.create_subscription(
-            Image, '/camera_bolt/depth', self.depth_callback, 10
+            Image, '/bolt_cam/depth', self.depth_callback, 10
         )
 
         # 트리거 명령 수신 (Isaac Sim으로부터 오차 보정 시작 신호 구독)
