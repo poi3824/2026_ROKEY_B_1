@@ -14,9 +14,11 @@ BehaviorNode (FSM) 및 ArmNode, Vision Correction Node 통신 연동 버전
 7. SCAN_NUT1 / SCAN_NUT2   : 너트 스캔 위치(버스바 체결 위치 기준 상대 이동)로 이동
 8. PICK_NUT1 / PICK_NUT2   : 초기 위치(HOME_EE_POS) 기준 고정 상대좌표로 접근(너트는 Nova
    Carter에 고정되어 비전 없이도 위치가 일정함), 물리 파지(Gripper Close) 및 상승
-9. ASSEMBLE_NUT1 / ASSEMBLE_NUT2 : 최초 SCAN_BATTERY 스캔 좌표(BATTERY_CENTER_POS, 버스바
-   grasp offset 영향 없음) 기준 사전 계산된 상대 오프셋을 적용해 산출한 볼트 목표 좌표로
-   이동, 착좌 및 Screwing 체결(Regrasp 포함)
+9. ASSEMBLE_NUT1 / ASSEMBLE_NUT2 : error_fix 노드가 /camera_bolt(고정 오버헤드 카메라) +
+   Depth로 볼트 1개를 직접 측정해 발행한 절대 world 좌표(/vision/bolt_anchor_pose)가 있으면
+   최우선 사용(반대편 볼트는 고정 상대 벡터로 계산), 없으면 최초 SCAN_BATTERY 스캔 좌표
+   (BATTERY_CENTER_POS, 버스바 grasp offset 영향 없음) 기준 사전 계산된 상대 오프셋을 적용해
+   산출한 볼트 목표 좌표로 대체. 이동, 착좌 및 Screwing 체결(Regrasp 포함)
 """
 
 import os
@@ -176,11 +178,19 @@ class Execute_Isaac_Busar(Node):
         self.requested_task = None
         self.alignment_success = False
 
+        # error_fix 노드가 /camera_bolt(고정 오버헤드 카메라) + Depth로 실측한 고정 볼트 1개의
+        # 절대 world 좌표. 팔의 kinematic 오차와 무관하므로 있으면 우선 사용 (반대편 볼트는
+        # 이 값 + 두 볼트 간 고정 오프셋 차이로 계산 - execute_isaac.py 쪽에서 처리).
+        self.bolt_anchor_pose = None
+
         self.sub_target_pose = self.create_subscription(
             PoseStamped, '/target_pose', self._on_target_pose, 10
         )
         self.sub_task_cmd = self.create_subscription(
             String, '/task_command', self._on_task_command, 10
+        )
+        self.sub_bolt_anchor_pose = self.create_subscription(
+            PoseStamped, '/vision/bolt_anchor_pose', self._on_bolt_anchor_pose, 10
         )
 
         self.pub_phase = self.create_publisher(String, '/isaac_phase', 10)
@@ -190,6 +200,9 @@ class Execute_Isaac_Busar(Node):
 
     def _on_target_pose(self, msg: PoseStamped):
         self.latest_target_pose = msg
+
+    def _on_bolt_anchor_pose(self, msg: PoseStamped):
+        self.bolt_anchor_pose = msg
 
     def _on_task_command(self, msg: String):
         self.get_logger().info(f"[Task Command 수신]: {msg.data}")
@@ -297,6 +310,21 @@ def compute_bolt_target_pos(nut_index, battery_center_pos):
     볼트 1/2번 체결 목표 3D 월드 좌표를 동적으로 산출한다 (절대좌표 하드코딩 금지)."""
     offset = BOLT1_OFFSET_FROM_CENTER if nut_index == 1 else BOLT2_OFFSET_FROM_CENTER
     return np.asarray(battery_center_pos) + offset
+
+
+def resolve_bolt_target_from_anchor(nut_index, anchor_world_xy, battery_center_xy):
+    """카메라가 실측한 고정 볼트 1개(anchor_world_xy)로부터 목표 볼트(nut_index) 좌표를 구한다.
+    anchor가 어느 볼트인지는 BOLT1/2_OFFSET_FROM_CENTER 대비 battery_center_xy(대략적인 사전
+    추정치, 라벨링 용도로만 사용 - 정확도는 anchor 실측값이 담당)와 가장 가까운 쪽으로 판별하고,
+    목표 볼트가 anchor와 같으면 실측값 그대로, 다르면 두 볼트 간 고정 상대 벡터(오프셋의 차)를
+    더해 반대편 위치를 계산한다."""
+    anchor_xy = np.asarray(anchor_world_xy)
+    center_xy = np.asarray(battery_center_xy)
+    dist1 = np.linalg.norm(anchor_xy - (center_xy + BOLT1_OFFSET_FROM_CENTER[:2]))
+    dist2 = np.linalg.norm(anchor_xy - (center_xy + BOLT2_OFFSET_FROM_CENTER[:2]))
+    anchor_offset = BOLT1_OFFSET_FROM_CENTER if dist1 < dist2 else BOLT2_OFFSET_FROM_CENTER
+    target_offset = BOLT1_OFFSET_FROM_CENTER if nut_index == 1 else BOLT2_OFFSET_FROM_CENTER
+    return anchor_xy + (target_offset[:2] - anchor_offset[:2])
 
 
 def update_target_positions(target_pose_msg: PoseStamped):
@@ -567,10 +595,25 @@ def main():
 
             elif task in ("ASSEMBLE_NUT1", "ASSEMBLE_NUT2"):
                 nut_index = 1 if task == "ASSEMBLE_NUT1" else 2
-                if target_mid_pos is not None and BATTERY_CENTER_POS is not None:
-                    # 볼트는 카메라에 가려 보이지 않으므로 비전 재검출을 못 함 -> 버스바 grasp
-                    # offset 영향이 없는 최초 SCAN_BATTERY 스캔 좌표(BATTERY_CENTER_POS)의 XY를
-                    # 기준으로 계산한다. Z는 버스바 체결 높이(target_mid_pos)를 유지.
+                if isaac_node.bolt_anchor_pose is not None and BATTERY_CENTER_POS is not None:
+                    # error_fix 노드가 /camera_bolt(고정 오버헤드 카메라, 팔과 무관) + Depth로
+                    # 직접 측정한 볼트 1개의 절대 world 좌표. 팔의 kinematic 오차, 버스바 grasp
+                    # offset 어느 쪽도 안 섞이므로 있으면 최우선으로 쓴다. 목표가 반대편 볼트면
+                    # 두 볼트 간 고정 상대 벡터를 더해 계산한다 (Hough Circle로 2개를 동시에
+                    # 안정적으로 분리 검출하기 어려워 1개만 실측하는 방식).
+                    anchor_pos = isaac_node.bolt_anchor_pose.pose.position
+                    anchor_xy = np.array([anchor_pos.x, anchor_pos.y])
+                    bolt_xy = resolve_bolt_target_from_anchor(nut_index, anchor_xy, BATTERY_CENTER_POS[:2])
+                    bolt_target_pos = np.array([bolt_xy[0], bolt_xy[1], 0.0])
+                    bolt_touch_pos = np.array([bolt_target_pos[0], bolt_target_pos[1], 0.3695])
+                    phase = "MOVE_TO_BOLT_NUT"
+                    step_count = 0
+                    print(f"\n>>> [{task}] 너트 {nut_index}번 -> 볼트 {nut_index}번 체결 시작 [카메라 실측] "
+                          f"(Target: X={bolt_target_pos[0]:.4f}, Y={bolt_target_pos[1]:.4f})")
+                elif target_mid_pos is not None and BATTERY_CENTER_POS is not None:
+                    # 카메라 기반 실측이 아직 없을 때의 대체 경로: 버스바 grasp offset 영향이
+                    # 없는 최초 SCAN_BATTERY 스캔 좌표(BATTERY_CENTER_POS)의 XY를 기준으로 계산.
+                    # Z는 버스바 체결 높이(target_mid_pos)를 유지.
                     battery_center_ref = np.array(
                         [BATTERY_CENTER_POS[0], BATTERY_CENTER_POS[1], target_mid_pos[2]]
                     )
@@ -581,7 +624,8 @@ def main():
                     ])
                     phase = "MOVE_TO_BOLT_NUT"
                     step_count = 0
-                    print(f"\n>>> [{task}] 너트 {nut_index}번 -> 볼트 {nut_index}번 체결 시작 (Target: X={bolt_target_pos[0]:.4f}, Y={bolt_target_pos[1]:.4f})")
+                    print(f"\n>>> [{task}] 너트 {nut_index}번 -> 볼트 {nut_index}번 체결 시작 [고정 오프셋] "
+                          f"(Target: X={bolt_target_pos[0]:.4f}, Y={bolt_target_pos[1]:.4f})")
                 else:
                     print(f"\n[ERROR] [{task}] 배터리 중심 좌표가 없습니다. 먼저 SCAN_BATTERY(MOVE_BATTERY_CENTER)/ASSEMBLE_BUSBAR가 수행되어야 합니다.")
                     publish_status("FAILURE:NO_BATTERY_CENTER")
@@ -828,27 +872,7 @@ def main():
                     if busbar_xform is not None:
                         busbar_xform.set_world_pose(position=target_mid_pos, orientation=BUSBAR_REST_ORIENTATION)
                     
-                    # -------------------------------------------------------------
-                    # 🔥 [추가 필요] 너트 조립용 기준 좌표(Anchor) 저장 및 볼트 3D 좌표 산출
-                    # -------------------------------------------------------------
-                    global assembled_battery_center, calculated_bolt1_pos, calculated_bolt2_pos
-
-                    # 버스바는 YOLO 인식으로 파지하므로 grasp point가 매번 달라져 target_mid_pos(TCP
-                    # 기준 체결 좌표)의 XY에는 grasp offset 오차가 섞여 있다. 볼트는 버스바를 얹기
-                    # 전부터 이미 고정돼 있으므로, 볼트 좌표 산출 기준은 그 오차와 무관한 최초
-                    # SCAN_BATTERY 스캔 좌표(BATTERY_CENTER_POS, get_bolt_pair 기반)의 XY를 쓴다.
-                    assembled_battery_center = np.array(
-                        [BATTERY_CENTER_POS[0], BATTERY_CENTER_POS[1], target_mid_pos[2]], dtype=float
-                    )
-
-                    calculated_bolt1_pos = assembled_battery_center + BOLT1_OFFSET_FROM_CENTER
-                    calculated_bolt2_pos = assembled_battery_center + BOLT2_OFFSET_FROM_CENTER
-                    
                     print(f"\n[OK] 버스바 안착 체결 완료 (EE Z: {cur_pos[2]:.4f}m)!")
-                    print(f" -> 기준 안착 좌표 저장: {assembled_battery_center}")
-                    print(f" -> 동적 계산된 볼트1 좌표: {calculated_bolt1_pos}")
-                    print(f" -> 동적 계산된 볼트2 좌표: {calculated_bolt2_pos}")
-                    # -------------------------------------------------------------
 
                     phase = "BUSBAR_RELEASE_AND_RETRACT"
                     step_count = 0
