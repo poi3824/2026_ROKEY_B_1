@@ -501,7 +501,14 @@ def main():
 
     while simulation_app.is_running():
         world.step(render=True)
-        rclpy.spin_once(isaac_node, timeout_sec=0.0)
+        # ★ spin_once는 한 번 호출에 콜백을 1개만 처리하고 리턴한다 - error_fix.py가
+        # 10Hz로 /target_pose를 계속 보내는데 한 틱에 여러 개가 몰리면 일부가 씹혀서
+        # 유실될 수 있다(구독 콜백이 latest-value 덮어쓰기 방식이라 처리 전에 다음
+        # 메시지가 오면 이전 건 사라짐 - yaw는 스텝이 0.01°로 작아서 이게 누적되면
+        # 최종 각도가 몇 도 부족해질 수 있음, 2026-07-27 실측 2도 잔차 확인).
+        # 큐가 빌 때까지 반복 처리해서 유실을 없앤다.
+        for _ in range(20):
+            rclpy.spin_once(isaac_node, timeout_sec=0.0)
         playing = world.is_playing()
 
         # 1. Play / Stop 상태 보정
