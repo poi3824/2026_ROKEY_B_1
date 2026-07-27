@@ -61,7 +61,7 @@ def parse_args():
                          help='tf 조회에 쓸 프레임 이름 (이미지 헤더 frame_id와 다를 수 있음)')
     parser.add_argument('--conf-threshold', type=float, default=0.5)
     parser.add_argument('--model-path', default=None,
-                         help='기본값: perception_node 패키지의 share/models/seg_v2.pt')
+                         help='기본값: perception_node 패키지의 share/models/seg_v4.pt')
     parser.add_argument('--out', default=None, help='기본값: <bag_dir>_frame<index>.png')
     return parser.parse_args()
 
@@ -105,12 +105,12 @@ def main():
     model_path = args.model_path
     if model_path is None:
         try:
-            model_path = f'{get_package_share_directory("perception_node")}/models/seg_v2.pt'
+            model_path = f'{get_package_share_directory("perception_node")}/models/seg_v4.pt'
         except Exception:
             # install/setup.bash를 source 안 했으면 ament index에 없음 -> 소스 트리
-            # 경로(src/perception_node/models/seg_v2.pt)로 대체.
+            # 경로(src/perception_node/models/seg_v4.pt)로 대체.
             model_path = os.path.join(
-                os.path.dirname(os.path.abspath(__file__)), '..', 'models', 'seg_v2.pt')
+                os.path.dirname(os.path.abspath(__file__)), '..', 'models', 'seg_v4.pt')
 
     rgb_msg, depth_msg, camera_info_msg, tf_buffer = read_frame(
         args.bag_dir, args.index, args.rgb_topic, args.depth_topic,

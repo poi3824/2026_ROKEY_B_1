@@ -19,16 +19,21 @@ BehaviorNode (FSM) 및 ArmNode, Vision Correction Node 통신 연동 버전
 
 import os
 import sys
-import json
 import math
-import time
 import numpy as np
 from pathlib import Path
 
 # 1. Isaac SimulationApp 초기화
 from isaacsim import SimulationApp
 
-_HEADLESS = os.environ.get("AMR_HEADLESS") == "1"
+_HEADLESS = (
+    os.environ.get("AMR_HEADLESS") == "1"
+    or "--headless" in sys.argv[1:]
+)
+_DEBUG_NO_TIMEOUTS = (
+    os.environ.get("AMR_DEBUG_NO_TIMEOUTS") == "1"
+    or "--debug-no-timeouts" in sys.argv[1:]
+)
 simulation_app = SimulationApp({"headless": _HEADLESS})
 
 from omni.isaac.core.utils.extensions import enable_extension
@@ -49,13 +54,30 @@ from isaacsim.core.utils.types import ArticulationAction
 # 3. ROS 2 Imports
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import Pose2D, PoseStamped
+from geometry_msgs.msg import PoseStamped
 from std_msgs.msg import String, Float32
 
 # RMPFlow Controller 경로 설정
 _THIS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(_THIS_DIR / "rmpflow"))
 from m0609_rmpflow_controller import RMPFlowController
+
+_DRIVE_DIR = (
+    _THIS_DIR.parents[1] / "src" / "amr_node" / "scrips_drive"
+)
+sys.path.insert(0, str(_DRIVE_DIR))
+from drive_controller import PoseState
+from vision_goal import (
+    VisionUnavailable,
+    compute_busbar_pick_targets,
+    compute_busbar_scan_xy,
+    select_nearest_busbar_path,
+)
+from integrated_drive_bridge import (
+    IntegratedDriveConfig,
+    IntegratedPhysicsDriveBridge,
+)
+from workcell_transform import rotate_busbar_workcell
 
 # ══════════════════════════════════════════════════════════════════════════
 #  [A] 설정 및 파라미터
@@ -83,33 +105,18 @@ M0609_PATH       = "/World/m0609"
 EE_LINK_NAME     = "link_6"
 GRIPPER_JOINTS   = ["finger_joint", "right_inner_knuckle_joint"]
 
-BUSBAR_ROOT_PATH      = "/World/busbar"
-BUSBAR_POLYSHAPE_PATH = "/World/busbar/geo/PolyShape"
+BUSBAR_PRIM_CANDIDATES = (
+    ("/World/Z_busbar3", "/World/Z_busbar3/Mesh"),
+    ("/World/Z_busbar3_01", "/World/Z_busbar3_01/Mesh"),
+    ("/World/Z_busbar3_02", "/World/Z_busbar3_02/Mesh"),
+)
+BUSBAR_PRIM_MAX_ASSOCIATION_M = 0.30
 
 # 너트 Prim 경로 (신규 추가)
 NUT1_ROOT_PATH      = "/World/nut1"
 NUT2_ROOT_PATH      = "/World/nut2"
 NUT1_POLYSHAPE_PATH = "/World/nut1/geo/PolyShape"
 NUT2_POLYSHAPE_PATH = "/World/nut2/geo/PolyShape"
-
-# AMR 목표 좌표는 아래 원본 배치 대비 delta다. 별도 AMR SimulationApp을 띄우지
-# 않고 이 executor의 live stage 안에서 mobile manipulator 그룹을 함께 이동한다.
-AMR_GROUP_BASELINE = {
-    "/World/Nova_Carter": Gf.Vec3d(
-        0.6659430917711248, -0.045551821646005186,
-        2.1389568693498673e-8),
-    "/World/m0609": Gf.Vec3d(
-        0.6695317489356534, 0.191648535280057,
-        0.4316854793539975),
-    "/World/nut1": Gf.Vec3d(
-        0.3812361672997574, -0.30126815314508776,
-        0.9711037512121846),
-    "/World/nut2": Gf.Vec3d(
-        0.47100575524334387, -0.3012513976789413,
-        0.9711038761801655),
-}
-AMR_DRIVE_SPEED_MPS = 0.5
-AMR_ANIMATION_HZ = 30.0
 
 # 그리퍼 파라미터
 GRIPPER_OPEN      = np.array([0.0, 0.0])
@@ -122,7 +129,6 @@ GRIP_CLOSE_RAMP_STEPS = 50
 EE_OFFSET = np.array([0.0, 0.0, 0.185])
 BUSBAR_HEIGHT = 0.003
 BUSBAR_GRASP_Z_LOCAL = BUSBAR_HEIGHT + 0.02
-BUSBAR_REST_ORIENTATION = np.array([0.5, -0.5, 0.5, 0.5])
 
 # 기본 좌표 및 높이 정의
 TARGET_INIT_JOINTS   = np.array([0.0, 0.0, np.radians(90.0), 0.0, np.radians(90.0), 0.0])
@@ -187,7 +193,23 @@ PICK_TOLERANCE_STRICT    = 0.01     # 10mm
 JOINT_TOLERANCE          = 0.02     # 관절 오차 허용범위 (rad)
 PICK_TOLERANCE_LOOSE_VAL = 0.015
 MAX_STUCK_STEPS          = 1800      # Phase 타임아웃 기준
+SCAN_ORIENTATION_TOLERANCE_RAD = np.radians(5.0)
+SCAN_BUSBAR_TIMEOUT_STEPS = 1200     # 20초: ArmNode 30초 timeout 전에 정지
 PHYSICS_DT               = 1.0 / 60.0
+
+# 고정 busbar camera가 선택한 실제 world 좌표를 중심으로 손목 카메라가
+# 제한 범위 안에서 반복 탐색한다. 절대 좌표나 과거 station 좌표는 없다.
+_BUSBAR_SCAN_SEARCH_STEP_M = float(
+    os.environ.get("BUSBAR_SCAN_SEARCH_STEP_M", "0.05")
+)
+if (
+    not math.isfinite(_BUSBAR_SCAN_SEARCH_STEP_M)
+    or _BUSBAR_SCAN_SEARCH_STEP_M <= 0.0
+    or _BUSBAR_SCAN_SEARCH_STEP_M > 0.10
+):
+    raise ValueError(
+        "BUSBAR_SCAN_SEARCH_STEP_M은 0보다 크고 0.10m 이하여야 합니다"
+    )
 
 URDF_PATH        = str(_THIS_DIR / "doosan-robot2/urdf/m0609_isaac_sim.urdf")
 ROBOT_DESC_PATH  = str(_THIS_DIR / "rmpflow/m0609_description.yaml")
@@ -231,19 +253,37 @@ def configure_fixed_camera_bridges(stage):
         print("[camera] busbar/bolt optical TF target 보정")
 
 
+def configure_ros_domain(stage):
+    """USD ActionGraph의 ROS2Context를 현재 ROS_DOMAIN_ID에 맞춘다."""
+    domain_id = int(os.environ.get("ROS_DOMAIN_ID", "0"))
+    if not 0 <= domain_id <= 232:
+        raise RuntimeError("ROS_DOMAIN_ID는 0~232 범위여야 합니다")
+    found = 0
+    for prim in stage.Traverse():
+        node_type = prim.GetAttribute("node:type")
+        if (
+            not node_type.IsValid()
+            or node_type.Get()
+            != "isaacsim.ros2.bridge.ROS2Context"
+        ):
+            continue
+        domain_attr = prim.GetAttribute("inputs:domain_id")
+        env_attr = prim.GetAttribute("inputs:useDomainIDEnvVar")
+        if not domain_attr.IsValid() or not env_attr.IsValid():
+            raise RuntimeError(
+                f"ROS2Context 속성 누락: {prim.GetPath()}"
+            )
+        domain_attr.Set(domain_id)
+        env_attr.Set(True)
+        found += 1
+    if found == 0:
+        raise RuntimeError("USD에서 ROS2Context를 찾지 못했습니다")
+    print(f"[ROS2] USD Context {found}개 domain={domain_id} 적용")
+
+
 # ══════════════════════════════════════════════════════════════════════════
 #  [B] 비전 브릿지 및 유틸리티 함수
 # ══════════════════════════════════════════════════════════════════════════
-def _get_translate_op(stage, path):
-    prim = stage.GetPrimAtPath(path)
-    if not prim.IsValid():
-        raise RuntimeError(f"AMR 이동 prim을 찾을 수 없습니다: {path}")
-    for op in UsdGeom.Xformable(prim).GetOrderedXformOps():
-        if op.GetOpType() == UsdGeom.XformOp.TypeTranslate:
-            return op
-    raise RuntimeError(f"AMR 이동 translate op가 없습니다: {path}")
-
-
 class Execute_Isaac_Busar(Node):
     """ArmNode / BehaviorNode / VisionNode 통신 브릿지"""
     def __init__(self, stage):
@@ -252,7 +292,6 @@ class Execute_Isaac_Busar(Node):
         self.latest_target_pose = None
         self.requested_task = None
         self.alignment_success = False
-        self.pending_amr_goal = None
 
         self.sub_target_pose = self.create_subscription(
             PoseStamped, '/target_pose', self._on_target_pose, 10
@@ -260,18 +299,10 @@ class Execute_Isaac_Busar(Node):
         self.sub_task_cmd = self.create_subscription(
             String, '/task_command', self._on_task_command, 10
         )
-        self.sub_amr_goal = self.create_subscription(
-            PoseStamped, '/amr/goal_pose', self._on_amr_goal, 10
-        )
-
         self.pub_phase = self.create_publisher(String, '/isaac_phase', 10)
         self.pub_progress = self.create_publisher(Float32, '/isaac_progress', 10)
         self.pub_status = self.create_publisher(String, '/isaac_status', 10)
         self.pub_errorfix_command = self.create_publisher(String, '/errorfix_command', 10)
-        self.pub_amr_pose = self.create_publisher(
-            Pose2D, '/amr/sim_pose', 10)
-        self.pub_amr_drive_state = self.create_publisher(
-            String, '/amr/drive_state', 10)
 
     def _on_target_pose(self, msg: PoseStamped):
         self.latest_target_pose = msg
@@ -283,92 +314,6 @@ class Execute_Isaac_Busar(Node):
         else:
             self.requested_task = msg.data
 
-    def _on_amr_goal(self, msg: PoseStamped):
-        self.pending_amr_goal = msg
-        self.get_logger().info(
-            "SUB /amr/goal_pose <- "
-            f"({msg.pose.position.x:.4f}, {msg.pose.position.y:.4f})")
-
-    @staticmethod
-    def _goal_stamp(msg: PoseStamped):
-        return f"{int(msg.header.stamp.sec)}:{int(msg.header.stamp.nanosec)}"
-
-    def _publish_amr_drive_state(
-        self, goal: PoseStamped, state: str, message: str
-    ):
-        msg = String()
-        msg.data = json.dumps({
-            "goal_stamp": self._goal_stamp(goal),
-            "state": state,
-            "message": message,
-        })
-        self.pub_amr_drive_state.publish(msg)
-
-    def execute_pending_amr_move(self):
-        """Arm phase가 IDLE일 때 호출해 mobile manipulator 그룹을 이동한다."""
-        goal = self.pending_amr_goal
-        if goal is None:
-            return False
-        self.pending_amr_goal = None
-
-        target = Gf.Vec3d(
-            float(goal.pose.position.x),
-            float(goal.pose.position.y),
-            0.0,
-        )
-        try:
-            nova_op = _get_translate_op(
-                self._stage, "/World/Nova_Carter")
-            start = (
-                Gf.Vec3d(nova_op.Get())
-                - AMR_GROUP_BASELINE["/World/Nova_Carter"]
-            )
-            distance = (target - start).GetLength()
-            steps = max(
-                1,
-                int(math.ceil(
-                    distance / AMR_DRIVE_SPEED_MPS
-                    * AMR_ANIMATION_HZ)),
-            )
-            self._publish_amr_drive_state(
-                goal, "ACTIVE", "통합 Isaac executor에서 AMR 이동 시작")
-
-            frame_sec = 1.0 / AMR_ANIMATION_HZ
-            for index in range(1, steps + 1):
-                frame_started = time.monotonic()
-                ratio = index / steps
-                current = start + (target - start) * ratio
-                for path, baseline in AMR_GROUP_BASELINE.items():
-                    _get_translate_op(self._stage, path).Set(
-                        Gf.Vec3d(baseline) + current)
-
-                pose = Pose2D()
-                pose.x = float(current[0])
-                pose.y = float(current[1])
-                self.pub_amr_pose.publish(pose)
-                simulation_app.update()
-                time.sleep(max(
-                    0.0,
-                    frame_sec - (time.monotonic() - frame_started),
-                ))
-
-            pose = Pose2D()
-            pose.x = float(target[0])
-            pose.y = float(target[1])
-            self.pub_amr_pose.publish(pose)
-            self._publish_amr_drive_state(
-                goal, "ARRIVED", "통합 Isaac executor AMR 이동 완료")
-            self.get_logger().info(
-                "PUB /amr/sim_pose -> "
-                f"({target[0]:.4f}, {target[1]:.4f}) 도착")
-            return True
-        except Exception as exc:
-            self.get_logger().error(f"AMR 그룹 이동 실패: {exc}")
-            self._publish_amr_drive_state(
-                goal, "FAILED", f"AMR 그룹 이동 실패: {exc}")
-            return False
-
-
 def euler_to_quaternion_wxyz(roll, pitch, yaw):
     cy, sy = np.cos(yaw * 0.5), np.sin(yaw * 0.5)
     cp, sp = np.cos(pitch * 0.5), np.sin(pitch * 0.5)
@@ -379,6 +324,21 @@ def euler_to_quaternion_wxyz(roll, pitch, yaw):
     y = cr * sp * cy + sr * sp * sy
     z = cr * cp * sy - sr * sp * cy
     return np.array([w, x, y, z])
+
+
+def quaternion_angular_error_wxyz(current, target):
+    """부호가 같은 회전을 뜻하는 q/-q를 고려한 최소 회전 오차."""
+    current = np.asarray(current, dtype=float)
+    target = np.asarray(target, dtype=float)
+    current_norm = np.linalg.norm(current)
+    target_norm = np.linalg.norm(target)
+    if current_norm <= 0.0 or target_norm <= 0.0:
+        return float("inf")
+    dot = abs(float(np.dot(
+        current / current_norm,
+        target / target_norm,
+    )))
+    return 2.0 * math.acos(max(-1.0, min(1.0, dot)))
 
 
 def disable_physics_recursively(stage, prim_path):
@@ -418,20 +378,67 @@ def find_prim_path(stage, root_path, name):
     return None
 
 
-def lock_amr_base(stage, amr_root_path):
-    amr_prim = stage.GetPrimAtPath(amr_root_path).GetParent()
-    if not amr_prim.IsValid():
-        amr_prim = stage.GetPrimAtPath(amr_root_path)
+AMR_DRIVE_SETTINGS = {
+    "/World/Nova_Carter/joint_caster_base": (100.0, 10.0, float("inf")),
+    "/World/Nova_Carter/joint_swing_left": (0.0, 1.0e-5, float("inf")),
+    "/World/Nova_Carter/joint_swing_right": (0.0, 1.0e-5, float("inf")),
+    "/World/Nova_Carter/joint_wheel_left": (0.0, 1.0e6, 200.0),
+    "/World/Nova_Carter/joint_wheel_right": (0.0, 1.0e6, 200.0),
+}
 
-    for prim in Usd.PrimRange(amr_prim):
-        for dt in ("angular", "linear"):
-            drive = UsdPhysics.DriveAPI.Get(prim, dt)
-            if drive:
-                drive.GetStiffnessAttr().Set(1.0e9)
-                drive.GetDampingAttr().Set(1.0e6)
-                drive.GetMaxForceAttr().Set(1.0e9)
-                if drive.GetTargetVelocityAttr():
-                    drive.GetTargetVelocityAttr().Set(0.0)
+
+def prepare_amr_physics(stage):
+    """저장된 고정 drive를 실제 wheel/caster 물리값으로 복원한다."""
+    for path, (stiffness, damping, max_force) in AMR_DRIVE_SETTINGS.items():
+        prim = stage.GetPrimAtPath(path)
+        if not prim.IsValid():
+            raise RuntimeError(f"AMR drive joint 누락: {path}")
+        drive = UsdPhysics.DriveAPI.Get(prim, "angular")
+        if not drive:
+            raise RuntimeError(f"AMR angular DriveAPI 누락: {path}")
+        drive.GetStiffnessAttr().Set(stiffness)
+        drive.GetDampingAttr().Set(damping)
+        drive.GetMaxForceAttr().Set(max_force)
+        drive.GetTargetPositionAttr().Set(0.0)
+        drive.GetTargetVelocityAttr().Set(0.0)
+
+
+def measure_amr_pose(robot):
+    position, orientation = robot.get_world_pose()
+    linear_velocity = robot.get_linear_velocity()
+    angular_velocity = robot.get_angular_velocity()
+    values = [
+        float(value)
+        for value in (
+            *position,
+            *orientation,
+            *linear_velocity,
+            *angular_velocity,
+        )
+    ]
+    if not all(math.isfinite(value) for value in values):
+        raise RuntimeError("AMR pose에 NaN/inf가 있습니다")
+    w, x, y, z = (float(value) for value in orientation)
+    norm = math.sqrt(w * w + x * x + y * y + z * z)
+    if norm < 1.0e-9:
+        raise RuntimeError("AMR quaternion이 유효하지 않습니다")
+    w, x, y, z = (value / norm for value in (w, x, y, z))
+    return PoseState(
+        x=float(position[0]),
+        y=float(position[1]),
+        yaw=math.atan2(
+            2.0 * (w * z + x * y),
+            1.0 - 2.0 * (y * y + z * z),
+        ),
+        z=float(position[2]),
+        up_z=1.0 - 2.0 * (x * x + y * y),
+        qx=x,
+        qy=y,
+        qz=z,
+        qw=w,
+        linear_speed=float(np.linalg.norm(linear_velocity)),
+        angular_speed=float(np.linalg.norm(angular_velocity)),
+    )
 
 
 def glue_busbar_to_ee(robot, busbar_xform, rest_pick_pos, blend):
@@ -473,20 +480,19 @@ def update_target_positions(target_pose_msg: PoseStamped):
     global BUSBAR_APPROACH_POS, BUSBAR_PICK_POS, BUSBAR_LIFT_MOVE_POS
 
     pos = target_pose_msg.pose.position
-    
-    # 1) 실제 파지 좌표 (Z = 0.455m)
-    pick_z = _POS_GRAB_PICK
-    new_pick = np.array([pos.x, pos.y, pick_z])
-    BUSBAR_PICK_POS = new_pick
-
-    # 2) 상공 접근 좌표 (Z = 0.600m 고정)
-    BUSBAR_APPROACH_POS = np.array([pos.x, pos.y, BUSBAR_APPROACH_Z])
-
-    # 3) 상승 이동 좌표 (Z = 0.600m 고정)
-    BUSBAR_LIFT_MOVE_POS = np.array([pos.x, pos.y + 0.1, BUSBAR_APPROACH_Z])
+    approach, pick, lift = compute_busbar_pick_targets(
+        target_xy=(float(pos.x), float(pos.y)),
+        pick_z=_POS_GRAB_PICK,
+        approach_z=BUSBAR_APPROACH_Z,
+    )
+    BUSBAR_APPROACH_POS = np.asarray(approach)
+    BUSBAR_PICK_POS = np.asarray(pick)
+    # 파지 뒤에는 근거 없는 world +Y 이동 없이 동일 XY에서 수직 상승한다.
+    BUSBAR_LIFT_MOVE_POS = np.asarray(lift)
 
     print(f"[Dynamic Target Set] Approach Pos (Z={BUSBAR_APPROACH_Z:.2f}m): ({BUSBAR_APPROACH_POS[0]:.4f}, {BUSBAR_APPROACH_POS[1]:.4f}, {BUSBAR_APPROACH_POS[2]:.4f})")
     print(f"[Dynamic Target Set] Pick Pos     (Z={BUSBAR_PICK_POS[2]:.4f}m): ({BUSBAR_PICK_POS[0]:.4f}, {BUSBAR_PICK_POS[1]:.4f}, {BUSBAR_PICK_POS[2]:.4f})")
+    print(f"[Dynamic Target Set] Vertical Lift                         : ({BUSBAR_LIFT_MOVE_POS[0]:.4f}, {BUSBAR_LIFT_MOVE_POS[1]:.4f}, {BUSBAR_LIFT_MOVE_POS[2]:.4f})")
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -508,12 +514,43 @@ def main():
     if not stage:
         raise RuntimeError(f"[ERROR] Stage를 로드하지 못했습니다: {usd_file_path}")
     configure_fixed_camera_bridges(stage)
+    configure_ros_domain(stage)
+    workcell_rotation = rotate_busbar_workcell(stage, 0.0)
+    prepare_amr_physics(stage)
 
-    world = World(stage_units_in_meters=1.0, physics_dt=PHYSICS_DT)
-    lock_amr_base(stage, NOVA_CARTER_ROOT)
+    world = World(
+        stage_units_in_meters=1.0,
+        physics_dt=PHYSICS_DT,
+        rendering_dt=PHYSICS_DT,
+    )
 
-    busbar_xform = SingleXFormPrim(BUSBAR_POLYSHAPE_PATH, name="busbar_poly") if stage.GetPrimAtPath(BUSBAR_POLYSHAPE_PATH).IsValid() else None
-    init_busbar_pos, init_busbar_quat = busbar_xform.get_world_pose() if busbar_xform else (None, None)
+    busbar_assets = {}
+    for index, (root_path, mesh_path) in enumerate(
+        BUSBAR_PRIM_CANDIDATES
+    ):
+        if (
+            not stage.GetPrimAtPath(root_path).IsValid()
+            or not stage.GetPrimAtPath(mesh_path).IsValid()
+        ):
+            continue
+        xform = SingleXFormPrim(
+            mesh_path,
+            name=f"busbar_mesh_{index}",
+        )
+        initial_position, initial_orientation = xform.get_world_pose()
+        busbar_assets[mesh_path] = {
+            "root_path": root_path,
+            "xform": xform,
+            "initial_position": np.asarray(initial_position).copy(),
+            "initial_orientation": np.asarray(initial_orientation).copy(),
+        }
+    if not busbar_assets:
+        raise RuntimeError(
+            "현재 USD에서 파지 가능한 busbar prim을 찾지 못했습니다: "
+            f"{BUSBAR_PRIM_CANDIDATES}"
+        )
+    busbar_root_path = None
+    busbar_xform = None
 
     nut1_xform = SingleXFormPrim(NUT1_POLYSHAPE_PATH, name="nut1_poly") if stage.GetPrimAtPath(NUT1_POLYSHAPE_PATH).IsValid() else None
     nut2_xform = SingleXFormPrim(NUT2_POLYSHAPE_PATH, name="nut2_poly") if stage.GetPrimAtPath(NUT2_POLYSHAPE_PATH).IsValid() else None
@@ -555,6 +592,47 @@ def main():
     rclpy.init()
     isaac_node = Execute_Isaac_Busar(stage)
 
+    left_wheel_index = robot.get_dof_index("joint_wheel_left")
+    right_wheel_index = robot.get_dof_index("joint_wheel_right")
+    if (
+        left_wheel_index is None
+        or right_wheel_index is None
+        or int(left_wheel_index) < 0
+        or int(right_wheel_index) < 0
+    ):
+        raise RuntimeError("통합 articulation에서 wheel DOF를 찾지 못했습니다")
+    wheel_indices = np.asarray(
+        [int(left_wheel_index), int(right_wheel_index)],
+        dtype=np.int64,
+    )
+
+    def apply_amr_wheels(left_radps, right_radps):
+        robot.apply_action(
+            ArticulationAction(
+                joint_velocities=np.asarray(
+                    [left_radps, right_radps],
+                    dtype=np.float32,
+                ),
+                joint_indices=wheel_indices,
+            )
+        )
+
+    drive_arrived = [False]
+    drive_node = IntegratedPhysicsDriveBridge(
+        measure_pose=lambda: measure_amr_pose(robot),
+        apply_wheels=apply_amr_wheels,
+        config=IntegratedDriveConfig(
+            physics_hz=1.0 / PHYSICS_DT,
+            debug_no_timeouts=_DEBUG_NO_TIMEOUTS,
+            busbar_workcell_yaw_deg=workcell_rotation.yaw_deg,
+            busbar_workcell_pivot_xyz=workcell_rotation.pivot_world,
+            busbar_approach_yaw_rad=(
+                workcell_rotation.busbar_approach_yaw_rad
+            ),
+        ),
+        on_arrived=lambda: drive_arrived.__setitem__(0, True),
+    )
+
     arm_controller = RMPFlowController(
         name="m0609_busbar_controller",
         robot_articulation=robot,
@@ -572,7 +650,9 @@ def main():
         robot_orientation=np.array([base_quat.GetReal(), *[float(x) for x in base_quat.GetImaginary()]]),
     )
 
-    print("\nIsaac Sim 준비 완료 - BehaviorNode 명령을 대기합니다.")
+    print(
+        "\nIsaac Sim 준비 완료 - 물리 AMR 주행과 Arm 명령을 대기합니다."
+    )
 
     step_count = 0
     grasp_timer = 0
@@ -581,6 +661,7 @@ def main():
     busbar_start_grasp_pos = None
     descend_target_z = None
     target_mid_pos = None
+    target_fine_yaw_rad = 0.0
 
     # ── 너트 조립(Nut Assembly) 상태 변수 (신규 추가) ──
     nut_index      = 0        # 1: 너트 1번, 2: 너트 2번 (NUT_*/MOVE_TO_BOLT_NUT 공용 Phase에서 참조)
@@ -619,16 +700,23 @@ def main():
     while simulation_app.is_running():
         world.step(render=True)
         rclpy.spin_once(isaac_node, timeout_sec=0.0)
+        rclpy.spin_once(drive_node, timeout_sec=0.0)
+        drive_node.control_step()
         playing = world.is_playing()
 
         # 1. Play / Stop 상태 보정
         if playing and not was_playing:
             world.reset()
-            enable_physics_recursively(stage, BUSBAR_ROOT_PATH)
+            for asset in busbar_assets.values():
+                enable_physics_recursively(stage, asset["root_path"])
+                asset["xform"].set_world_pose(
+                    position=asset["initial_position"],
+                    orientation=asset["initial_orientation"],
+                )
             enable_physics_recursively(stage, NUT1_ROOT_PATH)
             enable_physics_recursively(stage, NUT2_ROOT_PATH)
-            if busbar_xform and init_busbar_pos is not None:
-                busbar_xform.set_world_pose(position=init_busbar_pos, orientation=init_busbar_quat)
+            busbar_root_path = None
+            busbar_xform = None
             if nut1_xform and init_nut1_pos is not None:
                 nut1_xform.set_world_pose(position=init_nut1_pos, orientation=init_nut1_quat)
             if nut2_xform and init_nut2_pos is not None:
@@ -636,6 +724,7 @@ def main():
 
             step_count = 0
             grasp_timer = 0
+            target_fine_yaw_rad = 0.0
 
             nut_index = 0
             NUT_SCAN_POS = None
@@ -648,44 +737,138 @@ def main():
             screw_pass_theta = 0.0
             stuck_counter = 0
 
-        # 2. BehaviorNode / ArmNode 명령 분기 처리
-        if playing and phase == "IDLE" and isaac_node.pending_amr_goal:
-            if isaac_node.execute_pending_amr_move():
-                # mobile base 이동 후 RMPFlow의 world 기준 base pose를 갱신한다.
-                base_link_xf = world_xf(stage, f"{M0609_PATH}/base_link")
-                base_pos = base_link_xf.ExtractTranslation()
-                base_quat = base_link_xf.ExtractRotationQuat()
-                arm_controller._motion_policy.set_robot_base_pose(
-                    robot_position=np.array([
-                        base_pos[0], base_pos[1], base_pos[2]]),
-                    robot_orientation=np.array([
-                        base_quat.GetReal(),
-                        *[float(x) for x in base_quat.GetImaginary()],
-                    ]),
-                )
+        # 물리 주행 완료 후 RMPFlow가 사용하는 mobile base world pose를 갱신한다.
+        if playing and phase == "IDLE" and drive_arrived[0]:
+            drive_arrived[0] = False
+            base_link_xf = world_xf(stage, f"{M0609_PATH}/base_link")
+            base_pos = base_link_xf.ExtractTranslation()
+            base_quat = base_link_xf.ExtractRotationQuat()
+            arm_controller._motion_policy.set_robot_base_pose(
+                robot_position=np.array([
+                    base_pos[0], base_pos[1], base_pos[2]]),
+                robot_orientation=np.array([
+                    base_quat.GetReal(),
+                    *[float(x) for x in base_quat.GetImaginary()],
+                ]),
+            )
 
-        if playing and isaac_node.requested_task:
+        # 2. ArmNode 명령 분기 처리
+        if (
+            playing
+            and not drive_node.driving
+            and isaac_node.requested_task
+        ):
             task = isaac_node.requested_task
             isaac_node.requested_task = None
 
-            if task == "SCAN_BATTERY":
+            if task == "STOW_ARM":
+                phase = "STOW_ARM"
+                step_count = 0
+                print(
+                    "\n>>> [STOW_ARM] AMR 주행용 초기 관절 자세 복귀 시작"
+                )
+
+            elif task == "SCAN_BATTERY":
                 phase = "INIT_POSE"
                 step_count = 0
                 print(f"\n>>> [{task}] 배터리 스캔 요청 수신 -> 1) 초기 관절 정렬 시작")
 
-            elif task == "SCAN_BUSBAR":
-                cur_pos = world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation()
-                BUSBAR_SCAN_POS = np.array([cur_pos[0] - 0.5, cur_pos[1] + 0.5, BUSBAR_SCAN_Z])
-                phase = "SCAN_BUSBAR_APPROACH"
-                step_count = 0
-                print(f"\n>>> [{task}] 버스바 스캔 위치 이동 시작 (Target: X={BUSBAR_SCAN_POS[0]:.3f}, Y={BUSBAR_SCAN_POS[1]:.3f}, Z={BUSBAR_SCAN_POS[2]:.3f})")
+            elif task.startswith("SCAN_BUSBAR"):
+                try:
+                    task_name, separator, attempt_text = task.partition(":")
+                    if task_name != "SCAN_BUSBAR":
+                        raise ValueError(f"지원하지 않는 scan task: {task}")
+                    attempt = int(attempt_text) if separator else 0
+                    if attempt < 0:
+                        raise ValueError("scan attempt는 0 이상이어야 합니다")
+                    selected_pose = isaac_node.latest_target_pose
+                    if selected_pose is None:
+                        raise ValueError(
+                            "relay가 선택한 busbar target pose가 없습니다"
+                        )
+                    if selected_pose.header.frame_id != "world":
+                        raise ValueError(
+                            "busbar target pose는 world frame이어야 합니다"
+                        )
+                    pos = selected_pose.pose.position
+                    values = (float(pos.x), float(pos.y), float(pos.z))
+                    if not all(math.isfinite(value) for value in values):
+                        raise ValueError(
+                            "busbar target pose에 NaN/inf가 있습니다"
+                        )
+                    scan_x, scan_y = compute_busbar_scan_xy(
+                        target_xy=(values[0], values[1]),
+                        approach_yaw_rad=(
+                            workcell_rotation.busbar_approach_yaw_rad
+                        ),
+                        attempt_index=attempt,
+                        step_m=_BUSBAR_SCAN_SEARCH_STEP_M,
+                    )
+                    BUSBAR_SCAN_POS = np.array([
+                        scan_x,
+                        scan_y,
+                        BUSBAR_SCAN_Z,
+                    ])
+                except (TypeError, ValueError) as exc:
+                    print(f"\n[ERROR] [{task}] {exc}")
+                    publish_status("FAILURE:INVALID_BUSBAR_SCAN_TARGET")
+                    phase = "IDLE"
+                else:
+                    phase = "SCAN_BUSBAR_APPROACH"
+                    step_count = 0
+                    print(
+                        f"\n>>> [{task}] 선택 busbar 중심 손목 스캔 시작 "
+                        f"(Target: X={BUSBAR_SCAN_POS[0]:.3f}, "
+                        f"Y={BUSBAR_SCAN_POS[1]:.3f}, "
+                        f"Z={BUSBAR_SCAN_POS[2]:.3f})"
+                    )
 
             elif task == "PICK_BUSBAR":
-                if isaac_node.latest_target_pose is not None:
-                    update_target_positions(isaac_node.latest_target_pose)
-                phase = "BUSBAR_APPROACH"
-                step_count = 0
-                print(f"\n>>> [{task}] 버스바 상공 접근(Z=0.6m) 시작")
+                target_pose = isaac_node.latest_target_pose
+                if target_pose is None:
+                    print(f"\n[ERROR] [{task}] wrist target pose가 없습니다")
+                    publish_status("FAILURE:NO_BUSBAR_PICK_TARGET")
+                    phase = "IDLE"
+                else:
+                    target = target_pose.pose.position
+                    live_candidates = []
+                    for mesh_path, asset in busbar_assets.items():
+                        asset_position, _ = asset["xform"].get_world_pose()
+                        live_candidates.append((
+                            mesh_path,
+                            float(asset_position[0]),
+                            float(asset_position[1]),
+                        ))
+                    try:
+                        selected_mesh_path = select_nearest_busbar_path(
+                            target_xy=(float(target.x), float(target.y)),
+                            candidates=live_candidates,
+                            max_distance_m=BUSBAR_PRIM_MAX_ASSOCIATION_M,
+                        )
+                    except (TypeError, ValueError, VisionUnavailable) as exc:
+                        print(
+                            f"\n[ERROR] [{task}] 비전 좌표와 USD busbar "
+                            f"prim 연관 실패: {exc}"
+                        )
+                        publish_status(
+                            "FAILURE:BUSBAR_PRIM_ASSOCIATION"
+                        )
+                        phase = "IDLE"
+                    else:
+                        selected_asset = busbar_assets[selected_mesh_path]
+                        busbar_root_path = selected_asset["root_path"]
+                        busbar_xform = selected_asset["xform"]
+                        update_target_positions(target_pose)
+                        phase = "BUSBAR_APPROACH"
+                        step_count = 0
+                        print(
+                            f"\n>>> [{task}] 비전 target에 최근접한 "
+                            f"{selected_mesh_path} 파지 선택"
+                        )
+                        print(
+                            f">>> [{task}] 버스바 상공 접근"
+                            f"(Z={BUSBAR_APPROACH_Z:.3f}m) 시작"
+                        )
 
             elif task == "MOVE_BATTERY_CENTER":
                 if isaac_node.latest_target_pose is not None:
@@ -701,16 +884,18 @@ def main():
             elif task == "FINE_ALIGNMENT":
                 print("\n>>> [{task}] 비전 정밀 오차 보정 시작")
                 print(" -> 🚀 오차 보정 비전 노드에 시작 트리거 전송 [START_ERRORFIX_CORRECTION]")
-                
+
+                # 이전 arm target을 error-fix 증분으로 오인하지 않도록 먼저 비운다.
+                isaac_node.latest_target_pose = None
+                isaac_node.alignment_success = False
                 start_cmd = String()
                 start_cmd.data = "START_ERRORFIX_CORRECTION"
                 isaac_node.pub_errorfix_command.publish(start_cmd)
 
-                isaac_node.alignment_success = False
-                
                 # FINE_ALIGNMENT 진입 시 실시간 EE 위치 기준으로 Target 초기화
                 cur_ee = world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation()
                 target_fine_pos = np.array([cur_ee[0], cur_ee[1], BATTERY_CENTER_Z])
+                target_fine_yaw_rad = 0.0
                 phase = "FINE_ALIGNMENT"
                 step_count = 0
 
@@ -767,8 +952,52 @@ def main():
         # 3. FSM 제어 루프
         if playing and phase != "IDLE" and phase != "DONE":
 
+            # [SAFE] AMR 주행 전 팔을 차체 안쪽 초기 관절 자세로 복귀
+            if phase == "STOW_ARM":
+                publish_progress("STOW_ARM", 50.0)
+                arm_joint_names = [
+                    "joint_1", "joint_2", "joint_3",
+                    "joint_4", "joint_5", "joint_6",
+                ]
+                arm_dof_indices = [
+                    robot.get_dof_index(name)
+                    for name in arm_joint_names
+                ]
+                robot.apply_action(
+                    ArticulationAction(
+                        joint_positions=TARGET_INIT_JOINTS,
+                        joint_indices=arm_dof_indices,
+                    )
+                )
+                robot.gripper.apply_action(
+                    ArticulationAction(joint_positions=GRIPPER_OPEN)
+                )
+                all_joints = robot.get_joint_positions()
+                cur_arm_joints = all_joints[arm_dof_indices]
+                joint_err = np.linalg.norm(
+                    cur_arm_joints - TARGET_INIT_JOINTS
+                )
+                if joint_err < JOINT_TOLERANCE:
+                    print(
+                        "[OK] 팔 안전 자세 복귀 완료 "
+                        f"(joint_err={joint_err:.4f}rad)"
+                    )
+                    publish_progress("STOW_ARM_COMPLETE", 100.0)
+                    publish_status("SUCCESS")
+                    phase = "IDLE"
+                elif (
+                    not _DEBUG_NO_TIMEOUTS
+                    and step_count > MAX_STUCK_STEPS
+                ):
+                    print(
+                        "[ERROR] 팔 안전 자세 복귀 실패 "
+                        f"(joint_err={joint_err:.4f}rad)"
+                    )
+                    publish_status("FAILURE:STOW_ARM")
+                    phase = "IDLE"
+
             # [STEP 0-A] 초기 관절 자세 정렬
-            if phase == "INIT_POSE":
+            elif phase == "INIT_POSE":
                 publish_progress("INIT_ALIGN", 10.0)
                 
                 arm_joint_names = [
@@ -831,11 +1060,39 @@ def main():
 
                 cur_pos = world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation()
                 current_err = math.dist(cur_pos, tuple(BUSBAR_SCAN_POS))
+                _, cur_quat = robot.end_effector.get_world_pose()
+                orientation_err = quaternion_angular_error_wxyz(
+                    cur_quat,
+                    quat_busbar,
+                )
 
-                if current_err < PICK_TOLERANCE_STRICT or (current_err < PICK_TOLERANCE_LOOSE_VAL and step_count > MAX_STUCK_STEPS):
+                if step_count % 120 == 0:
+                    print(
+                        "[SCAN_BUSBAR] "
+                        f"position_err={current_err:.4f}m, "
+                        f"orientation_err="
+                        f"{math.degrees(orientation_err):.1f}deg"
+                    )
+
+                if (
+                    current_err < PICK_TOLERANCE_STRICT
+                    and orientation_err < SCAN_ORIENTATION_TOLERANCE_RAD
+                ):
                     print(f"[OK] 버스바 스캔 위치 도착 완료! ({cur_pos[0]:.3f}, {cur_pos[1]:.3f}, {cur_pos[2]:.3f})")
                     publish_progress("SCAN_BUSBAR_COMPLETE", 100.0)
                     publish_status("SUCCESS")
+                    phase = "IDLE"
+                elif (
+                    not _DEBUG_NO_TIMEOUTS
+                    and step_count > SCAN_BUSBAR_TIMEOUT_STEPS
+                ):
+                    print(
+                        "[ERROR] 버스바 스캔 자세 수렴 실패: "
+                        f"position_err={current_err:.4f}m, "
+                        f"orientation_err="
+                        f"{math.degrees(orientation_err):.1f}deg"
+                    )
+                    publish_status("FAILURE:SCAN_BUSBAR_IK")
                     phase = "IDLE"
 
             # [2단계] 버스바 상공 위치 접근 (Z = 0.6m)
@@ -850,6 +1107,12 @@ def main():
 
                 cur_pos = world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation()
                 current_err = math.dist(cur_pos, tuple(BUSBAR_APPROACH_POS))
+
+                if step_count % 120 == 0:
+                    print(
+                        "[PICK_BUSBAR APPROACH] "
+                        f"position_err={current_err:.4f}m"
+                    )
 
                 if current_err < PICK_TOLERANCE_STRICT or (current_err < PICK_TOLERANCE_LOOSE_VAL and step_count > MAX_STUCK_STEPS):
                     print(f"[OK] 1. 버스바 상공(Z={BUSBAR_APPROACH_POS[2]:.3f}m) 접근 완료 -> 2. 파지점(Z={BUSBAR_PICK_POS[2]:.3f}m) 수직 하강 시작")
@@ -878,12 +1141,19 @@ def main():
             elif phase == "BUSBAR_GRASP":
                 publish_progress("GRASPING", 75.0)
                 if grasp_timer == 0:
-                    disable_physics_recursively(stage, BUSBAR_ROOT_PATH)
-                    if busbar_xform is not None:
-                        real_pos, _ = busbar_xform.get_world_pose()
-                        busbar_start_grasp_pos = np.array(real_pos)
-                    else:
-                        busbar_start_grasp_pos = BUSBAR_PICK_POS
+                    if busbar_xform is None or busbar_root_path is None:
+                        print(
+                            "[ERROR] 선택된 busbar prim이 없어 "
+                            "가짜 파지로 진행하지 않습니다"
+                        )
+                        publish_status(
+                            "FAILURE:NO_SELECTED_BUSBAR_PRIM"
+                        )
+                        phase = "IDLE"
+                        continue
+                    disable_physics_recursively(stage, busbar_root_path)
+                    real_pos, _ = busbar_xform.get_world_pose()
+                    busbar_start_grasp_pos = np.array(real_pos)
 
                 actions = arm_controller.forward(
                     target_end_effector_position=BUSBAR_PICK_POS,
@@ -918,6 +1188,12 @@ def main():
                 cur_pos = world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation()
                 current_err = math.dist(cur_pos, tuple(BUSBAR_LIFT_MOVE_POS))
 
+                if step_count % 120 == 0:
+                    print(
+                        "[PICK_BUSBAR LIFT] "
+                        f"position_err={current_err:.4f}m"
+                    )
+
                 if current_err < PICK_TOLERANCE_STRICT or (current_err < PICK_TOLERANCE_LOOSE_VAL and step_count > MAX_STUCK_STEPS):
                     print("\n★ [PICK_BUSBAR SUCCESS] 버스바 파지 및 상승 완수!")
                     publish_progress("COMPLETE", 100.0)
@@ -951,14 +1227,43 @@ def main():
                 cur_ee_pos = world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation()
 
                 if isaac_node.latest_target_pose is not None:
-                    offset = isaac_node.latest_target_pose.pose.position
-                    if abs(offset.x) <= 0.0025 and abs(offset.y) <= 0.0025:             
+                    correction = isaac_node.latest_target_pose.pose
+                    offset = correction.position
+                    if abs(offset.x) <= 0.0025 and abs(offset.y) <= 0.0025:
                         target_fine_pos[0] += offset.x
                         target_fine_pos[1] += offset.y
                         target_fine_pos[2] = BATTERY_CENTER_Z
-                        
-                        print(f"\n[FINE_ALIGNMENT] Vision Offset Received -> dx: {offset.x:+.4f}m, dy: {offset.y:+.4f}m")
-                        print(f"               └─ New Target Pos -> X: {target_fine_pos[0]:.4f}, Y: {target_fine_pos[1]:.4f}, Z: {target_fine_pos[2]:.4f}")
+
+                        quaternion_norm = math.hypot(
+                            correction.orientation.z,
+                            correction.orientation.w,
+                        )
+                        yaw_delta = 0.0
+                        if quaternion_norm > 0.0:
+                            yaw_delta = 2.0 * math.atan2(
+                                correction.orientation.z,
+                                correction.orientation.w,
+                            )
+                            if abs(yaw_delta) <= math.radians(1.0):
+                                target_fine_yaw_rad += yaw_delta
+                                target_fine_yaw_rad = (
+                                    target_fine_yaw_rad + math.pi
+                                ) % (2.0 * math.pi) - math.pi
+
+                        print(
+                            "\n[FINE_ALIGNMENT] Vision Offset Received "
+                            f"-> dx: {offset.x:+.4f}m, "
+                            f"dy: {offset.y:+.4f}m, "
+                            f"dyaw: {math.degrees(yaw_delta):+.3f}deg"
+                        )
+                        print(
+                            "               └─ New Target "
+                            f"X: {target_fine_pos[0]:.4f}, "
+                            f"Y: {target_fine_pos[1]:.4f}, "
+                            f"Z: {target_fine_pos[2]:.4f}, "
+                            f"yaw: "
+                            f"{math.degrees(target_fine_yaw_rad):+.3f}deg"
+                        )
 
                     isaac_node.latest_target_pose = None
 
@@ -970,7 +1275,11 @@ def main():
 
                 actions = arm_controller.forward(
                     target_end_effector_position=target_fine_pos,
-                    target_end_effector_orientation=euler_to_quaternion_wxyz(0.0, 3.1415, 0.0)
+                    target_end_effector_orientation=euler_to_quaternion_wxyz(
+                        0.0,
+                        3.1415,
+                        target_fine_yaw_rad,
+                    )
                 )
                 robot.apply_action(actions)
 
@@ -992,7 +1301,11 @@ def main():
 
                 actions = arm_controller.forward(
                     target_end_effector_position=step_target_pos,
-                    target_end_effector_orientation=euler_to_quaternion_wxyz(0.0, 3.1415, 0.0)
+                    target_end_effector_orientation=euler_to_quaternion_wxyz(
+                        0.0,
+                        3.1415,
+                        target_fine_yaw_rad,
+                    )
                 )
                 robot.apply_action(actions)
                 robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_CLOSE))
@@ -1004,7 +1317,11 @@ def main():
 
                 if cur_pos[2] <= BUSBAR_RELEASE_Z or dist_err < INSERT_TOLERANCE_STRICT:
                     if busbar_xform is not None:
-                        busbar_xform.set_world_pose(position=target_mid_pos, orientation=BUSBAR_REST_ORIENTATION)
+                        _, placed_orientation = busbar_xform.get_world_pose()
+                        busbar_xform.set_world_pose(
+                            position=target_mid_pos,
+                            orientation=placed_orientation,
+                        )
                     
                     # -------------------------------------------------------------
                     # 🔥 [추가 필요] 너트 조립용 기준 좌표(Anchor) 저장 및 볼트 3D 좌표 산출
@@ -1036,7 +1353,11 @@ def main():
                 retract_pos = np.array([target_mid_pos[0], target_mid_pos[1], BATTERY_CENTER_Z])
                 actions = arm_controller.forward(
                     target_end_effector_position=retract_pos,
-                    target_end_effector_orientation=euler_to_quaternion_wxyz(0.0, 3.1415, 0.0)
+                    target_end_effector_orientation=euler_to_quaternion_wxyz(
+                        0.0,
+                        3.1415,
+                        target_fine_yaw_rad,
+                    )
                 )
                 robot.apply_action(actions)
                 robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_OPEN))
@@ -1371,9 +1692,11 @@ def main():
         was_playing = playing
 
     # 리소스 해제
+    drive_node.stop()
     if 'world' in locals() and world is not None:
         world.clear_instance()
     omni.usd.get_context().close_stage()
+    drive_node.destroy_node()
     isaac_node.destroy_node()
     rclpy.shutdown()
     simulation_app.close()

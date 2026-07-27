@@ -50,6 +50,7 @@ camera_frame_override 파라미터가 설정되어 있으면 그 값을 대신 �
 import collections
 import math
 import os
+import time
 
 import cv2
 import numpy as np
@@ -62,6 +63,12 @@ from geometry_msgs.msg import PoseStamped
 from rclpy.duration import Duration
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
+from rclpy.qos import (
+    DurabilityPolicy,
+    HistoryPolicy,
+    QoSProfile,
+    ReliabilityPolicy,
+)
 from sensor_msgs.msg import CameraInfo, Image
 from tf2_ros.buffer import Buffer
 from tf2_ros.transform_listener import TransformListener
@@ -73,7 +80,7 @@ from perception_node.camera_geometry import (
 from perception_node.detector import BUSBAR_KEYPOINT_ORDER, YoloPoseDetector
 
 DEFAULT_MODEL_PATH = os.path.join(
-    get_package_share_directory('perception_node'), 'models', 'keypoints_busbar6pt_v1.pt')
+    get_package_share_directory('perception_node'), 'models', 'keypoints_busbar6pt_v3.pt')
 
 BUSBAR_LABEL = 'busbar'
 NUT_LABEL = 'nut'
@@ -106,6 +113,10 @@ class PerceptionNode(Node):
         self.declare_parameter('publish_debug_image', True)
         self.declare_parameter('debug_image_topic', '/perception/debug_image')
         self.declare_parameter('grasp_query_max_age_sec', 5.0)
+        self.declare_parameter('max_rgb_depth_skew_sec', 0.1)
+        self.declare_parameter('max_input_receipt_age_sec', 1.0)
+        self.declare_parameter('require_unique_camera_source', False)
+        self.declare_parameter('use_busbar_pnp', True)
 
         # 🔥 bolt 라벨 스캔 시에만 적용할 ROI 영역 파라미터 (640x640 기준)
         self.declare_parameter('use_bolt_roi', True)
@@ -113,6 +124,8 @@ class PerceptionNode(Node):
         self.declare_parameter('bolt_roi_x_max', 490)
         self.declare_parameter('bolt_roi_y_min', 150)
         self.declare_parameter('bolt_roi_y_max', 450)
+        self.declare_parameter('bolt_roi_reference_width', 640)
+        self.declare_parameter('bolt_roi_reference_height', 640)
 
         rgb_topic = self.get_parameter('rgb_topic').value
         depth_topic = self.get_parameter('depth_topic').value
@@ -126,13 +139,36 @@ class PerceptionNode(Node):
         publish_debug_image = self.get_parameter('publish_debug_image').value
         debug_image_topic = self.get_parameter('debug_image_topic').value
         self._grasp_query_max_age_sec = self.get_parameter('grasp_query_max_age_sec').value
+        self._max_rgb_depth_skew_sec = float(
+            self.get_parameter('max_rgb_depth_skew_sec').value)
+        self._max_input_receipt_age_sec = float(
+            self.get_parameter('max_input_receipt_age_sec').value)
+        self._require_unique_camera_source = bool(
+            self.get_parameter('require_unique_camera_source').value)
+        self._use_busbar_pnp = bool(
+            self.get_parameter('use_busbar_pnp').value)
+        self._rgb_topic = str(rgb_topic)
+        self._depth_topic = str(depth_topic)
+        self._camera_info_topic = str(camera_info_topic)
+
+        if (
+            not math.isfinite(self._max_rgb_depth_skew_sec)
+            or self._max_rgb_depth_skew_sec <= 0.0
+            or not math.isfinite(self._max_input_receipt_age_sec)
+            or self._max_input_receipt_age_sec <= 0.0
+        ):
+            raise ValueError('RGB/depth skew와 input age 제한은 유한한 양수여야 합니다')
 
         self._bridge = CvBridge()
         self._detector = YoloPoseDetector(model_path)
 
         self._latest_rgb = None
         self._latest_rgb_header = None
+        self._latest_rgb_received_wall = 0.0
         self._latest_depth = None
+        self._latest_depth_header = None
+        self._latest_depth_received_wall = 0.0
+        self._last_processed_rgb_stamp_ns = None
         self._camera_model = None
         self._camera_frame_id = None
 
@@ -145,10 +181,18 @@ class PerceptionNode(Node):
         self._tf_buffer = Buffer()
         self._tf_listener = TransformListener(self._tf_buffer, self)
 
-        self._rgb_sub = self.create_subscription(Image, rgb_topic, self._on_rgb, 10)
-        self._depth_sub = self.create_subscription(Image, depth_topic, self._on_depth, 10)
+        sensor_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+        self._rgb_sub = self.create_subscription(
+            Image, rgb_topic, self._on_rgb, sensor_qos)
+        self._depth_sub = self.create_subscription(
+            Image, depth_topic, self._on_depth, sensor_qos)
         self._camera_info_sub = self.create_subscription(
-            CameraInfo, camera_info_topic, self._on_camera_info, 10)
+            CameraInfo, camera_info_topic, self._on_camera_info, sensor_qos)
 
         self._detections_pub = self.create_publisher(
             Detection3DArray, '/perception/detections_3d', 10)
@@ -185,21 +229,99 @@ class PerceptionNode(Node):
     def _on_rgb(self, msg: Image):
         self._latest_rgb = self._bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
         self._latest_rgb_header = msg.header
+        self._latest_rgb_received_wall = time.monotonic()
 
     def _on_depth(self, msg: Image):
         self._latest_depth = self._bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
+        self._latest_depth_header = msg.header
+        self._latest_depth_received_wall = time.monotonic()
 
     def _on_camera_info(self, msg: CameraInfo):
         self._camera_model = make_camera_model(msg)
         self._camera_frame_id = self._camera_frame_override or msg.header.frame_id
 
+    @staticmethod
+    def _stamp_ns(stamp):
+        sec = int(stamp.sec)
+        nanosec = int(stamp.nanosec)
+        if sec < 0 or nanosec < 0 or nanosec >= 1_000_000_000:
+            raise ValueError(f'invalid ROS stamp: {sec}.{nanosec:09d}')
+        return sec * 1_000_000_000 + nanosec
+
     def _detect_and_publish(self):
-        if self._latest_rgb is None or self._latest_depth is None or self._camera_model is None:
+        if (
+            self._latest_rgb is None
+            or self._latest_rgb_header is None
+            or self._latest_depth is None
+            or self._latest_depth_header is None
+            or self._camera_model is None
+        ):
+            return
+
+        if self._require_unique_camera_source:
+            source_counts = {
+                self._rgb_topic: self.count_publishers(self._rgb_topic),
+                self._depth_topic: self.count_publishers(self._depth_topic),
+                self._camera_info_topic: self.count_publishers(
+                    self._camera_info_topic),
+            }
+            invalid_sources = [
+                f'{topic}={count}'
+                for topic, count in source_counts.items()
+                if count != 1
+            ]
+            if invalid_sources:
+                self.get_logger().error(
+                    'camera source publisher 수가 정확히 1이 아니어서 검출 중단: '
+                    + ', '.join(invalid_sources),
+                    throttle_duration_sec=3.0)
+                return
+
+        try:
+            rgb_stamp_ns = self._stamp_ns(self._latest_rgb_header.stamp)
+            depth_stamp_ns = self._stamp_ns(self._latest_depth_header.stamp)
+        except ValueError as exc:
+            self.get_logger().error(
+                f'잘못된 camera source timestamp로 검출 중단: {exc}',
+                throttle_duration_sec=3.0)
+            return
+
+        if self._last_processed_rgb_stamp_ns is not None:
+            if rgb_stamp_ns == self._last_processed_rgb_stamp_ns:
+                return
+            if rgb_stamp_ns < self._last_processed_rgb_stamp_ns:
+                self.get_logger().warn(
+                    'RGB source timestamp가 역행해 현재 frame을 버리고 '
+                    '새 시퀀스를 기다립니다',
+                    throttle_duration_sec=3.0)
+                self._last_processed_rgb_stamp_ns = None
+                return
+
+        now_wall = time.monotonic()
+        rgb_age = now_wall - self._latest_rgb_received_wall
+        depth_age = now_wall - self._latest_depth_received_wall
+        if (
+            rgb_age > self._max_input_receipt_age_sec
+            or depth_age > self._max_input_receipt_age_sec
+        ):
+            self.get_logger().warn(
+                f'camera input receipt age 초과: rgb={rgb_age:.3f}s, '
+                f'depth={depth_age:.3f}s',
+                throttle_duration_sec=3.0)
+            return
+
+        source_skew_sec = abs(rgb_stamp_ns - depth_stamp_ns) / 1.0e9
+        if source_skew_sec > self._max_rgb_depth_skew_sec:
+            self.get_logger().warn(
+                f'RGB/depth source stamp 차이 {source_skew_sec:.3f}s가 '
+                f'제한 {self._max_rgb_depth_skew_sec:.3f}s를 초과해 검출 중단',
+                throttle_duration_sec=3.0)
             return
 
         rgb = self._latest_rgb
         depth = self._latest_depth
         header = self._latest_rgb_header
+        self._last_processed_rgb_stamp_ns = rgb_stamp_ns
 
         array_msg = Detection3DArray()
         array_msg.header.stamp = header.stamp
@@ -212,10 +334,26 @@ class PerceptionNode(Node):
 
         # ROI 파라미터 로드
         use_bolt_roi = self.get_parameter('use_bolt_roi').value
-        bolt_x_min = self.get_parameter('bolt_roi_x_min').value
-        bolt_x_max = self.get_parameter('bolt_roi_x_max').value
-        bolt_y_min = self.get_parameter('bolt_roi_y_min').value
-        bolt_y_max = self.get_parameter('bolt_roi_y_max').value
+        reference_width = int(
+            self.get_parameter('bolt_roi_reference_width').value)
+        reference_height = int(
+            self.get_parameter('bolt_roi_reference_height').value)
+        if reference_width <= 0 or reference_height <= 0:
+            self.get_logger().error(
+                'bolt ROI reference 크기는 양수여야 합니다',
+                throttle_duration_sec=3.0)
+            return
+        image_height, image_width = rgb.shape[:2]
+        scale_x = image_width / reference_width
+        scale_y = image_height / reference_height
+        bolt_x_min = round(
+            self.get_parameter('bolt_roi_x_min').value * scale_x)
+        bolt_x_max = round(
+            self.get_parameter('bolt_roi_x_max').value * scale_x)
+        bolt_y_min = round(
+            self.get_parameter('bolt_roi_y_min').value * scale_y)
+        bolt_y_max = round(
+            self.get_parameter('bolt_roi_y_max').value * scale_y)
 
         # 🔥 rqt_image_view 시각화를 위한 ROI 박스 그리기
         if debug_image is not None and use_bolt_roi:
@@ -358,7 +496,7 @@ class PerceptionNode(Node):
 
         # 점수 기준 정렬에서 화면 중앙(카메라 축) 근처 우선 정렬로 보정
         bolt_candidates = sorted(
-            bolt_candidates, 
+            bolt_candidates,
             key=lambda c: np.hypot(c[1][0], c[1][1])
         )[:2]
 
@@ -423,6 +561,11 @@ class PerceptionNode(Node):
         지금은 안전장치로 로그만 남긴다. (A)가 실패하면(가림/반사 등) 기존 방식대로
         6-keypoint 중심 픽셀의 depth 역투영으로 폴백한다(orientation 없이).
         """
+        if not self._use_busbar_pnp:
+            _, world_point, status = self._transform_pixel(
+                det['pixel'], depth_image, stamp)
+            return world_point, None, status
+
         pnp = busbar_pnp_world_pose(
             self._camera_model, det['keypoints_px'], self._tf_buffer,
             self._world_frame, self._camera_frame_id, stamp, on_tf_error=self._log_tf_error)
@@ -433,8 +576,10 @@ class PerceptionNode(Node):
             _, hole_a_depth_world, _status_a = self._transform_pixel(hole_a_px, depth_image, stamp)
             _, hole_b_depth_world, _status_b = self._transform_pixel(hole_b_px, depth_image, stamp)
             if hole_a_depth_world is not None and hole_b_depth_world is not None:
-                depth_mid_xy = ((hole_a_depth_world[0] + hole_b_depth_world[0]) / 2.0,
-                                 (hole_a_depth_world[1] + hole_b_depth_world[1]) / 2.0)
+                depth_mid_xy = (
+                    (hole_a_depth_world[0] + hole_b_depth_world[0]) / 2.0,
+                    (hole_a_depth_world[1] + hole_b_depth_world[1]) / 2.0,
+                )
                 discrepancy_m = dual_path_discrepancy_m(pnp['mid_xy'], depth_mid_xy)
                 msg = (f"[busbar] PnP-depth 이중경로 불일치={discrepancy_m*1000:.2f}mm "
                        f"(게이트 {BUSBAR_DUAL_PATH_GATE_M*1000:.0f}mm), "
