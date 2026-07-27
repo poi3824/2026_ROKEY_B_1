@@ -561,7 +561,7 @@ def main():
                 # test_isaac 씬(고정 배치)에서는 실측한 월드 좌표를 그대로 하드코딩해서 쓴다.
                 bolt_world_xy = BOLT1_WORLD_POS if nut_index == 1 else BOLT2_WORLD_POS
                 bolt_target_pos = np.array([bolt_world_xy[0], bolt_world_xy[1], 0.0])
-                bolt_touch_pos = np.array([bolt_target_pos[0], bolt_target_pos[1], 0.3695])
+                bolt_touch_pos = np.array([bolt_target_pos[0], bolt_target_pos[1], 0.3697])
                 phase = "MOVE_TO_BOLT_NUT"
                 step_count = 0
                 print(f"\n>>> [{task}] 너트 {nut_index}번 -> 볼트 {nut_index}번 체결 시작 [하드코딩 월드 좌표] "
