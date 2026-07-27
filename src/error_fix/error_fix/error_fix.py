@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import os
 import sys
 import math
 import cv2
@@ -11,21 +12,34 @@ from geometry_msgs.msg import PoseStamped
 from std_msgs.msg import String
 from cv_bridge import CvBridge
 
+# station별 볼트 카메라 토픽. AMR_WORK_STATION 환경변수로 선택.
+# 기본값 station_3 (기존 동작 그대로 유지) - 배터리팩4는 camera_bolt2 사용.
+STATION_CAMERA_TOPICS = {
+    "station_3": "/camera_bolt",
+    "station_4": "/camera_bolt2",
+}
+_WORK_STATION = os.environ.get("AMR_WORK_STATION", "station_3")
+if _WORK_STATION not in STATION_CAMERA_TOPICS:
+    raise ValueError(
+        f"AMR_WORK_STATION must be one of {sorted(STATION_CAMERA_TOPICS)}, "
+        f"got {_WORK_STATION!r}")
+CAMERA_BOLT_TOPIC = STATION_CAMERA_TOPICS[_WORK_STATION]
+
 
 class BatteryAssemblyVisionNode(Node):
     def __init__(self):
         super().__init__('battery_assembly_vision_node')
-        
+
         self.bridge = CvBridge()
 
         # ----------------------------------------------------------------------
         # ROS 2 Subscribers & Publishers
         # ----------------------------------------------------------------------
         self.rgb_sub = self.create_subscription(
-            Image, '/camera_bolt/rgb', self.rgb_callback, 10
+            Image, f'{CAMERA_BOLT_TOPIC}/rgb', self.rgb_callback, 10
         )
         self.depth_sub = self.create_subscription(
-            Image, '/camera_bolt/depth', self.depth_callback, 10
+            Image, f'{CAMERA_BOLT_TOPIC}/depth', self.depth_callback, 10
         )
 
         # 트리거 명령 수신 (Isaac Sim으로부터 오차 보정 시작 신호 구독)

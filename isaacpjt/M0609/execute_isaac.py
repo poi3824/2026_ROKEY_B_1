@@ -61,7 +61,7 @@ from m0609_rmpflow_controller import RMPFlowController
 # ══════════════════════════════════════════════════════════════════════════
 #  [A] 설정 및 파라미터
 # ══════════════════════════════════════════════════════════════════════════
-USD_PATH = "/home/rokey/junhyeok_version/isaacpjt/M0609/Collected_Busbar_AMR/Busbar.usd"
+USD_PATH = "/home/rokey/EV_combine/src/Collected_Busbar/Busbar.usd"
 
 NOVA_CARTER_ROOT = "/World/Nova_Carter/chassis_link"
 M0609_PATH       = "/World/m0609"
@@ -127,9 +127,25 @@ NUT_PICK_Z         = NUT_SUPPLY_TABLE_Z - (NUT_GRASP_Z_LOCAL - 0.0395)
 NUT_APPROACH_Z     = 0.8                                     # 너트 파지 상공 고도
 BOLT_APPROACH_Z    = 0.6                                     # 너트 체결 상공 고도
 
-# ★ 볼트 1/2번 실측 월드 좌표 (test_isaac 씬 고정 배치 기준) ★
-BOLT1_WORLD_POS = np.array([1.0552, 0.3722])
-BOLT2_WORLD_POS = np.array([1.2636, 0.0098])
+# ★ 볼트 1/2번 실측 월드 좌표 (station별 XY, test_isaac 씬 고정 배치 기준) ★
+# AMR_WORK_STATION 환경변수로 대상 station 선택. 기본값 station_3 (기존 동작 그대로 유지).
+STATION_BOLT_POSITIONS = {
+    "station_3": {
+        "bolt1": np.array([1.0552, 0.3722]),
+        "bolt2": np.array([1.2636, 0.0098]),
+    },
+    "station_4": {
+        "bolt1": np.array([1.0552, -0.2047]),
+        "bolt2": np.array([1.2636, -0.5671]),
+    },
+}
+_WORK_STATION = os.environ.get("AMR_WORK_STATION", "station_3")
+if _WORK_STATION not in STATION_BOLT_POSITIONS:
+    raise ValueError(
+        f"AMR_WORK_STATION must be one of {sorted(STATION_BOLT_POSITIONS)}, "
+        f"got {_WORK_STATION!r}")
+BOLT1_WORLD_POS = STATION_BOLT_POSITIONS[_WORK_STATION]["bolt1"]
+BOLT2_WORLD_POS = STATION_BOLT_POSITIONS[_WORK_STATION]["bolt2"]
 
 # 너트 체결(Screwing) 파라미터
 ENGAGE_LEN           = 0.0125     # 체결 깊이 (12.5mm)
@@ -304,6 +320,52 @@ def quat_wxyz_to_yaw(quat_wxyz):
     return math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
 
 
+def compute_local_offset(parent_pos, parent_quat_wxyz, child_pos, child_quat_wxyz):
+    """parent(AMR) 월드 포즈 기준 child(너트)의 로컬 오프셋 포즈(위치+회전) 계산."""
+    parent_rot = Gf.Rotation(Gf.Quatd(
+        float(parent_quat_wxyz[0]),
+        Gf.Vec3d(float(parent_quat_wxyz[1]), float(parent_quat_wxyz[2]), float(parent_quat_wxyz[3]))))
+    parent_mat = Gf.Matrix4d().SetRotate(parent_rot)
+    parent_mat.SetTranslateOnly(Gf.Vec3d(*[float(v) for v in parent_pos]))
+
+    child_rot = Gf.Rotation(Gf.Quatd(
+        float(child_quat_wxyz[0]),
+        Gf.Vec3d(float(child_quat_wxyz[1]), float(child_quat_wxyz[2]), float(child_quat_wxyz[3]))))
+    child_mat = Gf.Matrix4d().SetRotate(child_rot)
+    child_mat.SetTranslateOnly(Gf.Vec3d(*[float(v) for v in child_pos]))
+
+    local_mat = child_mat * parent_mat.GetInverse()
+    local_pos = local_mat.ExtractTranslation()
+    local_quat = local_mat.ExtractRotationQuat()
+    return (
+        np.array([local_pos[0], local_pos[1], local_pos[2]]),
+        np.array([local_quat.GetReal(), *local_quat.GetImaginary()]),
+    )
+
+
+def compose_world_pose(parent_pos, parent_quat_wxyz, local_pos, local_quat_wxyz):
+    """parent(AMR) 현재 월드 포즈에 로컬 오프셋을 합성해 child(너트)의 월드 포즈 계산."""
+    parent_rot = Gf.Rotation(Gf.Quatd(
+        float(parent_quat_wxyz[0]),
+        Gf.Vec3d(float(parent_quat_wxyz[1]), float(parent_quat_wxyz[2]), float(parent_quat_wxyz[3]))))
+    parent_mat = Gf.Matrix4d().SetRotate(parent_rot)
+    parent_mat.SetTranslateOnly(Gf.Vec3d(*[float(v) for v in parent_pos]))
+
+    local_rot = Gf.Rotation(Gf.Quatd(
+        float(local_quat_wxyz[0]),
+        Gf.Vec3d(float(local_quat_wxyz[1]), float(local_quat_wxyz[2]), float(local_quat_wxyz[3]))))
+    local_mat = Gf.Matrix4d().SetRotate(local_rot)
+    local_mat.SetTranslateOnly(Gf.Vec3d(*[float(v) for v in local_pos]))
+
+    world_mat = local_mat * parent_mat
+    world_pos = world_mat.ExtractTranslation()
+    world_quat = world_mat.ExtractRotationQuat()
+    return (
+        np.array([world_pos[0], world_pos[1], world_pos[2]]),
+        np.array([world_quat.GetReal(), *world_quat.GetImaginary()]),
+    )
+
+
 def glue_busbar_to_ee(robot, busbar_xform, rest_pick_pos, blend):
     if busbar_xform is None or rest_pick_pos is None:
         return
@@ -469,6 +531,16 @@ def main():
     amr_target_xy_theta = None
     wheels_locked = True  # main() 시작 시 lock_amr_base() 이미 호출됨
 
+    # ── 너트 AMR 고정(Glue) 상태 ──
+    # PICK_NUT1/2로 실제 파지되기 전까지는 AMR 위 고정 오프셋을 계속 따라가도록
+    # 매 프레임 강제로 포즈를 갱신한다(물리 마찰에 의존 X). AMR이 set_world_pose로
+    # 직접 텔레포트 이동하기 때문에(바퀴 조인트 저항 없음), 얹혀있기만 한 너트는
+    # 접촉 마찰만으로는 AMR 이동/회전을 따라가지 못하고 떨어질 수 있어서 필요하다.
+    nut1_local_offset = None
+    nut2_local_offset = None
+    nut1_released = False
+    nut2_released = False
+
     def publish_status(status_str: str):
         msg = String()
         msg.data = status_str
@@ -492,14 +564,27 @@ def main():
         if playing and not was_playing:
             world.reset()
             enable_physics_recursively(stage, BUSBAR_ROOT_PATH)
-            enable_physics_recursively(stage, NUT1_ROOT_PATH)
-            enable_physics_recursively(stage, NUT2_ROOT_PATH)
             if busbar_xform and init_busbar_pos is not None:
                 busbar_xform.set_world_pose(position=init_busbar_pos, orientation=init_busbar_quat)
             if nut1_xform and init_nut1_pos is not None:
                 nut1_xform.set_world_pose(position=init_nut1_pos, orientation=init_nut1_quat)
             if nut2_xform and init_nut2_pos is not None:
                 nut2_xform.set_world_pose(position=init_nut2_pos, orientation=init_nut2_quat)
+
+            # 너트는 PICK 전까지 물리를 끄고 AMR에 Kinematic Glue로 고정한다
+            # (얹혀있기만 하면 AMR set_world_pose 텔레포트 이동 시 마찰만으로
+            #  따라가지 못하고 떨어진다 -> 로컬 오프셋을 계산해 매 프레임 강제 추종).
+            disable_physics_recursively(stage, NUT1_ROOT_PATH)
+            disable_physics_recursively(stage, NUT2_ROOT_PATH)
+            amr_pos0, amr_quat0 = robot.get_world_pose()
+            nut1_local_offset = (
+                compute_local_offset(amr_pos0, amr_quat0, init_nut1_pos, init_nut1_quat)
+                if nut1_xform and init_nut1_pos is not None else None)
+            nut2_local_offset = (
+                compute_local_offset(amr_pos0, amr_quat0, init_nut2_pos, init_nut2_quat)
+                if nut2_xform and init_nut2_pos is not None else None)
+            nut1_released = False
+            nut2_released = False
 
             step_count = 0
             grasp_timer = 0
@@ -517,6 +602,16 @@ def main():
 
             amr_moving = False
             amr_target_xy_theta = None
+
+        # 1.4. 너트 AMR 고정(Glue) 추종 - PICK 되기 전까지 매 프레임 강제 갱신
+        if playing:
+            amr_cur_pos, amr_cur_quat = robot.get_world_pose()
+            if not nut1_released and nut1_xform is not None and nut1_local_offset is not None:
+                glued_pos, glued_quat = compose_world_pose(amr_cur_pos, amr_cur_quat, *nut1_local_offset)
+                nut1_xform.set_world_pose(position=glued_pos, orientation=glued_quat)
+            if not nut2_released and nut2_xform is not None and nut2_local_offset is not None:
+                glued_pos, glued_quat = compose_world_pose(amr_cur_pos, amr_cur_quat, *nut2_local_offset)
+                nut2_xform.set_world_pose(position=glued_pos, orientation=glued_quat)
 
         # 1.5. AMR 이동 처리 (behavior_node -> amr_node -> /amr/goal_pose)
         #      팔 작업 중에는 바퀴를 잠그고(lock), AMR 이동 중에는 풀어준다(unlock).
@@ -676,6 +771,14 @@ def main():
 
             elif task in ("PICK_NUT1", "PICK_NUT2"):
                 nut_index = 1 if task == "PICK_NUT1" else 2
+                # 실제 파지 시작 -> AMR Glue 해제하고 정상 다이나믹 바디로 전환
+                # (이후 그리퍼의 실제 접촉/마찰 기반 파지 물리는 기존 로직 그대로).
+                if nut_index == 1:
+                    nut1_released = True
+                    enable_physics_recursively(stage, NUT1_ROOT_PATH)
+                else:
+                    nut2_released = True
+                    enable_physics_recursively(stage, NUT2_ROOT_PATH)
                 if HOME_EE_POS is not None:
                     nut_offset = NUT1_OFFSET_FROM_HOME if nut_index == 1 else NUT2_OFFSET_FROM_HOME
                     pick_x = HOME_EE_POS[0] + nut_offset[0]
