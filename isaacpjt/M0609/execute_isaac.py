@@ -129,12 +129,21 @@ INSERT_TOLERANCE_STRICT = 0.001    # Insert 단계 오차 허용범위 (1mm)
 # ══════════════════════════════════════════════════════════════════════════
 #  너트 조립(Nut Assembly) 파라미터
 # ══════════════════════════════════════════════════════════════════════════
-NUT_SCAN_OFFSET_X = -0.5
-NUT_SCAN_OFFSET_Y = -0.3
 NUT_SCAN_Z        = 0.9
 
-NUT1_OFFSET_FROM_HOME = np.array([-0.4587, -0.2957])
-NUT2_OFFSET_FROM_HOME = np.array([-0.3683, -0.2961])
+# 초기 자세(INIT_POSE 직후 HOME_EE_POS) TCP 좌표 기준, 너트 1~6번까지의 실측 상대
+# 오프셋(X,Y만 - Z는 NUT_PICK_Z로 고정). 초기 TCP=(1.0335, 0.1931, 0.8658), 너트1~6
+# 실측 월드좌표를 각각 빼서 계산함 - AMR이 어느 배터리 스테이션에 있든, INIT_POSE로
+# 되돌아가 새로 구한 HOME_EE_POS에 이 오프셋만 더하면 그 스테이션에서의 정확한 너트
+# 위치가 나온다(월드 절대좌표를 하드코딩하면 스테이션이 바뀔 때마다 다 틀어짐).
+NUT_OFFSET_FROM_HOME = {
+    1: np.array([-0.4587, -0.2957]),
+    2: np.array([-0.3683, -0.2961]),
+    3: np.array([-0.2781, -0.2949]),
+    4: np.array([-0.2781, -0.2093]),
+    5: np.array([-0.3692, -0.2107]),
+    6: np.array([-0.4589, -0.2083]),
+}
 
 NUT_HEIGHT         = 0.0095
 NUT_GRASP_Z_LOCAL  = NUT_HEIGHT + 0.023
@@ -680,6 +689,7 @@ def main():
     grasp_timer = 0
     was_playing = False
     phase = "IDLE"
+    init_pose_only = False  # True면 INIT_POSE 완료 후 SCAN_APPROACH로 안 이어지고 바로 종료
     busbar_grasped = False  # 그리퍼-버스바 FixedJoint가 걸려있는 상태인지
     descend_target_z = None
     target_mid_pos = None
@@ -687,7 +697,7 @@ def main():
 
     # ── 너트 조립(Nut Assembly) 상태 변수 ──
     nut_index      = 0        # 1: 너트 1번, 2: 너트 2번
-    NUT_SCAN_POS   = None     # 너트 스캔 위치 (최초 1회 계산 후 재사용)
+    NUT_SCAN_POS   = None     # 너트 스캔 위치 (SCAN_NUT1/2마다 해당 너트 오프셋으로 새로 계산)
     nut_pick_pos   = None     # 현재 너트의 물리 파지 좌표
     nut_approach_pos = None   # 현재 너트 파지 상공 접근 좌표
     bolt_target_pos  = None   # 체결 목표 좌표
@@ -884,8 +894,18 @@ def main():
 
             if task == "SCAN_BATTERY":
                 phase = "INIT_POSE"
+                init_pose_only = False
                 step_count = 0
                 print(f"\n>>> [{task}] 배터리 스캔 요청 수신 -> 1) 초기 관절 정렬 시작")
+
+            elif task == "RETURN_HOME":
+                # 너트 작업 전처럼 "관절 각도만 초기 자세로 되돌리고 싶을 때" 쓴다.
+                # SCAN_BATTERY와 달리 완료 후 SCAN_APPROACH(배터리 스캔 고도 상승)로
+                # 이어지지 않고 바로 끝난다.
+                phase = "INIT_POSE"
+                init_pose_only = True
+                step_count = 0
+                print(f"\n>>> [{task}] 초기 관절 자세 복귀 시작")
 
             elif task == "SCAN_BUSBAR":
                 cur_pos = world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation()
@@ -941,17 +961,27 @@ def main():
 
             elif task in ("SCAN_NUT1", "SCAN_NUT2"):
                 nut_index = 1 if task == "SCAN_NUT1" else 2
-                if NUT_SCAN_POS is None:
-                    cur_ee = world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation()
-                    NUT_SCAN_POS = np.array([cur_ee[0] + NUT_SCAN_OFFSET_X, cur_ee[1] + NUT_SCAN_OFFSET_Y, NUT_SCAN_Z])
-                phase = "NUT_SCAN_APPROACH"
-                step_count = 0
-                print(f"\n>>> [{task}] 너트 스캔 위치 이동 시작 (Target: X={NUT_SCAN_POS[0]:.3f}, Y={NUT_SCAN_POS[1]:.3f}, Z={NUT_SCAN_POS[2]:.3f})")
+                if HOME_EE_POS is not None:
+                    # 너트마다 HOME 기준 X,Y가 다르므로 스캔 위치도 매번 그 너트의
+                    # 오프셋으로 새로 계산한다(이전엔 최초 1회만 계산해서 재사용하다보니
+                    # 너트 2번 스캔 때도 너트 1번 위치로 가는 버그가 있었다).
+                    nut_offset = NUT_OFFSET_FROM_HOME[nut_index]
+                    NUT_SCAN_POS = np.array([
+                        HOME_EE_POS[0] + nut_offset[0],
+                        HOME_EE_POS[1] + nut_offset[1],
+                        NUT_SCAN_Z,
+                    ])
+                    phase = "NUT_SCAN_APPROACH"
+                    step_count = 0
+                    print(f"\n>>> [{task}] 너트 {nut_index}번 스캔 위치 이동 시작 (Target: X={NUT_SCAN_POS[0]:.3f}, Y={NUT_SCAN_POS[1]:.3f}, Z={NUT_SCAN_POS[2]:.3f})")
+                else:
+                    print(f"\n[ERROR] [{task}] 초기 위치(HOME_EE_POS)가 없습니다. 먼저 INIT_POSE가 수행되어야 합니다.")
+                    publish_status("FAILURE:NO_HOME_POSE")
 
             elif task in ("PICK_NUT1", "PICK_NUT2"):
                 nut_index = 1 if task == "PICK_NUT1" else 2
                 if HOME_EE_POS is not None:
-                    nut_offset = NUT1_OFFSET_FROM_HOME if nut_index == 1 else NUT2_OFFSET_FROM_HOME
+                    nut_offset = NUT_OFFSET_FROM_HOME[nut_index]
                     pick_x = HOME_EE_POS[0] + nut_offset[0]
                     pick_y = HOME_EE_POS[1] + nut_offset[1]
                     nut_pick_pos = np.array([pick_x, pick_y, NUT_PICK_Z])
@@ -1015,9 +1045,15 @@ def main():
                     )
 
                     print(f"[OK] 1) 관절 정렬 완료! (EE Pos: {HOME_EE_POS[0]:.3f}, {HOME_EE_POS[1]:.3f}, {HOME_EE_POS[2]:.3f})")
-                    print(f" -> 2) 초기 위치 기준 Z={SCAN_APPROACH_Z}m 상승 시작 (Target: {SCAN_POS[0]:.3f}, {SCAN_POS[1]:.3f}, {SCAN_POS[2]:.3f})")
 
-                    phase = "SCAN_APPROACH"
+                    if init_pose_only:
+                        print(" -> 초기 자세 복귀만 요청됨 - 스캔 이동 없이 종료")
+                        publish_progress("RETURN_HOME_COMPLETE", 100.0)
+                        publish_status("SUCCESS")
+                        phase = "IDLE"
+                    else:
+                        print(f" -> 2) 초기 위치 기준 Z={SCAN_APPROACH_Z}m 상승 시작 (Target: {SCAN_POS[0]:.3f}, {SCAN_POS[1]:.3f}, {SCAN_POS[2]:.3f})")
+                        phase = "SCAN_APPROACH"
                     step_count = 0
                 elif step_count > 300:
                     print(f"\n[ERROR] INIT_POSE 관절 정렬 실패 (joint_err={joint_err:.4f}rad) - 실패 처리")

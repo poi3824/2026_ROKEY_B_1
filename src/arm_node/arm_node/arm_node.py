@@ -355,6 +355,30 @@ class ArmNode(Node):
             return result_msg
 
         # ---------------------------------------------------------------------
+        # [Task] RETURN_HOME (너트 작업 전 관절 각도만 초기 자세로 복귀, 스캔 이동 없음)
+        # ---------------------------------------------------------------------
+        elif task_type == "RETURN_HOME":
+            self.get_logger().info(" -> [RETURN_HOME] Isaac Sim으로 초기 자세 복귀 명령 전송")
+
+            cmd_msg = String()
+            cmd_msg.data = "RETURN_HOME"
+            self.pub_task_command.publish(cmd_msg)
+
+            success = self.wait_for_isaac_completion(goal_handle, feedback_msg)
+
+            if success:
+                result_msg.success = True
+                result_msg.message = "초기 자세 복귀 완료"
+                goal_handle.succeed()
+            else:
+                result_msg.success = False
+                result_msg.error_code = "RETURN_HOME_FAILED"
+                result_msg.message = f"초기 자세 복귀 실패 (Status: {self.isaac_status})"
+                goal_handle.abort()
+
+            return result_msg
+
+        # ---------------------------------------------------------------------
         # [Task 7] SCAN_NUT1 / SCAN_NUT2 (너트 스캔 지점 이동 & 비전 좌표 저장)
         # ---------------------------------------------------------------------
         elif task_type in ("SCAN_NUT1", "SCAN_NUT2"):

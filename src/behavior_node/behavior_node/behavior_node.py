@@ -41,6 +41,7 @@ class ProcessState(Enum):
     MOVE_BATTERY_CENTER = auto()    # 배터리 중점 상공으로 이동
     FINE_ALIGNMENT = auto()         # 비전 기반 1픽셀 미세 오차 보정
     ASSEMBLE_BUSBAR = auto()        # 버스바 체결 (하강 및 그리퍼 해제) - 추가됨
+    RETURN_HOME_FOR_NUT = auto()    # 너트 작업 전 초기 관절 자세로 복귀 (HOME_EE_POS 갱신)
     SCAN_NUT1 = auto()              # 너트 스캔 위치 이동 및 너트 1번 스캔 (신규)
     PICK_NUT1 = auto()              # 너트 1번 물리 파지 (신규)
     ASSEMBLE_NUT1 = auto()          # 볼트 1번 위치로 이동 및 너트 1번 체결 (신규)
@@ -227,6 +228,20 @@ class BehaviorNode(Node):
             self.get_logger().info("\n>>> [STEP 5] 버스바 체결 및 하강 (ASSEMBLE_BUSBAR) 요청")
             self.send_arm_goal(
                 task_type="ASSEMBLE_BUSBAR",
+                next_state=ProcessState.RETURN_HOME_FOR_NUT
+            )
+
+        # [STEP 5.5] 너트 작업 전 초기 관절 자세로 복귀 (신규)
+        # 너트 위치는 execute_isaac.py에서 HOME_EE_POS 기준 상대 오프셋으로 계산되는데,
+        # 버스바 체결까지 마친 시점의 팔 위치는 HOME이 아니다(배터리 중점 상공 쪽에
+        # 남아있음). AMR이 다른 배터리 스테이션으로 이동한 뒤라 HOME_EE_POS도 예전
+        # 스테이션 기준 값으로 남아있을 수 있으므로, RETURN_HOME task로 관절 각도만
+        # 초기 자세로 되돌려 HOME_EE_POS를 현재 AMR 위치 기준으로 새로 갱신한다
+        # (SCAN_BATTERY를 재사용하면 배터리 스캔 고도까지 다시 올라가버려서 안 됨).
+        elif self.state == ProcessState.RETURN_HOME_FOR_NUT:
+            self.get_logger().info("\n>>> [STEP 5.5] 너트 작업 전 초기 자세 복귀 (RETURN_HOME_FOR_NUT) 요청")
+            self.send_arm_goal(
+                task_type="RETURN_HOME",
                 next_state=ProcessState.SCAN_NUT1
             )
 
