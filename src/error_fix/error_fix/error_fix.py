@@ -68,8 +68,8 @@ class BatteryAssemblyVisionNode(Node):
         # 연속 30 Step 유지 카운터
         self.hold_count = 0
 
-        # 10Hz 오차 보정 제어 루프
-        self.create_timer(0.1, self.control_loop)
+        # 60Hz 오차 보정 제어 루프
+        self.create_timer(1.0 / 60.0, self.control_loop)
 
         self.get_logger().info("🚀 [Vision Node] 실행 완료. 고정 볼트 탐색을 시작합니다 (트리거 대기 중...)")
 
