@@ -902,9 +902,15 @@ def main():
                 cur_pos = world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation()
                 current_err = math.dist(cur_pos, tuple(nut_approach_pos))
 
+                # ★ 진단용: eye-in-hand 추적값이 계속 표류하는지, 그냥 못 따라가는지
+                # 구분하려면 이 로그로 목표(vision)와 실제 EE 위치를 같이 봐야 한다.
+                if step_count % 30 == 0:
+                    print(f"    [NUT_APPROACH] cur=({cur_pos[0]:.4f},{cur_pos[1]:.4f}) "
+                          f"target=({nut_approach_pos[0]:.4f},{nut_approach_pos[1]:.4f}) err={current_err*1000:.1f}mm")
+
                 if current_err < PICK_TOLERANCE_STRICT or (current_err < PICK_TOLERANCE_LOOSE_VAL and step_count > MAX_STUCK_STEPS):
                     nut_label = resolve_nut_assets(nut_index, nut1_xform, nut2_xform)[1]
-                    print(f"[OK] {nut_label} 상공 도착! -> 하강 시작")
+                    print(f"[OK] {nut_label} 상공 도착! (err={current_err*1000:.1f}mm) -> 하강 시작")
                     phase = "NUT_DESCEND"
                     step_count = 0
 
@@ -923,9 +929,13 @@ def main():
                 cur_pos = world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation()
                 current_err = math.dist(cur_pos, tuple(nut_pick_pos))
 
+                if step_count % 30 == 0:
+                    print(f"    [NUT_DESCEND] cur=({cur_pos[0]:.4f},{cur_pos[1]:.4f},{cur_pos[2]:.4f}) "
+                          f"target=({nut_pick_pos[0]:.4f},{nut_pick_pos[1]:.4f},{nut_pick_pos[2]:.4f}) err={current_err*1000:.1f}mm")
+
                 if current_err < PICK_TOLERANCE_STRICT or (current_err < PICK_TOLERANCE_LOOSE_VAL and step_count > MAX_STUCK_STEPS):
                     nut_label = resolve_nut_assets(nut_index, nut1_xform, nut2_xform)[1]
-                    print(f"[OK] {nut_label} 하강 완료! -> 물리 파지(Gripper Close) 시작")
+                    print(f"[OK] {nut_label} 하강 완료! (err={current_err*1000:.1f}mm) -> 물리 파지(Gripper Close) 시작")
                     phase = "NUT_GRASP"
                     grasp_timer = 0
 
