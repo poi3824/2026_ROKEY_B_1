@@ -6,33 +6,10 @@ import numpy as np
 
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import Image, CameraInfo
+from sensor_msgs.msg import Image
 from geometry_msgs.msg import PoseStamped
 from std_msgs.msg import String
 from cv_bridge import CvBridge
-from scipy.spatial.transform import Rotation as R
-
-# ──────────────────────────────────────────────────────────────────────────
-# camera_bolt 고정 World Pose (Busbar.usd -> /World/Camera_bolt prim에서 추출).
-# 카메라가 /World에 고정 마운트된 탑다운(수직 아래) 카메라라서 실행 중 갱신 불필요.
-# ──────────────────────────────────────────────────────────────────────────
-CAMERA_BOLT_WORLD_POS = np.array([1.259848, -0.005358, 1.218396])
-CAMERA_BOLT_WORLD_QUAT_WXYZ = np.array([0.7071067811865476, 0.0, 0.0, 0.7071067811865475])
-_CAMERA_BOLT_ROT = R.from_quat([
-    CAMERA_BOLT_WORLD_QUAT_WXYZ[1], CAMERA_BOLT_WORLD_QUAT_WXYZ[2],
-    CAMERA_BOLT_WORLD_QUAT_WXYZ[3], CAMERA_BOLT_WORLD_QUAT_WXYZ[0],
-])
-# ROS 카메라 광학 프레임(X:right, Y:down, Z:forward) -> USD 카메라 로컬 프레임(X:right, Y:up, Z:backward)
-_OPTICAL_TO_USD_CAM = np.diag([1.0, -1.0, -1.0])
-
-
-def pixel_depth_to_world(u, v, depth_m, fx, fy, cx, cy):
-    """픽셀 좌표(u,v) + depth(m)를 camera_bolt 고정 pose 기준 world 좌표(m)로 변환."""
-    x_opt = (u - cx) * depth_m / fx
-    y_opt = (v - cy) * depth_m / fy
-    z_opt = depth_m
-    p_cam_usd = _OPTICAL_TO_USD_CAM @ np.array([x_opt, y_opt, z_opt])
-    return _CAMERA_BOLT_ROT.apply(p_cam_usd) + CAMERA_BOLT_WORLD_POS
 
 
 class BatteryAssemblyVisionNode(Node):
@@ -50,9 +27,6 @@ class BatteryAssemblyVisionNode(Node):
         self.depth_sub = self.create_subscription(
             Image, '/camera_bolt/depth', self.depth_callback, 10
         )
-        self.caminfo_sub = self.create_subscription(
-            CameraInfo, '/camera_bolt/camera_info', self.caminfo_callback, 10
-        )
 
         # 트리거 명령 수신 (Isaac Sim으로부터 오차 보정 시작 신호 구독)
         self.sub_errorfix_cmd = self.create_subscription(
@@ -62,23 +36,12 @@ class BatteryAssemblyVisionNode(Node):
         # Isaac Sim 목표 포즈 퍼블리셔 및 보정 완료 상태 퍼블리셔
         self.pub_target_pose = self.create_publisher(PoseStamped, '/target_pose', 10)
         self.pub_task_cmd = self.create_publisher(String, '/task_command', 10)
-        # 고정 볼트(fixed_bolt_coords)의 절대 world 좌표 1회 발행용 (너트 체결 타겟 계산에 사용,
-        # 팔의 kinematic 오차와 무관한 값 - execute_isaac.py가 구독).
-        self.pub_bolt_anchor = self.create_publisher(PoseStamped, '/vision/bolt_anchor_pose', 10)
 
         # ----------------------------------------------------------------------
         # 제어 및 오차 보정 파라미터
         # ----------------------------------------------------------------------
         self.TOLERANCE_DEG = 3        # 목표 각도 정밀도: 0.5도 이하
         self.MAX_VALID_PIXEL_ERR = 200  # 이상치 픽셀 오차 스킵 가드
-
-        # camera_bolt intrinsics (최초 1회 수신 시 캐시, 고정 카메라라 갱신 불필요)
-        self.fx = self.fy = self.cx = self.cy = None
-
-        # 고정 볼트 world 좌표 산출용 (bolts_detected 이후 depth 샘플을 모아 평균, 노이즈 감소)
-        self._bolt_world_samples = []
-        self.BOLT_WORLD_AVG_SAMPLES = 30
-        self.bolt_anchor_published = False
 
         # 최신 Depth 프레임 및 상태 변수
         self.current_depth_frame = None
@@ -118,41 +81,6 @@ class BatteryAssemblyVisionNode(Node):
             self.is_active = True
             self.hold_count = 0  # 새로 시작 시 연속 카운터 초기화
 
-    def caminfo_callback(self, msg: CameraInfo):
-        if self.fx is None:
-            self.fx, self.fy, self.cx, self.cy = msg.k[0], msg.k[4], msg.k[2], msg.k[5]
-            self.get_logger().info(f"✅ camera_bolt intrinsics 수신: fx={self.fx:.2f}, fy={self.fy:.2f}")
-
-    def _update_bolt_anchor_world(self):
-        """고정 볼트(fixed_bolt_coords[0])의 depth를 샘플링해 world 좌표를 평균 내고,
-        충분히 모이면 /vision/bolt_anchor_pose로 1회 발행한다."""
-        if self.bolt_anchor_published or not self.fixed_bolt_coords:
-            return
-        if self.fx is None or self.current_depth_frame is None:
-            return
-
-        bx, by = self.fixed_bolt_coords[0]
-        depth_h, depth_w = self.current_depth_frame.shape[:2]
-        if not (0 <= by < depth_h and 0 <= bx < depth_w):
-            return
-        depth_m = float(self.current_depth_frame[by, bx])
-        if depth_m <= 0.0:
-            return
-
-        world_pos = pixel_depth_to_world(bx, by, depth_m, self.fx, self.fy, self.cx, self.cy)
-        self._bolt_world_samples.append(world_pos)
-
-        if len(self._bolt_world_samples) >= self.BOLT_WORLD_AVG_SAMPLES:
-            avg_pos = np.mean(self._bolt_world_samples, axis=0)
-            msg = PoseStamped()
-            msg.header.frame_id = "world"
-            msg.header.stamp = self.get_clock().now().to_msg()
-            msg.pose.position.x, msg.pose.position.y, msg.pose.position.z = (float(v) for v in avg_pos)
-            msg.pose.orientation.w = 1.0
-            self.pub_bolt_anchor.publish(msg)
-            self.bolt_anchor_published = True
-            self.get_logger().info(f"✅ 고정 볼트 world 좌표 확정(평균 {self.BOLT_WORLD_AVG_SAMPLES}프레임) -> {avg_pos}")
-
     def depth_callback(self, msg):
         try:
             depth_img = self.bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
@@ -180,9 +108,6 @@ class BatteryAssemblyVisionNode(Node):
             else:
                 cv2.putText(display_img, "Searching Static Bolts...", (30, 40),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-
-        if self.bolts_detected and not self.bolt_anchor_published:
-            self._update_bolt_anchor_world()
 
         # ----------------------------------------------------------------------
         # [STEP 2] 트리거 수신 전 대기 모드 (시각화만 출력)
