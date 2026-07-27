@@ -67,6 +67,7 @@ NOVA_CARTER_ROOT = "/World/Nova_Carter/chassis_link"
 M0609_PATH       = "/World/m0609"
 EE_LINK_NAME     = "link_6"
 GRIPPER_JOINTS   = ["finger_joint", "right_inner_knuckle_joint"]
+GRIPPER_ROOT_PATH = f"{M0609_PATH}/onrobot_rg2ft"
 
 # AMR 이동 파라미터 (amr_node의 arrival_tolerance_m 기본값 0.05m보다 더 정확히 세워서 도착)
 AMR_LINEAR_SPEED  = 0.3    # m/s (목표에서 멀 때 최고 속도)
@@ -79,8 +80,8 @@ AMR_MIN_LINEAR_SPEED  = 0.02   # m/s - 감속해도 이 이하로는 안 느려�
 AMR_MIN_ANGULAR_SPEED = 0.05   # rad/s
 AMR_ACCEL_TIME = 1.0   # s - 이동 시작 후 이 시간 동안 속도를 0에서 최고속까지 서서히 올린다
 
-BUSBAR_ROOT_PATH      = "/World/busbar"
-BUSBAR_POLYSHAPE_PATH = "/World/busbar/geo/PolyShape"
+BUSBAR_ROOT_PATH      = "/World/Z_busbar3"
+BUSBAR_POLYSHAPE_PATH = "/World/Z_busbar3/Mesh"
 
 # 너트 Prim 경로 (체결에 실제로 쓰이는 건 nut1/nut2뿐이지만, 씬에는 여분 너트
 # nut1_01, nut2_01/02/03도 있고 이것들도 전부 AMR에 실린 부품 트레이 위 물체라
@@ -94,10 +95,11 @@ EXTRA_NUT_POLYSHAPE_PATHS = [f"{p}/geo/PolyShape" for p in EXTRA_NUT_ROOT_PATHS]
 
 # 그리퍼 파라미터
 GRIPPER_OPEN      = np.array([0.0, 0.0])
-GRIPPER_CLOSE     = np.array([0.8, 0.8])
+GRIPPER_CLOSE     = np.array([0.85, 0.85])
 GRIPPER_CLOSE_NUT = np.array([0.96, 0.96])
 GRIPPER_DELTA     = np.array([-0.5, -0.5])
 GRIP_CLOSE_RAMP_STEPS = 50
+GRIP_SETTLE_STEPS = 15  # 손가락이 다 닫힌 뒤 FixedJoint를 만들기 전 안정화 대기 틱 수
 
 # Kinematic Pose-Glue 파라미터
 EE_OFFSET = np.array([0.0, 0.0, 0.185])
@@ -107,6 +109,11 @@ BUSBAR_REST_ORIENTATION = np.array([0.5, -0.5, 0.5, 0.5])
 
 # 기본 좌표 및 높이 정의
 TARGET_INIT_JOINTS   = np.array([0.0, 0.0, np.radians(90.0), 0.0, np.radians(90.0), np.radians(90.0)])
+
+# INIT_POSE/RETURN_HOME_JOINTS 관절 속도 제한 (rad/s) - 목표 각도를 한 틱에 통째로
+# 명령하면 오차가 클 때 PD 드라이브가 최대 속도로 꽂아버려 반력으로 AMR까지 흔들리므로,
+# 이 속도로 매 틱 목표를 조금씩만 전진시켜 부드럽게 도달하게 한다.
+ARM_INIT_MAX_JOINT_SPEED = math.radians(20.0)  # rad/s
 
 _POS_GRAB_PICK       = 0.455
 SCAN_APPROACH_Z      = 0.7     # 배터리 스캔 고도
@@ -300,6 +307,80 @@ def detach_nut_from_amr(stage, nut_root_path, joint_name=NUT_AMR_JOINT_NAME):
         UsdPhysics.FixedJoint(joint_prim).GetJointEnabledAttr().Set(False)
 
 
+BUSBAR_GRIP_JOINT_NAME = "PhysicsFixedJoint_Gripper"
+
+
+def _quat_mul(q1, q2):
+    w1, x1, y1, z1 = q1
+    w2, x2, y2, z2 = q2
+    return np.array([
+        w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+        w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+        w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+        w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+    ])
+
+
+def _quat_conj(q):
+    w, x, y, z = q
+    return np.array([w, -x, -y, -z])
+
+
+def _quat_rotate_vec(q, v):
+    qv = np.array([0.0, v[0], v[1], v[2]])
+    return _quat_mul(_quat_mul(q, qv), _quat_conj(q))[1:]
+
+
+def attach_busbar_to_gripper(stage, gripper_link_path, robot, busbar_xform):
+    """버스바를 그리퍼(EE 링크)에 FixedJoint로 고정한다.
+
+    find_rigidbody_path로 찾은 부모 프림(/World/Z_busbar3)과, 위치를 실제로 측정한
+    Mesh 프림(/World/Z_busbar3/Mesh, busbar_xform)이 서로 다른 로컬 좌표계라 조인트가
+    엉뚱한 곳으로 튕겼다(실측 확인됨) - 부모와 Mesh 사이에 자체 상대 오프셋이 있으면
+    "Mesh 기준으로 잰 상대변환"을 "부모 프림"에 그대로 적용했을 때 그 오프셋만큼
+    어긋난다. 그래서 위치를 재는 프림과 조인트를 실제로 거는 프림을 Mesh 하나로
+    통일한다 - busbar_xform.get_world_pose()로 잰 것과 동일한 BUSBAR_POLYSHAPE_PATH
+    (Mesh)를 Body1로 직접 지정한다."""
+    gripper_prim = stage.GetPrimAtPath(gripper_link_path)
+    busbar_prim = stage.GetPrimAtPath(BUSBAR_POLYSHAPE_PATH)
+    if not gripper_prim.IsValid() or not busbar_prim.IsValid():
+        return None
+
+    ee_pos, ee_quat = robot.end_effector.get_world_pose()
+    real_pos, real_quat = busbar_xform.get_world_pose()
+    ee_pos = np.asarray(ee_pos, dtype=float)
+    ee_quat = np.asarray(ee_quat, dtype=float)
+    real_pos = np.asarray(real_pos, dtype=float)
+    real_quat = np.asarray(real_quat, dtype=float)
+
+    ee_quat_conj = _quat_conj(ee_quat)
+    rel_pos = _quat_rotate_vec(ee_quat_conj, real_pos - ee_pos)
+    rel_quat = _quat_mul(ee_quat_conj, real_quat)
+
+    joint_path = f"{BUSBAR_POLYSHAPE_PATH}/{BUSBAR_GRIP_JOINT_NAME}"
+    joint_prim = stage.GetPrimAtPath(joint_path)
+    joint = UsdPhysics.FixedJoint(joint_prim) if joint_prim.IsValid() else UsdPhysics.FixedJoint.Define(stage, joint_path)
+
+    joint.CreateBody0Rel().SetTargets([gripper_link_path])
+    joint.CreateBody1Rel().SetTargets([BUSBAR_POLYSHAPE_PATH])
+
+    joint.CreateLocalPos0Attr().Set(Gf.Vec3f(*[float(v) for v in rel_pos]))
+    joint.CreateLocalRot0Attr().Set(Gf.Quatf(float(rel_quat[0]), Gf.Vec3f(*[float(v) for v in rel_quat[1:]])))
+    joint.CreateLocalPos1Attr().Set(Gf.Vec3f(0.0, 0.0, 0.0))
+    joint.CreateLocalRot1Attr().Set(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
+    joint.CreateJointEnabledAttr().Set(True)
+
+    print(f"[BUSBAR ATTACH] EE=({ee_pos[0]:.4f},{ee_pos[1]:.4f},{ee_pos[2]:.4f}) "
+          f"Busbar=({real_pos[0]:.4f},{real_pos[1]:.4f},{real_pos[2]:.4f}) rel_pos={rel_pos}")
+    return joint
+
+
+def detach_busbar_from_gripper(stage):
+    joint_prim = stage.GetPrimAtPath(f"{BUSBAR_POLYSHAPE_PATH}/{BUSBAR_GRIP_JOINT_NAME}")
+    if joint_prim.IsValid():
+        UsdPhysics.FixedJoint(joint_prim).GetJointEnabledAttr().Set(False)
+
+
 def nut_paths_for_index(nut_index):
     """nut_index(1 또는 2)에 따라 (root_path, rigidbody_path) 반환"""
     if nut_index == 1:
@@ -322,6 +403,34 @@ def find_prim_path(stage, root_path, name):
     return None
 
 
+def _set_runtime_gains(robot, joint_names, stiffness, damping, max_force):
+    """robot._articulation_view(런타임 PhysX 텐서 뷰)에 직접 gain을 적용한다.
+
+    UsdPhysics.DriveAPI의 stiffness/damping 속성을 시뮬레이션 시작 후에 stage에서
+    직접 Set()해도 이미 초기화된 ArticulationView는 그 값을 다시 읽어가지 않는다
+    (Articulation.set_gains의 save_to_usd=False 기본값이 보여주듯, USD와 런타임
+    physics view는 서로 다른 저장소다). 그래서 "강성을 올렸는데도 계속 풀린다"는
+    증상은 실제로는 런타임에 전혀 반영이 안 된 것이었다. robot.apply_action이
+    쓰는 것과 동일한 _articulation_view.set_gains/set_max_efforts를 써야 실제
+    시뮬레이션에 적용된다."""
+    if robot is None:
+        return
+    view = getattr(robot, "_articulation_view", None)
+    if view is None:
+        return
+    # view.set_gains(..., joint_names=...)의 내부 이름->인덱스 변환이 dof_names 순서와
+    # 어긋나 있어(IndexError로 실측 확인됨) 범위를 벗어난 인덱스를 만들어냈다. 스크립트
+    # 전역에서 이미 잘 쓰이고 있는 robot.get_dof_index()로 직접 인덱스를 구해
+    # joint_indices로 넘기면 이 문제를 피할 수 있다.
+    joint_indices = [robot.get_dof_index(name) for name in joint_names]
+    n = len(joint_indices)
+    kps = np.full((1, n), float(stiffness))
+    kds = np.full((1, n), float(damping))
+    efforts = np.full((1, n), float(max_force))
+    view.set_gains(kps=kps, kds=kds, joint_indices=joint_indices, save_to_usd=False)
+    view.set_max_efforts(values=efforts, joint_indices=joint_indices)
+
+
 def lock_amr_base(stage, amr_root_path, robot=None):
     """로봇팔 작업 중 AMR 바퀴를 고정(브레이크)한다 - 팔의 반력으로 베이스가
     흔들리는 것을 방지.
@@ -329,13 +438,18 @@ def lock_amr_base(stage, amr_root_path, robot=None):
     stiffness만 확 높이고 targetPosition을 안 맞추면, 드라이브가 "지금 위치"가
     아니라 예전에 남아있던 targetPosition(보통 0)으로 확 스냅되면서 바퀴가 휙
     돌아간다. 그래서 robot이 주어지면 잠그기 직전에 각 관절의 현재 각도를 읽어
-    그대로 targetPosition으로 넣어, "지금 있는 자리 그대로" 잠기도록 한다."""
+    그대로 targetPosition으로 넣어, "지금 있는 자리 그대로" 잠기도록 한다.
+
+    아래 stage 기반 DriveAPI Set()은 USD에 값을 남겨두기 위한 것일 뿐 런타임
+    시뮬레이션에는 반영되지 않는다 - 실제 잠금 효과는 이 함수 끝에서
+    robot._articulation_view.set_gains/set_max_efforts로 낸다(_set_runtime_gains)."""
     amr_prim = stage.GetPrimAtPath(amr_root_path).GetParent()
     if not amr_prim.IsValid():
         amr_prim = stage.GetPrimAtPath(amr_root_path)
 
     dof_names = list(robot.dof_names) if robot is not None else None
     joint_positions = robot.get_joint_positions() if robot is not None else None
+    locked_joint_names = []
 
     for prim in Usd.PrimRange(amr_prim):
         for dt in ("angular", "linear"):
@@ -349,16 +463,37 @@ def lock_amr_base(stage, amr_root_path, robot=None):
                         # USD Physics DriveAPI의 각도 관련 targetPosition은 degree 단위다
                         # (Isaac Sim의 관절 각도는 radian이라 변환 필요).
                         pos_attr.Set(math.degrees(cur_val) if dt == "angular" else cur_val)
+                    locked_joint_names.append(prim.GetName())
                 drive.GetStiffnessAttr().Set(1.0e9)
                 drive.GetDampingAttr().Set(1.0e6)
                 drive.GetMaxForceAttr().Set(1.0e9)
                 if drive.GetTargetVelocityAttr():
                     drive.GetTargetVelocityAttr().Set(0.0)
 
+    if robot is not None and locked_joint_names:
+        locked_indices = [dof_names.index(n) for n in locked_joint_names]
+        # 드라이브 목표 위치도 "지금 있는 자리"로 맞춰준다 (apply_action은 position
+        # target을 설정할 뿐 순간이동시키지 않으므로 set_joint_positions과 다르다).
+        robot.apply_action(
+            ArticulationAction(
+                joint_positions=joint_positions[locked_indices],
+                joint_indices=locked_indices,
+            )
+        )
+        _set_runtime_gains(robot, locked_joint_names, 1.0e9, 1.0e6, 1.0e9)
 
-def unlock_amr_base(stage, amr_root_path):
+
+def unlock_amr_base(stage, amr_root_path, robot=None):
     """AMR 이동 시작 전 바퀴 구동부를 풀어준다 (lock_amr_base의 반대) - 베이스를
-    set_world_pose로 직접 이동시키므로 바퀴 조인트가 그 이동에 저항하지 않도록 함."""
+    set_world_pose로 직접 이동시키므로 바퀴 조인트가 그 이동에 저항하지 않도록 함.
+
+    주의: 여기서는 일부러 _set_runtime_gains를 쓰지 않는다. 바퀴 강성을 런타임에서
+    진짜로 0까지 내리면, 바퀴가 몸체(그 위의 팔 포함)를 떠받치는 힘까지 사라져서
+    로봇이 바닥으로 무너지는 사고가 발생했다(실측 확인됨). AMR 이동은 set_world_pose로
+    좌표를 직접 덮어써서 하기 때문에 바퀴 드라이브를 실제로 풀어줄 필요가 애초에 없다 -
+    이 함수는 이전부터 stage 속성만 바꾸는(런타임에는 반영 안 되는) 안전한 무동작이었고,
+    그 상태를 그대로 유지한다. robot 파라미터는 lock_amr_base와 시그니처를 맞추기 위해
+    남겨두되 사용하지 않는다."""
     amr_prim = stage.GetPrimAtPath(amr_root_path).GetParent()
     if not amr_prim.IsValid():
         amr_prim = stage.GetPrimAtPath(amr_root_path)
@@ -372,21 +507,25 @@ def unlock_amr_base(stage, amr_root_path):
                 drive.GetMaxForceAttr().Set(0.0)
 
 
+def stiffen_gripper_grip(robot, joint_names=None):
+    """물체(버스바 등)를 옮기는 동안 그리퍼 관절 강성을 확 높인다 - AMR 이동 중
+    반동(순간이동으로 인한 물리적 충격)에도 그리퍼가 살짝 벌어지지 않도록 하기 위함.
+    GRIPPER_OPEN/CLOSE 자체(목표 위치)는 그대로 동작하고, 그 목표를 얼마나 세게
+    붙잡을지(강성/최대 힘)만 올라간다.
+
+    반드시 robot._articulation_view.set_gains/set_max_efforts(런타임 physics view)로
+    적용해야 한다 - 이전에는 UsdPhysics.DriveAPI를 stage에 직접 Set()했는데, 시뮬레이션이
+    이미 시작된 뒤에는 그 변경이 실제 물리 계산에 반영되지 않아 "강성을 올려도 계속
+    벌어지는" 문제가 있었다."""
+    if joint_names is None:
+        joint_names = GRIPPER_JOINTS
+    _set_runtime_gains(robot, joint_names, 1.0e9, 1.0e6, 1.0e9)
+
+
 def quat_wxyz_to_yaw(quat_wxyz):
     """월드 Z축 기준 yaw(rad)만 추출 (AMR은 평면 위를 움직이므로 roll/pitch는 무시)."""
     w, x, y, z = quat_wxyz
     return math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
-
-
-def glue_busbar_to_ee(robot, busbar_xform, rest_pick_pos, blend):
-    if busbar_xform is None or rest_pick_pos is None:
-        return
-    ee_pos, ee_quat = robot.end_effector.get_world_pose()
-    grasp_point_pos = np.asarray(ee_pos) - EE_OFFSET
-    target_pos = grasp_point_pos - np.array([0.0, 0.0, BUSBAR_GRASP_Z_LOCAL])
-
-    busbar_pos = rest_pick_pos + blend * (target_pos - rest_pick_pos)
-    busbar_xform.set_world_pose(position=busbar_pos, orientation=np.asarray(ee_quat))
 
 
 def yaw_rotated_quat(base_wxyz, delta_deg):
@@ -541,7 +680,7 @@ def main():
     grasp_timer = 0
     was_playing = False
     phase = "IDLE"
-    busbar_start_grasp_pos = None
+    busbar_grasped = False  # 그리퍼-버스바 FixedJoint가 걸려있는 상태인지
     descend_target_z = None
     target_mid_pos = None
     scan_hold_quat = None  # INIT_POSE 완료 시점의 실제 EE 자세 (SCAN_APPROACH가 그대로 유지)
@@ -595,6 +734,8 @@ def main():
         if playing and not was_playing:
             world.reset()
             enable_physics_recursively(stage, BUSBAR_ROOT_PATH)
+            detach_busbar_from_gripper(stage)
+            busbar_grasped = False
             if busbar_xform and init_busbar_pos is not None:
                 busbar_xform.set_world_pose(position=init_busbar_pos, orientation=init_busbar_quat)
             if nut1_xform and init_nut1_pos is not None:
@@ -650,7 +791,7 @@ def main():
                 amr_moving = True
                 amr_move_step = 0
                 if wheels_locked:
-                    unlock_amr_base(stage, NOVA_CARTER_ROOT)
+                    unlock_amr_base(stage, NOVA_CARTER_ROOT, robot=robot)
                     wheels_locked = False
                 print(f"\n>>> [AMR] 이동 목표 수신 (X={g_pos.x:.4f}, Y={g_pos.y:.4f}, "
                       f"Theta={g_theta:.4f}) -> 바퀴 잠금 해제, 이동 시작")
@@ -694,8 +835,7 @@ def main():
                 )
 
                 # 너트 1/2번은 AMR 섀시에 FixedJoint로 고정되어 있으므로(attach_nut_to_amr),
-                # AMR이 set_world_pose로 움직이면 물리 솔버가 알아서 같이 끌고 간다 -
-                # 예전처럼 매 틱 강체 변환을 수동으로 복사해 줄 필요가 없다.
+                # AMR이 set_world_pose로 움직이면 물리 솔버가 알아서 같이 끌고 간다.
 
                 amr_pos = np.array([new_x, new_y, amr_pos[2]])
                 amr_yaw = new_yaw
@@ -704,8 +844,6 @@ def main():
                     amr_moving = False
                     amr_target_xy_theta = None
                     print(f"\n[AMR] 목표 지점 도착 (X={new_x:.4f}, Y={new_y:.4f}) -> 바퀴 잠금")
-                    # set_world_pose로 순간이동시켜온 관성/잔류 속도가 남아있으면 바퀴를
-                    # 갑자기 강한 힘으로 고정(lock)하는 순간 충격으로 튈 수 있어 먼저 0으로 만든다.
                     try:
                         robot.set_linear_velocity(np.zeros(3))
                         robot.set_angular_velocity(np.zeros(3))
@@ -720,6 +858,15 @@ def main():
             sim_pose_msg.y = float(amr_pos[1])
             sim_pose_msg.theta = float(amr_yaw)
             isaac_node.pub_amr_sim_pose.publish(sim_pose_msg)
+
+            # 버스바를 실제 물리(마찰) 그립으로 물고 있는 동안은 phase="IDLE" 구간
+            # (예: PICK_BUSBAR 완료 후 AMR이 배터리 스테이션으로 이동하는 중)에도
+            # 계속 CLOSE 명령을 넣어줘야 한다 - 관절 액션이 안 들어가면 드라이브가
+            # 느슨해져 그 사이 손아귀 힘이 빠질 수 있다. 위치는 더 이상 스크립트로
+            # 덮어쓰지 않는다 - 그리퍼(팔+AMR과 같이 강체로 움직이는 관절 체인)가
+            # 실제로 물고 있는 물리 그립이 알아서 따라간다.
+            if busbar_grasped:
+                robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_CLOSE))
 
         # 2. BehaviorNode / ArmNode 명령 분기 처리
         if playing and isaac_node.requested_task:
@@ -832,24 +979,28 @@ def main():
             # [STEP 0-A] 초기 관절 자세 정렬
             if phase == "INIT_POSE":
                 publish_progress("INIT_ALIGN", 10.0)
-                
+
                 arm_joint_names = [
-                    "joint_1", "joint_2", "joint_3", 
+                    "joint_1", "joint_2", "joint_3",
                     "joint_4", "joint_5", "joint_6"
                 ]
                 arm_dof_indices = [robot.get_dof_index(name) for name in arm_joint_names]
 
+                all_joints = robot.get_joint_positions()
+                cur_arm_joints = all_joints[arm_dof_indices]
+
+                max_step = ARM_INIT_MAX_JOINT_SPEED * PHYSICS_DT
+                delta = TARGET_INIT_JOINTS - cur_arm_joints
+                ramped_target = cur_arm_joints + np.clip(delta, -max_step, max_step)
+
                 robot.apply_action(
                     ArticulationAction(
-                        joint_positions=TARGET_INIT_JOINTS,
+                        joint_positions=ramped_target,
                         joint_indices=arm_dof_indices
                     )
                 )
                 robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_OPEN))
 
-                all_joints = robot.get_joint_positions()
-                cur_arm_joints = all_joints[arm_dof_indices]
-                
                 joint_err = np.linalg.norm(cur_arm_joints - TARGET_INIT_JOINTS)
 
                 if joint_err < JOINT_TOLERANCE:
@@ -974,16 +1125,14 @@ def main():
                     phase = "BUSBAR_GRASP"
                     grasp_timer = 0
 
-            # [4단계] Kinematic Pose-Glue 파지
+            # [4단계] 물리 파지 + FixedJoint 고정 - 버스바의 물리(중력/충돌)는 계속
+            # 켜둔 채 그리퍼로 실제로 닫아서 무는데, AMR이 set_world_pose로 매 틱
+            # 순간이동하는(최고속에서 틱당 최대 5mm) 반면 버스바 두께는 3mm뿐이라
+            # 마찰만으로는 그 이동을 따라가지 못하고 미끄러져 빠진다(실측 확인됨).
+            # 그래서 손가락이 다 닫히고 살짝 안정화된 뒤 attach_busbar_to_gripper로
+            # 그리퍼(link_6)와 버스바 사이에 실제 FixedJoint를 만들어 완전히 고정한다.
             elif phase == "BUSBAR_GRASP":
                 publish_progress("GRASPING", 75.0)
-                if grasp_timer == 0:
-                    disable_physics_recursively(stage, BUSBAR_ROOT_PATH)
-                    if busbar_xform is not None:
-                        real_pos, _ = busbar_xform.get_world_pose()
-                        busbar_start_grasp_pos = np.array(real_pos)
-                    else:
-                        busbar_start_grasp_pos = BUSBAR_PICK_POS
 
                 actions = arm_controller.forward(
                     target_end_effector_position=BUSBAR_PICK_POS,
@@ -996,12 +1145,22 @@ def main():
                 grip_target = ramp_frac * GRIPPER_CLOSE
                 robot.gripper.apply_action(ArticulationAction(joint_positions=grip_target))
 
-                glue_busbar_to_ee(robot, busbar_xform, busbar_start_grasp_pos, blend=ramp_frac)
+                if grasp_timer == GRIP_CLOSE_RAMP_STEPS:
+                    # 옮기는 동안에도 그리퍼가 계속 꽉 닫힌 것처럼 보이게 강성을 올려둔다
+                    # (FixedJoint가 실제 고정을 담당하므로 필수는 아니지만 외관상 유지).
+                    stiffen_gripper_grip(robot)
 
-                if grasp_timer >= GRIP_CLOSE_RAMP_STEPS:
-                    print("[OK] 3. 버스바 파지 완료 -> 4. 안전 고도 상승")
-                    phase = "BUSBAR_LIFT"
-                    step_count = 0
+                if grasp_timer >= GRIP_CLOSE_RAMP_STEPS + GRIP_SETTLE_STEPS:
+                    joint = attach_busbar_to_gripper(stage, ee_path, robot, busbar_xform)
+                    if joint is None:
+                        print(f"\n[ERROR] 버스바 파지 실패 (prim 경로 확인 필요: {BUSBAR_POLYSHAPE_PATH})")
+                        publish_status("FAILURE:BUSBAR_ATTACH_FAILED")
+                        phase = "IDLE"
+                    else:
+                        busbar_grasped = True
+                        print("[OK] 3. 버스바 물리 파지 + FixedJoint 고정 완료 -> 4. 안전 고도 상승")
+                        phase = "BUSBAR_LIFT"
+                        step_count = 0
 
             # [5단계] 안전 고도 들어올리기 (Z = 0.6m)
             elif phase == "BUSBAR_LIFT":
@@ -1013,7 +1172,6 @@ def main():
                 robot.apply_action(actions)
                 robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_CLOSE))
 
-                glue_busbar_to_ee(robot, busbar_xform, busbar_start_grasp_pos, blend=1.0)
 
                 cur_pos = world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation()
                 current_err = math.dist(cur_pos, tuple(BUSBAR_LIFT_MOVE_POS))
@@ -1033,7 +1191,6 @@ def main():
                 )
                 robot.apply_action(actions)
                 robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_CLOSE))
-                glue_busbar_to_ee(robot, busbar_xform, busbar_start_grasp_pos, blend=1.0)
 
                 cur_pos = world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation()
                 current_err = math.dist(cur_pos, tuple(BATTERY_CENTER_POS))
@@ -1075,7 +1232,6 @@ def main():
                 robot.apply_action(actions)
 
                 robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_CLOSE))
-                glue_busbar_to_ee(robot, busbar_xform, busbar_start_grasp_pos, blend=1.0)
 
                 if isaac_node.alignment_success:
                     print("\n\n★ [FINE_ALIGNMENT SUCCESS] 미세 오차 보정 성공 및 정렬 완료!")
@@ -1097,15 +1253,14 @@ def main():
                 robot.apply_action(actions)
                 robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_CLOSE))
 
-                glue_busbar_to_ee(robot, busbar_xform, busbar_start_grasp_pos, blend=1.0)
-
                 cur_pos = world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation()
                 dist_err = math.dist(cur_pos, tuple(target_mid_pos))
 
                 if cur_pos[2] <= BUSBAR_RELEASE_Z or dist_err < INSERT_TOLERANCE_STRICT:
-                    if busbar_xform is not None:
-                        busbar_xform.set_world_pose(position=target_mid_pos, orientation=BUSBAR_REST_ORIENTATION)
-                    
+                    # 실제 물리 그립 상태라 여기서 busbar 위치를 강제로 순간이동(snap)
+                    # 시키면 안 된다 - 그리퍼가 여전히 물고 있는 채로 물체만 텔레포트하면
+                    # 다음 physics step에서 손가락과 겹침이 발생해 튕겨나갈 수 있다.
+                    # 착좌 정확도는 이제 IK가 내려간 실제 위치(target_mid_pos)에 의존한다.
                     print(f"\n[OK] 버스바 안착 체결 완료 (EE Z: {cur_pos[2]:.4f}m)!")
 
                     phase = "BUSBAR_RELEASE_AND_RETRACT"
@@ -1115,6 +1270,12 @@ def main():
             elif phase == "BUSBAR_RELEASE_AND_RETRACT":
                 publish_progress("BUSBAR_RETRACT", 95.0)
 
+                if busbar_grasped:
+                    # 그리퍼를 열기 전에 FixedJoint부터 풀어야 한다 - 안 그러면 조인트가
+                    # 버스바를 계속 붙잡고 있어서 그리퍼가 열려도 안 떨어진다.
+                    detach_busbar_from_gripper(stage)
+                    busbar_grasped = False
+
                 retract_pos = np.array([target_mid_pos[0], target_mid_pos[1], BATTERY_CENTER_Z])
                 actions = arm_controller.forward(
                     target_end_effector_position=retract_pos,
@@ -1122,8 +1283,6 @@ def main():
                 )
                 robot.apply_action(actions)
                 robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_OPEN))
-
-                glue_busbar_to_ee(robot, busbar_xform, busbar_start_grasp_pos, blend=0.0)
 
                 cur_pos = world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation()
                 current_err = math.dist(cur_pos, tuple(retract_pos))
@@ -1473,21 +1632,26 @@ def main():
                 publish_progress("RETURNING_HOME_JOINTS", 99.0)
 
                 arm_joint_names = [
-                    "joint_1", "joint_2", "joint_3", 
+                    "joint_1", "joint_2", "joint_3",
                     "joint_4", "joint_5", "joint_6"
                 ]
                 arm_dof_indices = [robot.get_dof_index(name) for name in arm_joint_names]
 
+                all_joints = robot.get_joint_positions()
+                cur_arm_joints = all_joints[arm_dof_indices]
+
+                max_step = ARM_INIT_MAX_JOINT_SPEED * PHYSICS_DT
+                delta = TARGET_INIT_JOINTS - cur_arm_joints
+                ramped_target = cur_arm_joints + np.clip(delta, -max_step, max_step)
+
                 robot.apply_action(
                     ArticulationAction(
-                        joint_positions=TARGET_INIT_JOINTS,
+                        joint_positions=ramped_target,
                         joint_indices=arm_dof_indices
                     )
                 )
                 robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_OPEN))
 
-                all_joints = robot.get_joint_positions()
-                cur_arm_joints = all_joints[arm_dof_indices]
                 joint_err = np.linalg.norm(cur_arm_joints - TARGET_INIT_JOINTS)
 
                 if joint_err < JOINT_TOLERANCE or step_count > 120:
