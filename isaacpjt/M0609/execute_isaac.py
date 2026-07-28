@@ -57,6 +57,14 @@ from std_msgs.msg import String, Float32, Empty
 _THIS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(_THIS_DIR / "rmpflow"))
 from m0609_rmpflow_controller import RMPFlowController
+from nut_insertion_controller import (
+    ForceGuidedNutInsertion,
+    InsertionConfig,
+    InsertionState,
+    NutSensorFilter,
+    RawNutSensors,
+    evaluate_screw_state,
+)
 
 # ══════════════════════════════════════════════════════════════════════════
 #  [A] 설정 및 파라미터
@@ -211,6 +219,26 @@ TORQUE_THRESHOLD     = 45.0       # 6번 조인트 반력 임계값 (Nm)
 STUCK_Z_DELTA_THRESH = 0.0001     # Z축 하강 멈춤 판정 기준 (0.1mm)
 STUCK_STEP_LIMIT     = 12         # Z축 변화 없이 토크 지속되는 Step 수
 TCP_FORCE_CHECK_Z    = 0.378      # TCP(EE) 높이가 이 값 이하일 때만 힘/토크 감지 활성화
+
+# 힘/토크 기반 초기 삽입. get_measured_joint_forces()의 joint_6 child-frame
+# [Fx,Fy,Fz,Tx,Ty,Tz] 반력을 비접촉 상태에서 영점 보정해 사용한다.
+NUT_SENSOR_TARE_STEPS = 30
+NUT_SENSOR_FILTER_ALPHA = 0.2
+NUT_GRIP_SLIP_RATIO = 0.25
+NUT_GRIP_SLIP_HOLD_STEPS = 15
+NUT_SCREW_FORCE_CORRECTION_LIMIT_M = 0.001
+NUT_SCREW_FORCE_COMPLIANCE_M_PER_N = 0.00002
+NUT_CROSS_THREAD_HOLD_STEPS = 8
+NUT_CROSS_THREAD_UNWIND_DEG = 60.0
+NUT_CROSS_THREAD_RETRACT_M = 0.03
+NUT_INSERT_CONFIG = InsertionConfig(
+    contact_force_n=6.0,
+    target_axial_force_n=10.0,
+    max_axial_force_n=55.0,
+    max_lateral_force_n=20.0,
+    cross_thread_torque_nm=25.0,
+    max_attempts=3,
+)
 
 # 위치 저장용 변수
 HOME_EE_POS          = None
@@ -749,6 +777,51 @@ def resolve_station_from_amr_xy(x, y, tolerance=0.3):
     return None
 
 
+def read_nut_sensors(robot, wrist_dof_index, wrist_force_joint_index,
+                     gripper_dof_indices):
+    """이름으로 확정한 joint_6/그리퍼 센서만 읽는다.
+
+    get_measured_joint_forces의 0번 row는 articulation root이므로 revolute DOF의
+    반력 row는 DOF index + 1이다. 반환 wrench는 joint_6 child frame 기준이다.
+    """
+    try:
+        efforts = robot.get_measured_joint_efforts()
+        forces = robot.get_measured_joint_forces(
+            [int(wrist_force_joint_index)]
+        )
+        tcp_pos, _ = robot.end_effector.get_world_pose()
+        effort_values = np.asarray(efforts, dtype=float).reshape(-1)
+        force_values = np.asarray(forces, dtype=float).reshape(-1, 6)
+        wrist_effort = float(effort_values[int(wrist_dof_index)])
+        grip_efforts = [
+            abs(float(effort_values[int(index)]))
+            for index in gripper_dof_indices
+        ]
+        gripper_effort = (
+            float(sum(grip_efforts) / len(grip_efforts))
+            if grip_efforts else 0.0
+        )
+        wrench = tuple(float(value) for value in force_values[0])
+        values = (*wrench, wrist_effort, gripper_effort, float(tcp_pos[2]))
+        valid = all(math.isfinite(value) for value in values)
+        return RawNutSensors(
+            wrench=wrench,
+            wrist_effort=wrist_effort,
+            gripper_effort=gripper_effort,
+            tcp_z=float(tcp_pos[2]),
+            valid=valid,
+        )
+    except (IndexError, TypeError, ValueError, RuntimeError) as exc:
+        print(f"[NUT SENSOR][WARN] joint_6 반력 읽기 실패: {exc}")
+        return RawNutSensors(
+            wrench=(0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+            wrist_effort=0.0,
+            gripper_effort=0.0,
+            tcp_z=0.0,
+            valid=False,
+        )
+
+
 def yaw_rotated_quat(base_wxyz, delta_deg):
     """base_wxyz 오리엔테이션을 월드 Z축 기준으로 delta_deg 만큼 추가 회전시킨 쿼터니언 반환 (Screwing 회전용)"""
     base_q = Gf.Quatd(float(base_wxyz[0]), Gf.Vec3d(float(base_wxyz[1]), float(base_wxyz[2]), float(base_wxyz[3])))
@@ -880,6 +953,19 @@ def main():
     for _ in range(30):
         world.step(render=True)
 
+    # 통합 articulation의 마지막 DOF를 토크로 간주하지 않는다. 실제 이름으로
+    # joint_6 및 그리퍼 DOF를 확정하고, joint 반력 배열의 root offset(+1)을 쓴다.
+    wrist_dof_index = int(robot.get_dof_index("joint_6"))
+    gripper_dof_indices = [
+        int(robot.get_dof_index(name)) for name in GRIPPER_JOINTS
+    ]
+    wrist_force_joint_index = wrist_dof_index + 1
+    print(
+        "[NUT SENSOR] "
+        f"joint_6 DOF={wrist_dof_index}, force-row={wrist_force_joint_index}, "
+        f"gripper DOFs={gripper_dof_indices}"
+    )
+
     # battery4_main의 검증된 너트 운반 방식: PICK 전에는 물리를 끄고 AMR 기준 로컬
     # 오프셋으로 매 프레임 포즈를 갱신한다. PICK 명령을 받은 너트만 이 glue에서 풀고
     # 물리를 켜서 그리퍼의 실제 접촉/마찰로 집는다.
@@ -965,6 +1051,17 @@ def main():
     screw_unwind_deg    = 0.0
     prev_ee_z           = 0.0
     stuck_counter       = 0
+    nut_sensor_filter   = NutSensorFilter(NUT_SENSOR_FILTER_ALPHA)
+    nut_insert_controller = ForceGuidedNutInsertion(NUT_INSERT_CONFIG)
+    nut_insert_origin_pos = None
+    nut_insert_origin_quat = None
+    nut_insert_last_state = None
+    nut_grip_reference = 0.0
+    nut_grip_slip_counter = 0
+    nut_sensor_invalid_steps = 0
+    screw_cross_counter = 0
+    screw_cross_start_pos = None
+    screw_cross_start_quat = None
 
     # ── AMR 이동 상태 (amr_node <-> /amr/goal_pose, /amr/sim_pose) ──
     amr_moving = False
@@ -1044,6 +1141,16 @@ def main():
             screw_pass_idx = 0
             screw_pass_theta = 0.0
             stuck_counter = 0
+            nut_sensor_filter.reset()
+            nut_insert_origin_pos = None
+            nut_insert_origin_quat = None
+            nut_insert_last_state = None
+            nut_grip_reference = 0.0
+            nut_grip_slip_counter = 0
+            nut_sensor_invalid_steps = 0
+            screw_cross_counter = 0
+            screw_cross_start_pos = None
+            screw_cross_start_quat = None
 
             amr_moving = False
             amr_target_xy_theta = None
@@ -1359,6 +1466,14 @@ def main():
                 bolt_world_xy = STATION_BOLT_WORLD_POS.get(current_station, STATION_BOLT_WORLD_POS[3])[nut_slot]
                 bolt_target_pos = np.array([bolt_world_xy[0], bolt_world_xy[1], 0.0])
                 bolt_touch_pos = np.array([bolt_target_pos[0], bolt_target_pos[1], 0.3697])
+                nut_sensor_filter.reset()
+                nut_insert_origin_pos = None
+                nut_insert_origin_quat = None
+                nut_insert_last_state = None
+                nut_grip_reference = 0.0
+                nut_grip_slip_counter = 0
+                nut_sensor_invalid_steps = 0
+                screw_cross_counter = 0
                 phase = "MOVE_TO_BOLT_NUT"
                 step_count = 0
                 print(f"\n>>> [{task}] 너트 {nut_index}번(스테이션{current_station} 슬롯{nut_slot}) -> 볼트 {nut_slot}번 체결 시작 "
@@ -1899,19 +2014,130 @@ def main():
 
                 cur_pos = world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation()
 
+                # 볼트와 충분히 떨어진 하강 초반의 joint_6 반력을 영점으로 수집한다.
+                # 정지 중 중력/자세 하중을 빼야 접촉으로 증가한 힘만 볼 수 있다.
+                if nut_sensor_filter.tare_count < NUT_SENSOR_TARE_STEPS:
+                    raw_sensor = read_nut_sensors(
+                        robot,
+                        wrist_dof_index,
+                        wrist_force_joint_index,
+                        gripper_dof_indices,
+                    )
+                    nut_sensor_filter.add_tare_sample(raw_sensor)
+
                 if abs(cur_pos[2] - bolt_touch_pos[2]) < PICK_TOLERANCE_LOOSE_VAL or descend_target_z <= bolt_touch_pos[2]:
+                    if not nut_sensor_filter.finish_tare():
+                        print("[ERROR] joint_6 힘/토크 센서 영점 보정 실패")
+                        publish_status("FAILURE:NUT_SENSOR_TARE")
+                        phase = "IDLE"
+                        continue
+                    ee_now_pos, ee_now_quat = robot.end_effector.get_world_pose()
+                    nut_insert_origin_pos = np.asarray(ee_now_pos, dtype=float).copy()
+                    nut_insert_origin_quat = np.asarray(ee_now_quat, dtype=float).copy()
+                    nut_insert_controller.reset(float(ee_now_pos[2]))
+                    nut_insert_last_state = nut_insert_controller.state
+
+                    raw_sensor = read_nut_sensors(
+                        robot,
+                        wrist_dof_index,
+                        wrist_force_joint_index,
+                        gripper_dof_indices,
+                    )
+                    nut_grip_reference = abs(raw_sensor.gripper_effort)
+                    nut_grip_slip_counter = 0
+                    nut_sensor_invalid_steps = 0
+
+                    nut_label = resolve_nut_assets(nut_index, nut1_xform, nut2_xform)[1]
+                    print(
+                        f"[OK] 볼트 {nut_index}번 기하학적 접근 완료 ({nut_label}) -> "
+                        "힘 접촉/나선 중심/나사산 시작점 탐색"
+                    )
+                    phase = "NUT_FORCE_INSERT"
+                    step_count = 0
+
+            # [16.5단계] 축력 접촉 → 나선 중심 탐색 → 역회전 → 저속 정회전.
+            # 나사산이 실제로 물려 TCP Z 진행이 생길 때만 본 체결로 넘어간다.
+            elif phase == "NUT_FORCE_INSERT":
+                publish_progress("NUT_FORCE_INSERT", 55.0)
+                raw_sensor = read_nut_sensors(
+                    robot,
+                    wrist_dof_index,
+                    wrist_force_joint_index,
+                    gripper_dof_indices,
+                )
+                sensor = nut_sensor_filter.update(raw_sensor)
+                insert_cmd = nut_insert_controller.update(sensor, PHYSICS_DT)
+
+                target_pos = nut_insert_origin_pos + np.array([
+                    insert_cmd.x_offset,
+                    insert_cmd.y_offset,
+                    insert_cmd.z_offset,
+                ])
+                target_quat = yaw_rotated_quat(
+                    nut_insert_origin_quat, insert_cmd.rotation_deg
+                )
+                actions = arm_controller.forward(
+                    target_end_effector_position=target_pos,
+                    target_end_effector_orientation=target_quat,
+                )
+                robot.apply_action(actions)
+                robot.gripper.apply_action(
+                    ArticulationAction(joint_positions=GRIPPER_CLOSE_NUT)
+                )
+
+                if (
+                    nut_grip_reference > 1.0
+                    and sensor.gripper_force
+                    < nut_grip_reference * NUT_GRIP_SLIP_RATIO
+                ):
+                    nut_grip_slip_counter += 1
+                else:
+                    nut_grip_slip_counter = max(0, nut_grip_slip_counter - 1)
+
+                if insert_cmd.state != nut_insert_last_state:
+                    print(
+                        f"[NUT INSERT] {nut_insert_last_state} -> "
+                        f"{insert_cmd.state.value}: {insert_cmd.message} | "
+                        f"Fz={sensor.axial_force:.1f}N, "
+                        f"Fxy={sensor.lateral_force:.1f}N, "
+                        f"Tz={sensor.torque:.1f}Nm"
+                    )
+                    nut_insert_last_state = insert_cmd.state
+
+                if step_count % 20 == 0:
+                    print(
+                        f"  [NUT{nut_index} INSERT] {insert_cmd.state.value} | "
+                        f"Fz={sensor.axial_force:.1f}N | "
+                        f"Fxy={sensor.lateral_force:.1f}N | "
+                        f"T={sensor.torque:.1f}Nm | "
+                        f"Grip={sensor.gripper_force:.1f} | "
+                        f"offset=({insert_cmd.x_offset*1000:.2f},"
+                        f"{insert_cmd.y_offset*1000:.2f},"
+                        f"{insert_cmd.z_offset*1000:.2f})mm"
+                    )
+
+                if nut_grip_slip_counter >= NUT_GRIP_SLIP_HOLD_STEPS:
+                    print("[ERROR] 그리퍼 effort 급감: 너트 미끄러짐 감지")
+                    publish_status("FAILURE:NUT_GRIP_SLIP")
+                    phase = "IDLE"
+                elif insert_cmd.failed:
+                    print(f"[ERROR] 힘 기반 너트 삽입 실패: {insert_cmd.message}")
+                    publish_status("FAILURE:NUT_FORCE_INSERT")
+                    phase = "IDLE"
+                elif insert_cmd.engaged:
                     ee_now_pos, ee_now_quat = robot.end_effector.get_world_pose()
                     screw_start_quat = np.asarray(ee_now_quat).copy()
                     screw_seat_ee_pos = np.asarray(ee_now_pos).copy()
-
                     screw_sub = "rotate"
                     screw_pass_idx = 0
                     screw_pass_theta = 0.0
                     stuck_counter = 0
-                    prev_ee_z = ee_now_pos[2]
-
-                    nut_label = resolve_nut_assets(nut_index, nut1_xform, nut2_xform)[1]
-                    print(f"[OK] 볼트 {nut_index}번 착좌 완료 ({nut_label})! -> Screwing 시작")
+                    screw_cross_counter = 0
+                    prev_ee_z = float(ee_now_pos[2])
+                    print(
+                        f"[OK] 너트 {nut_index}번 나사산 정상 물림 확인 -> "
+                        "힘 보정 Screwing 시작"
+                    )
                     phase = "NUT_SCREW"
                     step_count = 0
 
@@ -1930,35 +2156,137 @@ def main():
                     else:
                         regrasp_extra = 0.0
 
+                    raw_sensor = read_nut_sensors(
+                        robot,
+                        wrist_dof_index,
+                        wrist_force_joint_index,
+                        gripper_dof_indices,
+                    )
+                    sensor = nut_sensor_filter.update(raw_sensor)
+                    if sensor.valid:
+                        nut_sensor_invalid_steps = 0
+                        force_correction = max(
+                            -NUT_SCREW_FORCE_CORRECTION_LIMIT_M,
+                            min(
+                                NUT_SCREW_FORCE_CORRECTION_LIMIT_M,
+                                (
+                                    sensor.axial_force
+                                    - NUT_INSERT_CONFIG.target_axial_force_n
+                                ) * NUT_SCREW_FORCE_COMPLIANCE_M_PER_N,
+                            ),
+                        )
+                    else:
+                        nut_sensor_invalid_steps += 1
+                        force_correction = 0.0
+
+                    # 피치 기반 Z feed-forward에 축력 보정을 더한다. 힘이 높으면
+                    # 목표를 올리고, 낮으면 최대 1mm 범위에서만 더 내려 누른다.
                     target_pos = screw_seat_ee_pos.copy()
-                    target_pos[2] = screw_seat_ee_pos[2] - depth_m + regrasp_extra
+                    target_pos[2] = (
+                        screw_seat_ee_pos[2]
+                        - depth_m
+                        + regrasp_extra
+                        + force_correction
+                    )
                     target_quat = yaw_rotated_quat(screw_start_quat, screw_pass_theta)
 
                     actions = arm_controller.forward(target_end_effector_position=target_pos, target_end_effector_orientation=target_quat)
                     robot.apply_action(actions)
                     robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_CLOSE_NUT))
 
-                    # 실시간 토크 및 Stuck 감지
+                    # 실제 joint_6 반력과 TCP 진행량으로 사선 물림/완착을 구분한다.
                     cur_ee_pos, _ = robot.end_effector.get_world_pose()
                     z_movement = abs(prev_ee_z - cur_ee_pos[2])
                     prev_ee_z = cur_ee_pos[2]
+                    curr_torque = sensor.torque if sensor.valid else 0.0
+                    actual_advance = max(
+                        0.0, float(screw_seat_ee_pos[2] - cur_ee_pos[2])
+                    )
+                    evaluation = evaluate_screw_state(
+                        planned_depth_m=depth_m,
+                        actual_advance_m=actual_advance,
+                        torque_nm=curr_torque,
+                        lateral_force_n=(
+                            sensor.lateral_force
+                            if sensor.valid else float("inf")
+                        ),
+                        z_movement_m=z_movement,
+                        engage_length_m=ENGAGE_LEN,
+                        seated_torque_nm=TORQUE_THRESHOLD,
+                        cross_thread_torque_nm=(
+                            NUT_INSERT_CONFIG.cross_thread_torque_nm
+                        ),
+                        max_lateral_force_n=(
+                            NUT_INSERT_CONFIG.max_lateral_force_n
+                        ),
+                        stall_z_movement_m=STUCK_Z_DELTA_THRESH,
+                    )
 
-                    joint_efforts = robot.get_measured_joint_efforts()
-                    curr_torque = abs(joint_efforts[-1]) if joint_efforts is not None and len(joint_efforts) > 0 else 0.0
-
-                    if cur_ee_pos[2] <= TCP_FORCE_CHECK_Z:
-                        if z_movement < STUCK_Z_DELTA_THRESH and depth_m > 0.003:
-                            stuck_counter += 1
-                        else:
-                            stuck_counter = max(0, stuck_counter - 1)
-                        is_seated_by_torque = (curr_torque > TORQUE_THRESHOLD) or (stuck_counter >= STUCK_STEP_LIMIT)
+                    if evaluation.cross_thread:
+                        screw_cross_counter += 1
                     else:
-                        is_seated_by_torque = False
+                        screw_cross_counter = max(0, screw_cross_counter - 1)
+                    if evaluation.seated:
+                        stuck_counter += 1
+                    else:
+                        stuck_counter = max(0, stuck_counter - 1)
+                    is_seated_by_torque = stuck_counter >= STUCK_STEP_LIMIT
+
+                    if (
+                        nut_grip_reference > 1.0
+                        and sensor.valid
+                        and sensor.gripper_force
+                        < nut_grip_reference * NUT_GRIP_SLIP_RATIO
+                    ):
+                        nut_grip_slip_counter += 1
+                    else:
+                        nut_grip_slip_counter = max(
+                            0, nut_grip_slip_counter - 1
+                        )
 
                     if step_count % 20 == 0:
-                        print(f"  [NUT{nut_index} SCREW] Pass {screw_pass_idx+1}/{1+REGRASP_CYCLES} | Theta: {screw_pass_theta:.1f}° | 깊이: {depth_m*1000:.2f}mm / 목표 {ENGAGE_LEN*1000:.1f}mm | TCP Z: {cur_ee_pos[2]:.4f}m | 토크: {curr_torque:.1f}Nm")
+                        print(
+                            f"  [NUT{nut_index} SCREW] Pass "
+                            f"{screw_pass_idx+1}/{1+REGRASP_CYCLES} | "
+                            f"Theta={screw_pass_theta:.1f}° | "
+                            f"계획/실제 깊이={depth_m*1000:.2f}/"
+                            f"{actual_advance*1000:.2f}mm | "
+                            f"Fz={sensor.axial_force:.1f}N | "
+                            f"Fxy={sensor.lateral_force:.1f}N | "
+                            f"T={curr_torque:.1f}Nm | "
+                            f"Grip={sensor.gripper_force:.1f}"
+                        )
 
-                    if pass_done or is_seated_by_torque:
+                    if nut_sensor_invalid_steps >= 10:
+                        print("[ERROR] 체결 중 joint_6 센서가 연속 누락되었습니다")
+                        publish_status("FAILURE:NUT_SENSOR_LOST")
+                        phase = "IDLE"
+                    elif nut_grip_slip_counter >= NUT_GRIP_SLIP_HOLD_STEPS:
+                        print("[ERROR] 체결 중 너트 미끄러짐이 감지되었습니다")
+                        publish_status("FAILURE:NUT_GRIP_SLIP")
+                        phase = "IDLE"
+                    elif screw_cross_counter >= NUT_CROSS_THREAD_HOLD_STEPS:
+                        screw_cross_start_pos = np.asarray(
+                            cur_ee_pos, dtype=float
+                        ).copy()
+                        _, current_quat = robot.end_effector.get_world_pose()
+                        screw_cross_start_quat = np.asarray(
+                            current_quat, dtype=float
+                        ).copy()
+                        screw_unwind_deg = 0.0
+                        screw_release_step = 0
+                        screw_sub = "cross_unwind"
+                        print(
+                            f"[NUT{nut_index} CROSS-THREAD] 얕은 깊이에서 "
+                            f"토크 {curr_torque:.1f}Nm 상승 + Z 진행 부족 -> "
+                            "60° 역회전 후 안전 상승"
+                        )
+
+                    if (
+                        phase == "NUT_SCREW"
+                        and screw_sub == "rotate"
+                        and (pass_done or is_seated_by_torque)
+                    ):
                         if is_seated_by_torque:
                             print(f"  [체결 감지] 너트 {nut_index}번 완착(Seating) 감지! (TCP Z: {cur_ee_pos[2]:.4f}m, 토크: {curr_torque:.1f}Nm) -> Screwing 조기 종료 및 그리퍼 해제")
 
@@ -1971,6 +2299,62 @@ def main():
                             screw_pass_end_pos = target_pos.copy()
                             screw_sub = "release"
                             screw_release_step = 0
+
+                elif screw_sub == "cross_unwind":
+                    screw_unwind_deg = min(
+                        screw_unwind_deg
+                        + SCREW_OMEGA_DEG_S * 0.5 * PHYSICS_DT,
+                        NUT_CROSS_THREAD_UNWIND_DEG,
+                    )
+                    target_quat = yaw_rotated_quat(
+                        screw_cross_start_quat, -screw_unwind_deg
+                    )
+                    actions = arm_controller.forward(
+                        target_end_effector_position=screw_cross_start_pos,
+                        target_end_effector_orientation=target_quat,
+                    )
+                    robot.apply_action(actions)
+                    robot.gripper.apply_action(
+                        ArticulationAction(joint_positions=GRIPPER_CLOSE_NUT)
+                    )
+                    if screw_unwind_deg >= NUT_CROSS_THREAD_UNWIND_DEG:
+                        screw_sub = "cross_lift"
+                        screw_release_step = 0
+
+                elif screw_sub == "cross_lift":
+                    cross_lift_target = screw_cross_start_pos + np.array([
+                        0.0, 0.0, NUT_CROSS_THREAD_RETRACT_M
+                    ])
+                    target_quat = yaw_rotated_quat(
+                        screw_cross_start_quat,
+                        -NUT_CROSS_THREAD_UNWIND_DEG,
+                    )
+                    actions = arm_controller.forward(
+                        target_end_effector_position=cross_lift_target,
+                        target_end_effector_orientation=target_quat,
+                    )
+                    robot.apply_action(actions)
+                    robot.gripper.apply_action(
+                        ArticulationAction(joint_positions=GRIPPER_CLOSE_NUT)
+                    )
+                    cur_pos = np.asarray(
+                        world_xf(
+                            stage, f"{M0609_PATH}/{EE_LINK_NAME}"
+                        ).ExtractTranslation(),
+                        dtype=float,
+                    )
+                    screw_release_step += 1
+                    if (
+                        math.dist(cur_pos, tuple(cross_lift_target))
+                        < PICK_TOLERANCE_STRICT
+                        or screw_release_step > 180
+                    ):
+                        print(
+                            f"[SAFE] 너트 {nut_index}번 사선 물림 해제 및 "
+                            f"{NUT_CROSS_THREAD_RETRACT_M*1000:.0f}mm 상승 완료"
+                        )
+                        publish_status("FAILURE:NUT_CROSS_THREAD")
+                        phase = "IDLE"
 
                 elif screw_sub == "release":
                     screw_release_step += 1
