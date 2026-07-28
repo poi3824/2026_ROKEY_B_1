@@ -19,6 +19,9 @@ class CameraPerceptionConfig:
     optical_frame: str
     keep_global_outputs: tuple[str, ...] = ()
     use_bolt_roi: bool = False
+    prefer_busbar_depth: bool = False
+    inference_image_size: int | None = None
+    bolt_roi_bounds: tuple[int, int, int, int] = (150, 490, 180, 450)
 
 
 CAMERA_CONFIGS = (
@@ -39,6 +42,7 @@ CAMERA_CONFIGS = (
         camera_info_topic='/busbar_cam/camera_info',
         optical_frame='busbar_cam_optical_frame',
         keep_global_outputs=('/vision/busbar_grasp',),
+        prefer_busbar_depth=True,
     ),
     CameraPerceptionConfig(
         namespace='bolt_cam',
@@ -48,6 +52,11 @@ CAMERA_CONFIGS = (
         camera_info_topic='/bolt_cam/camera_info',
         optical_frame='bolt_cam_optical_frame',
         use_bolt_roi=True,
+        inference_image_size=640,
+        # Keep a central ROI while including station bolt_1 at x~=531 when
+        # Camera_bolt is centered over bolt_2.  The lower neighbouring pack at
+        # y~=512 remains excluded.
+        bolt_roi_bounds=(80, 560, 150, 450),
     ),
 )
 

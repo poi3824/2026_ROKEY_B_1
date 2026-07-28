@@ -103,6 +103,17 @@ def test_launch_wires_three_isolated_perception_instances(monkeypatch):
         assert parameters['max_input_receipt_age_sec'] == 1.0
         assert parameters['require_unique_camera_source'] is True
         assert parameters['required_target_frames'] == 3
+        assert parameters['inference_image_size'] == (
+            config.inference_image_size
+            if config.inference_image_size is not None
+            else 0
+        )
+        assert (
+            parameters['bolt_roi_x_min'],
+            parameters['bolt_roi_x_max'],
+            parameters['bolt_roi_y_min'],
+            parameters['bolt_roi_y_max'],
+        ) == config.bolt_roi_bounds
 
     remappings = [
         dict(node.kwargs['remappings'])

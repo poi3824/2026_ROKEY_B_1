@@ -73,6 +73,22 @@ _THIS_DIR = Path(__file__).resolve().parent
 _REPO_ROOT = _THIS_DIR.parents[1]
 sys.path.insert(0, str(_THIS_DIR / "rmpflow"))
 from m0609_rmpflow_controller import RMPFlowController
+from fine_alignment_policy import (
+    BoundedPlanarCommandLead,
+    FineAlignmentStepGate,
+    planar_command_response,
+    planar_yaw_delta,
+)
+from nut_motion_policy import (
+    consecutive_pose_settle,
+    exact_collision_filter_targets,
+    lead_xy_target,
+    lead_z_target,
+    nut_ee_coupling_error,
+    nut_from_ee_offset,
+    rate_limited_z_target,
+)
+from wrist_scan_policy import busbar_wrist_scan_target
 
 _DRIVE_DIR = _REPO_ROOT / "src/amr_node/scrips_drive"
 sys.path.insert(0, str(_DRIVE_DIR))
@@ -199,8 +215,54 @@ NUT1_ROOT_PATH      = "/World/nut1"
 NUT2_ROOT_PATH      = "/World/nut2"
 NUT1_POLYSHAPE_PATH = "/World/nut1/geo/PolyShape"
 NUT2_POLYSHAPE_PATH = "/World/nut2/geo/PolyShape"
+NUT1_INTERFERING_PEG_PATH = (
+    "/World/Nova_Carter/chassis_link/carter_tray/peg_5"
+)
+NUT2_INTERFERING_PEG_PATH = (
+    "/World/Nova_Carter/chassis_link/carter_tray/peg_4"
+)
 EXTRA_NUT_ROOT_PATHS = ["/World/nut3", "/World/nut4", "/World/nut5", "/World/nut6"]
 EXTRA_NUT_POLYSHAPE_PATHS = [f"{p}/geo/PolyShape" for p in EXTRA_NUT_ROOT_PATHS]
+# 각 nut의 SDF hole과 자기 tray peg cylinder가 겹치므로, 실제 rigid body와
+# 그 peg 한 쌍만 제외한다. root/cart/robot/finger/다른 peg는 필터링하지 않는다.
+NUT_EXACT_PEG_FILTER_SPECS = (
+    (
+        "NUT1",
+        NUT1_ROOT_PATH,
+        NUT1_POLYSHAPE_PATH,
+        NUT1_INTERFERING_PEG_PATH,
+    ),
+    (
+        "NUT2",
+        NUT2_ROOT_PATH,
+        NUT2_POLYSHAPE_PATH,
+        NUT2_INTERFERING_PEG_PATH,
+    ),
+    (
+        "NUT3",
+        EXTRA_NUT_ROOT_PATHS[0],
+        EXTRA_NUT_POLYSHAPE_PATHS[0],
+        "/World/Nova_Carter/chassis_link/carter_tray/peg_3",
+    ),
+    (
+        "NUT4",
+        EXTRA_NUT_ROOT_PATHS[1],
+        EXTRA_NUT_POLYSHAPE_PATHS[1],
+        "/World/Nova_Carter/chassis_link/carter_tray/peg_1",
+    ),
+    (
+        "NUT5",
+        EXTRA_NUT_ROOT_PATHS[2],
+        EXTRA_NUT_POLYSHAPE_PATHS[2],
+        "/World/Nova_Carter/chassis_link/carter_tray/peg_0",
+    ),
+    (
+        "NUT6",
+        EXTRA_NUT_ROOT_PATHS[3],
+        EXTRA_NUT_POLYSHAPE_PATHS[3],
+        "/World/Nova_Carter/chassis_link/carter_tray/peg_2",
+    ),
+)
 
 # 그리퍼 파라미터
 GRIPPER_OPEN      = np.array([0.0, 0.0])
@@ -209,10 +271,7 @@ GRIPPER_CLOSE     = np.array([0.85, 0.85])
 GRIPPER_CLOSE_NUT = np.array([0.96, 0.96])
 GRIPPER_DELTA     = np.array([-0.5, -0.5])
 GRIP_CLOSE_RAMP_STEPS = 50
-NUT_AMR_DETACH_SETTLE_STEPS = 60  # 하강 완료 직후(손가락 닫기 전) 너트가 중력/잔류
-                                   # 속도로 살짝 튀거나 흔들릴 수 있으니, 완전히 정지할
-                                   # 때까지(1초) 대기한 뒤에야 그리퍼를 닫기 시작한다.
-GRIP_SETTLE_STEPS = 15  # 손가락이 다 닫힌 뒤 FixedJoint를 만들기 전 안정화 대기 틱 수
+GRIP_SETTLE_STEPS = 15  # 닫힌 손가락 안에서 tray glue 해제 후 결합 안정화 틱 수
 
 # Kinematic Pose-Glue 파라미터
 EE_OFFSET = np.array([0.0, 0.0, 0.185])
@@ -239,10 +298,35 @@ INSERT_SPEED            = 0.0005   # Step당 수직 하강 거리
 BUSBAR_RELEASE_Z        = 0.37     # 그리퍼 해제 및 체결 완료 임계 Z 높이
 INSERT_TOLERANCE_STRICT = 0.001    # Insert 단계 오차 허용범위 (1mm)
 
+# error_fix의 /target_pose는 이 frame_id에서만 증분 명령으로 해석한다. 한 번의
+# 증분을 실제 EE가 추종·정지한 뒤 12틱 확인해야 다음 post-motion 표본을 허용한다.
+FINE_ALIGNMENT_DELTA_FRAME = "fine_alignment_delta"
+FINE_STEP_POSITION_TOL_M = 0.005
+FINE_STEP_ORIENTATION_TOL_RAD = math.radians(3.0)
+FINE_STEP_MOTION_TOL_M = 0.0001
+FINE_STEP_ORIENTATION_MOTION_TOL_RAD = math.radians(0.005)
+FINE_STEP_SETTLE_STEPS = 12
+# 80% 명령 응답에서 한 틱 정지 판정 해상도만큼을 관측 margin으로 뺀다.
+# error_fix의 0.2 mm 스텝도 0.06 mm 이상의 command-direction 실제 이동을
+# 증명해야 하므로 same-frame/no-motion ACK는 허용되지 않는다.
+FINE_STEP_POSITION_RESPONSE_NOISE_MARGIN_M = 0.0001
+FINE_STEP_ORIENTATION_RESPONSE_NOISE_MARGIN_RAD = math.radians(0.005)
+# A settle ACK must prove that the arm executed nearly all of the incremental
+# command whenever that command is above the observation noise floor.
+FINE_STEP_MIN_RESPONSE_RATIO = 0.80
+# During an active step only the RMPFlow controller target can advance along
+# the correction direction, by at most 1 mm.  After strict settle, that exact
+# effective XY is committed before ACK so the next command cannot jump back.
+FINE_CONTROLLER_LEAD_GROWTH_M = 0.00005
+FINE_CONTROLLER_MAX_LEAD_M = 0.001
+
 # ══════════════════════════════════════════════════════════════════════════
 #  너트 조립(Nut Assembly) 파라미터
 # ══════════════════════════════════════════════════════════════════════════
 NUT_SCAN_Z        = 0.9
+NUT_POSE_POSITION_TOL_M = 0.02
+NUT_POSE_ORIENTATION_TOL_RAD = math.radians(3.0)
+NUT_POSE_SETTLE_STEPS = 12
 
 # 초기 자세(INIT_POSE 직후 HOME_EE_POS) TCP 좌표 기준, 너트 1~6번까지의 실측 상대
 # 오프셋(X,Y만 - Z는 NUT_PICK_Z로 고정). 초기 TCP=(1.0335, 0.1931, 0.8658), 너트1~6
@@ -269,9 +353,16 @@ NUT_APPROACH_Z     = 0.9                                     # 너트 파지 상
 NUT_PEG_CLEARANCE_Z = 0.08                                   # 파지 직후 XY 이동 없이 먼저
                                                               # 수직으로 빠져나올 거리(80mm,
                                                               # 공급대 peg 길이보다 큰 안전값)
-NUT_PEG_CLEAR_TOLERANCE = 0.003                              # 수직 이탈 완료 허용오차(3mm)
 NUT_PEG_CLEAR_HOLD_STEPS = 15                                # 이탈 높이 도착 후 파지 안정화
                                                               # 대기(60Hz 기준 0.25초)
+NUT_EE_COUPLING_TOLERANCE_M = 0.01                           # 파지 직후 저장한 EE-relative
+                                                              # 너트 위치에서 허용할 최대 drift
+NUT_EE_SETTLE_MOTION_TOLERANCE_M = 0.001                     # dynamics 전환 뒤 상대 위치가
+                                                              # 이 값 이하로 움직여야 안정 tick
+NUT_LIFT_COMMAND_MAX_STEP_M = 0.0005                         # friction grasp에 80mm 최종
+                                                              # 목표를 한 틱에 주지 않는 Z ramp
+NUT_PEG_CLEAR_COMMAND_MARGIN_M = 0.002                       # 실제 nut tracking 오차를 넘기기
+                                                              # 위한 command-only Z 여유(2mm)
 BOLT_APPROACH_Z    = 0.6                                     # 너트 체결 상공 고도
 
 # ★ 스테이션별 볼트 1/2번 실측 월드 좌표 (test_isaac 씬 고정 배치 기준) ★
@@ -291,13 +382,6 @@ STATION_NUT_INDICES = {
     5: (5, 6),
 }
 
-# 스테이션 4/5는 버스바 스캔 위치도 실측 절대좌표로 고정 (station 3은 기존처럼 현재
-# EE 위치 기준 상대 오프셋 계산을 그대로 쓴다).
-STATION_BUSBAR_SCAN_XY = {
-    4: np.array([-0.2271, 1.8945]),
-    5: np.array([-0.9586, 1.8945]),
-}
-
 # behavior_node.py의 AMR_STATION_POSES와 동일한 좌표 - /amr/goal_pose로 어느 스테이션에
 # 와있는지 자동 판별하는 데 쓴다(battery/busbar 두 지점 다 등록해서 어느 태스크
 # 시점이든 매칭되게 함).
@@ -306,6 +390,7 @@ STATION_AMR_POINTS = {
     4: [(0.6667, -0.6617), (-0.2271, 1.9078)],
     5: [(0.6667, -1.1964), (-0.9586, 1.9078)],
 }
+BUSBAR_AMR_EXPECTED_YAW = -1.5707
 
 # 너트 체결(Screwing) 파라미터
 ENGAGE_LEN           = 0.0125     # 체결 깊이 (12.5mm)
@@ -472,6 +557,213 @@ def configure_ros_domain(stage):
     print(f"[ROS2] USD Context {found}개 domain={domain_id} 적용")
 
 
+def configure_monotonic_simulation_time(stage):
+    """Keep camera source stamps monotonic across Stop→Play restarts."""
+    configured = 0
+    for prim in stage.Traverse():
+        reset_attr = prim.GetAttribute(
+            "inputs:resetSimulationTimeOnStop"
+        )
+        if not reset_attr.IsValid():
+            continue
+        reset_attr.Set(False)
+        configured += 1
+    print(
+        "[camera] Stop→Play source timestamp reset 비활성 "
+        f"({configured} authored nodes)"
+    )
+
+
+def _nut_collision_filter_failures(
+    stage,
+    *,
+    label,
+    root_path,
+    body_path,
+    peg_path,
+):
+    """Return contract violations for one intentionally exact nut/peg pair."""
+
+    body_path, expected_targets = exact_collision_filter_targets(
+        body_path,
+        peg_path,
+    )
+    body_prim = stage.GetPrimAtPath(body_path)
+    peg_prim = stage.GetPrimAtPath(expected_targets[0])
+    nut_root = stage.GetPrimAtPath(root_path)
+    failures = []
+
+    if not body_prim.IsValid():
+        failures.append(f"{label} 실제 rigid body prim 누락: {body_path}")
+    else:
+        if not body_prim.HasAPI(UsdPhysics.RigidBodyAPI):
+            failures.append(f"{label} RigidBodyAPI 누락: {body_path}")
+        if not body_prim.HasAPI(UsdPhysics.CollisionAPI):
+            failures.append(f"{label} CollisionAPI 누락: {body_path}")
+        actual_targets = tuple(
+            str(path)
+            for path in UsdPhysics.FilteredPairsAPI(
+                body_prim,
+            ).GetFilteredPairsRel().GetTargets()
+        )
+        if actual_targets != expected_targets:
+            failures.append(
+                f"{label} exact filteredPairs={actual_targets}, "
+                f"expected={expected_targets}"
+            )
+
+    if not peg_prim.IsValid():
+        failures.append(
+            f"{label} 간섭 peg prim 누락: {expected_targets[0]}"
+        )
+    elif not peg_prim.HasAPI(UsdPhysics.CollisionAPI):
+        failures.append(
+            f"{label} 간섭 peg CollisionAPI 누락: {expected_targets[0]}"
+        )
+
+    if not nut_root.IsValid():
+        failures.append(f"{label} root prim 누락: {root_path}")
+    else:
+        legacy_targets = tuple(
+            str(path)
+            for path in nut_root.GetRelationship(
+                "physics:filteredPairs",
+            ).GetTargets()
+        )
+        if legacy_targets:
+            failures.append(
+                f"{label} legacy broad filteredPairs가 남아 있음: "
+                f"{legacy_targets}"
+            )
+
+    # Filtering is unilateral in USD Physics.  Catch an unexpected relation
+    # anywhere else that targets this nut (or one authored on a descendant),
+    # since either would silently broaden this one-pair exception.
+    for prim in stage.Traverse():
+        prim_path = str(prim.GetPath())
+        if prim_path in {body_path, root_path}:
+            continue
+        relation = prim.GetRelationship("physics:filteredPairs")
+        if not relation.IsValid():
+            continue
+        targets = tuple(str(path) for path in relation.GetTargets())
+        if not targets:
+            continue
+        authored_on_nut = prim_path.startswith(f"{root_path}/")
+        targets_nut = any(
+            target == root_path
+            or target.startswith(f"{root_path}/")
+            for target in targets
+        )
+        if authored_on_nut or targets_nut:
+            failures.append(
+                f"예상하지 않은 {label} filteredPairs: "
+                f"{prim_path} -> {targets}"
+            )
+
+    return failures
+
+
+def _configure_nut_exact_peg_filter(
+    stage,
+    *,
+    label,
+    root_path,
+    body_path,
+    peg_path,
+):
+    """Neutralize one legacy broad filter, then author one body/peg pair."""
+
+    body_path, target_paths = exact_collision_filter_targets(
+        body_path,
+        peg_path,
+    )
+    body_prim = stage.GetPrimAtPath(body_path)
+    peg_prim = stage.GetPrimAtPath(target_paths[0])
+    missing = [
+        path
+        for path, prim in (
+            (body_path, body_prim),
+            (target_paths[0], peg_prim),
+        )
+        if not prim.IsValid()
+    ]
+    if missing:
+        raise RuntimeError(
+            f"{label} exact collision-filter prim 누락: "
+            + ", ".join(missing)
+        )
+    if not body_prim.HasAPI(UsdPhysics.RigidBodyAPI):
+        raise RuntimeError(f"{label} RigidBodyAPI 누락: {body_path}")
+    if not body_prim.HasAPI(UsdPhysics.CollisionAPI):
+        raise RuntimeError(f"{label} CollisionAPI 누락: {body_path}")
+    if not peg_prim.HasAPI(UsdPhysics.CollisionAPI):
+        raise RuntimeError(
+            f"{label} 간섭 peg CollisionAPI 누락: {target_paths[0]}"
+        )
+
+    nut_root = stage.GetPrimAtPath(root_path)
+    if not nut_root.IsValid():
+        raise RuntimeError(f"{label} root prim 누락: {root_path}")
+    legacy_relation = nut_root.GetRelationship("physics:filteredPairs")
+    if legacy_relation.IsValid() and not legacy_relation.SetTargets([]):
+        raise RuntimeError(
+            f"{label} legacy broad filteredPairs neutralize 실패"
+        )
+
+    filtered_api = UsdPhysics.FilteredPairsAPI.Apply(body_prim)
+    relation = filtered_api.CreateFilteredPairsRel()
+    if not relation.SetTargets([Sdf.Path(target_paths[0])]):
+        raise RuntimeError(f"{label} exact filteredPairs authoring 실패")
+
+    failures = _nut_collision_filter_failures(
+        stage,
+        label=label,
+        root_path=root_path,
+        body_path=body_path,
+        peg_path=peg_path,
+    )
+    if failures:
+        details = "\n  - ".join(failures)
+        raise RuntimeError(
+            f"{label} exact collision-filter 설정 실패:\n  - {details}"
+        )
+    print(
+        f"[{label} PHYSICS] legacy broad filter neutralized; exact pair="
+        f"{body_path} -> {target_paths[0]}"
+    )
+
+
+def _all_nut_collision_filter_failures(stage):
+    """Return violations for the six intentionally exact own-peg pairs."""
+
+    failures = []
+    for label, root_path, body_path, peg_path in NUT_EXACT_PEG_FILTER_SPECS:
+        failures.extend(
+            _nut_collision_filter_failures(
+                stage,
+                label=label,
+                root_path=root_path,
+                body_path=body_path,
+                peg_path=peg_path,
+            )
+        )
+    return failures
+
+
+def configure_exact_nut_peg_filters(stage):
+    """Filter each nut body against its own tray peg, and nothing else."""
+
+    for label, root_path, body_path, peg_path in NUT_EXACT_PEG_FILTER_SPECS:
+        _configure_nut_exact_peg_filter(
+            stage,
+            label=label,
+            root_path=root_path,
+            body_path=body_path,
+            peg_path=peg_path,
+        )
+
+
 def create_runtime_stage_overlay(source_path, output_directory):
     """원본 USD를 저장하지 않고, 첫 graph 생성 전 적용할 wrapper USD를 만든다."""
     source_stage = Usd.Stage.Open(str(Path(source_path).resolve()))
@@ -508,7 +800,9 @@ def create_runtime_stage_overlay(source_path, output_directory):
                 stage.SetDefaultPrim(runtime_default_prim)
 
         configure_ros_domain(stage)
+        configure_monotonic_simulation_time(stage)
         configure_fixed_camera_bridges(stage)
+        configure_exact_nut_peg_filters(stage)
     if not layer.Save():
         raise RuntimeError(f"runtime USD layer 저장 실패: {overlay_path}")
 
@@ -521,8 +815,10 @@ class Execute_Isaac_Busar(Node):
     def __init__(self):
         super().__init__("execute_isaac_busar")
         self.latest_target_pose = None
+        self.latest_fine_alignment_delta = None
         self.requested_task = None
         self.alignment_success = False
+        self.expected_fine_alignment_generation = None
 
         self.sub_target_pose = self.create_subscription(
             PoseStamped, '/target_pose', self._on_target_pose, 10
@@ -554,6 +850,11 @@ class Execute_Isaac_Busar(Node):
             '/busbar_cam/perception/reset_cache',
             10,
         )
+        self.pub_wrist_perception_reset = self.create_publisher(
+            Empty,
+            '/wrist/perception/reset_cache',
+            10,
+        )
         self.pub_bolt_perception_reset = self.create_publisher(
             Empty,
             '/bolt_cam/perception/reset_cache',
@@ -561,7 +862,12 @@ class Execute_Isaac_Busar(Node):
         )
 
     def _on_target_pose(self, msg: PoseStamped):
-        self.latest_target_pose = msg
+        if msg.header.frame_id.startswith(
+            FINE_ALIGNMENT_DELTA_FRAME
+        ):
+            self.latest_fine_alignment_delta = msg
+        else:
+            self.latest_target_pose = msg
 
     def _on_amr_goal_pose(self, msg: PoseStamped):
         self.amr_goal_pose = msg
@@ -635,10 +941,37 @@ class Execute_Isaac_Busar(Node):
 
     def _on_task_command(self, msg: String):
         self.get_logger().info(f"[Task Command 수신]: {msg.data}")
-        if msg.data == "ALIGNMENT_SUCCESS":
+        if (
+            msg.data == "ALIGNMENT_SUCCESS"
+            or msg.data.startswith("ALIGNMENT_SUCCESS:")
+        ):
+            _, separator, generation_text = msg.data.partition(":")
+            if not separator:
+                self.get_logger().warn(
+                    "generation 없는 legacy ALIGNMENT_SUCCESS 무시")
+                return
+            try:
+                generation = int(generation_text)
+            except ValueError:
+                self.get_logger().warn(
+                    f"잘못된 ALIGNMENT_SUCCESS generation 무시: {msg.data}")
+                return
+            expected_generation = (
+                self.expected_fine_alignment_generation
+            )
+            if generation <= 0 or expected_generation is None:
+                self.get_logger().warn(
+                    "활성 FINE_ALIGNMENT와 연결되지 않은 완료 신호 무시: "
+                    f"{msg.data}")
+                return
+            if generation != expected_generation:
+                self.get_logger().warn(
+                    "stale FINE_ALIGNMENT 완료 신호 무시: "
+                    f"expected={expected_generation}, received={generation}")
+                return
             self.alignment_success = True
-        else:
-            self.requested_task = msg.data
+            return
+        self.requested_task = msg.data
 
 
 def euler_to_quaternion_wxyz(roll, pitch, yaw):
@@ -662,6 +995,18 @@ def disable_physics_recursively(stage, prim_path):
             UsdPhysics.CollisionAPI(prim).GetCollisionEnabledAttr().Set(False)
         if prim.HasAPI(UsdPhysics.RigidBodyAPI):
             UsdPhysics.RigidBodyAPI(prim).GetRigidBodyEnabledAttr().Set(False)
+
+
+def enable_collision_recursively(stage, prim_path):
+    """Enable contact geometry without releasing a kinematically glued body."""
+    root_prim = stage.GetPrimAtPath(prim_path)
+    if not root_prim.IsValid():
+        return
+    for prim in Usd.PrimRange(root_prim):
+        if prim.HasAPI(UsdPhysics.CollisionAPI):
+            UsdPhysics.CollisionAPI(
+                prim
+            ).GetCollisionEnabledAttr().Set(True)
 
 
 def enable_physics_recursively(stage, prim_path):
@@ -697,6 +1042,14 @@ def _quat_normalize(q):
     if not np.all(np.isfinite(quaternion)) or norm <= 1.0e-9:
         raise ValueError("유효하지 않은 quaternion입니다")
     return quaternion / norm
+
+
+def _quat_angular_error(q1, q2):
+    """Return the shortest 3-D quaternion distance in radians."""
+    q1 = _quat_normalize(q1)
+    q2 = _quat_normalize(q2)
+    quaternion_dot = min(1.0, abs(float(np.dot(q1, q2))))
+    return 2.0 * math.acos(quaternion_dot)
 
 
 def _quat_rotate_vec(q, v):
@@ -748,8 +1101,16 @@ def busbar_camera_pose_for_asset(busbar_xform):
     return camera_position, camera_orientation / quat_norm
 
 
-def bolt_camera_pose_for_asset(stage, bolt_path, initial_position, initial_orientation):
-    """현재 station bolt_2 XY로 이동하되 USD의 기존 Z·자세를 유지한다."""
+def bolt_camera_pose_for_target(
+    stage,
+    bolt_path,
+    initial_position,
+    initial_orientation,
+):
+    """한 bolt의 XY로 이동하며 USD의 기존 카메라 Z·자세를 유지한다."""
+    bolt_prim = stage.GetPrimAtPath(bolt_path)
+    if not bolt_prim.IsValid():
+        raise ValueError(f"bolt camera target prim이 없습니다: {bolt_path}")
     bolt_position = world_xf(stage, bolt_path).ExtractTranslation()
     camera_position = np.array(
         [
@@ -764,7 +1125,7 @@ def bolt_camera_pose_for_asset(stage, bolt_path, initial_position, initial_orien
         not np.all(np.isfinite(camera_position))
         or not np.all(np.isfinite(camera_orientation))
     ):
-        raise RuntimeError("bolt camera pose가 유효하지 않습니다")
+        raise RuntimeError("bolt camera target pose가 유효하지 않습니다")
     return camera_position, camera_orientation
 
 
@@ -1024,6 +1385,41 @@ def _configure_runtime_wheel_drive(robot):
     return np.asarray([int(index) for index in indices], dtype=np.int64)
 
 
+def _configure_runtime_wheel_brake(robot):
+    """Hold the current wheel angles while the arm works.
+
+    A zero velocity target alone allowed the wheels to roll slowly under arm
+    reaction forces.  Use a finite position drive while stopped, then
+    ``unlock_amr_base`` restores the pure velocity drive before every goal.
+    """
+    indices = [robot.get_dof_index(name) for name in AMR_WHEEL_JOINT_NAMES]
+    if any(index is None or int(index) < 0 for index in indices):
+        raise RuntimeError(f"AMR wheel DOF 누락: {indices}")
+    wheel_indices = np.asarray(
+        [int(index) for index in indices],
+        dtype=np.int64,
+    )
+    wheel_positions = np.asarray(
+        robot.get_joint_positions()[wheel_indices],
+        dtype=np.float32,
+    )
+    _set_runtime_gains(
+        robot,
+        AMR_WHEEL_JOINT_NAMES,
+        stiffness=1.0e4,
+        damping=1.0e4,
+        max_force=200.0,
+    )
+    robot.apply_action(
+        ArticulationAction(
+            joint_positions=wheel_positions,
+            joint_velocities=np.zeros(2, dtype=np.float32),
+            joint_indices=wheel_indices,
+        )
+    )
+    return wheel_indices
+
+
 def _apply_amr_wheel_speeds(robot, wheel_indices, left_radps, right_radps):
     """좌우 실제 wheel joint에 목표 각속도(rad/s)를 전달한다."""
     robot.apply_action(
@@ -1046,8 +1442,7 @@ def lock_amr_base(stage, amr_root_path, robot=None):
     del amr_root_path
     prepare_amr_physics(stage)
     if robot is not None:
-        wheel_indices = _configure_runtime_wheel_drive(robot)
-        _apply_amr_wheel_speeds(robot, wheel_indices, 0.0, 0.0)
+        _configure_runtime_wheel_brake(robot)
 
 
 def unlock_amr_base(stage, amr_root_path, robot=None):
@@ -1088,6 +1483,17 @@ def quat_wxyz_to_yaw(quat_wxyz):
 def goal_stamp_key(msg):
     """amr_node와 동일한 ``sec:nanosec`` 목표 상관 키."""
     return f"{int(msg.header.stamp.sec)}:{int(msg.header.stamp.nanosec)}"
+
+
+def pose_stamp_ns(msg):
+    """Return a positive integer correlation key from a PoseStamped."""
+    stamp_ns = (
+        int(msg.header.stamp.sec) * 1_000_000_000
+        + int(msg.header.stamp.nanosec)
+    )
+    if stamp_ns <= 0:
+        raise ValueError("PoseStamped source stamp가 0입니다")
+    return stamp_ns
 
 
 def measure_amr_pose(robot):
@@ -1144,6 +1550,43 @@ def resolve_station_from_amr_xy(x, y, tolerance=0.3):
     if best_dist is not None and best_dist <= tolerance:
         return best_station
     return None
+
+
+def resolve_busbar_stop_from_amr_xy(x, y, tolerance=AMR_POS_TOL):
+    """승인된 AMR position tolerance 안의 canonical busbar stop을 찾는다."""
+    best_station, best_dist = None, None
+    for station, points in STATION_AMR_POINTS.items():
+        busbar_x, busbar_y = points[1]
+        distance = math.hypot(x - busbar_x, y - busbar_y)
+        if best_dist is None or distance < best_dist:
+            best_station, best_dist = station, distance
+    if best_dist is not None and best_dist <= tolerance:
+        return best_station
+    return None
+
+
+def busbar_station_pose_error(robot, station):
+    """Return actual pose plus planar errors from the station busbar stop.
+
+    ``SCAN_BUSBAR`` and ``PICK_BUSBAR`` are only reachable after the AMR has
+    arrived at the selected station's busbar stop.  Calling either task from
+    the battery stop (or from the initial scene pose) leaves the target
+    outside the arm workspace; with the intentionally large arm stuck budget
+    that otherwise looks like an infinite wait.
+    """
+    points = STATION_AMR_POINTS.get(station)
+    if points is None:
+        raise ValueError(f"unknown station: {station}")
+    expected_x, expected_y = points[1]
+    pose = measure_amr_pose(robot)
+    position_error = math.hypot(
+        pose.x - expected_x,
+        pose.y - expected_y,
+    )
+    yaw_error = abs(
+        normalize_angle(pose.yaw - BUSBAR_AMR_EXPECTED_YAW)
+    )
+    return pose, position_error, yaw_error
 
 
 def yaw_rotated_quat(base_wxyz, delta_deg):
@@ -1221,6 +1664,8 @@ def validate_stage_contract(stage):
         )
     if not any(prim.IsA(UsdPhysics.Scene) for prim in stage.Traverse()):
         failures.append("UsdPhysics.Scene prim 누락")
+
+    failures.extend(_all_nut_collision_filter_failures(stage))
 
     for graph_path, config in FIXED_CAMERA_BRIDGES.items():
         camera_path = config["camera"]
@@ -1312,6 +1757,16 @@ def validate_stage_contract(stage):
     if context_count == 0:
         failures.append("활성 ROS2Context 누락")
 
+    for prim in stage.Traverse():
+        reset_attr = prim.GetAttribute(
+            "inputs:resetSimulationTimeOnStop"
+        )
+        if reset_attr.IsValid() and bool(reset_attr.Get()):
+            failures.append(
+                "Stop→Play camera source stamp reset 활성: "
+                f"{prim.GetPath()}"
+            )
+
     station_camera_poses = {}
     for station, (root_path, mesh_path) in STATION_BUSBAR_PATHS.items():
         if (
@@ -1399,7 +1854,8 @@ def validate_stage_contract(stage):
 
     print(
         "[PREFLIGHT] PASS: camera/render/optical TF/ROS domain/"
-        "single-publisher bridge/station prim/wheel DriveAPI"
+        "monotonic source stamp/single-publisher bridge/station prim/"
+        "wheel DriveAPI/six exact nut/own-peg collision pairs"
     )
     for station, (position, orientation) in station_camera_poses.items():
         print(
@@ -1738,7 +2194,7 @@ def main():
         world.step(render=True)
 
     wheel_indices = _configure_runtime_wheel_drive(robot)
-    _apply_amr_wheel_speeds(robot, wheel_indices, 0.0, 0.0)
+    lock_amr_base(stage, NOVA_CARTER_ROOT, robot=robot)
     drive_controller = GoToPoseController(
         ControllerConfig(
             position_tolerance=AMR_POS_TOL,
@@ -1805,6 +2261,9 @@ def main():
     atexit.register(shutdown_runtime)
 
     if _SMOKE_TEST:
+        # main 진입 직후에는 팔 작업용 wheel position brake가 걸려 있다.
+        # smoke는 순수 velocity drive를 검증해야 하므로 먼저 대칭적으로 해제한다.
+        unlock_amr_base(stage, NOVA_CARTER_ROOT, robot=robot)
         validate_stage_contract(stage)
         run_wheel_smoke_test(
             world,
@@ -1898,6 +2357,7 @@ def main():
     grasp_timer = 0
     nut_release_timer = 0
     was_playing = False
+    playback_started_once = False
     phase = "IDLE"
     init_pose_only = False  # True면 INIT_POSE 완료 후 SCAN_APPROACH로 안 이어지고 바로 종료
     busbar_grasped = False  # 그리퍼-버스바 FixedJoint가 걸려있는 상태인지
@@ -1905,19 +2365,58 @@ def main():
     busbar_lift_stable_steps = 0
     descend_target_z = None
     target_mid_pos = None
+    target_fine_yaw_rad = 0.0
+    fine_alignment_generation = 0
+    fine_step_gate = FineAlignmentStepGate(
+        position_tolerance_m=FINE_STEP_POSITION_TOL_M,
+        orientation_tolerance_rad=FINE_STEP_ORIENTATION_TOL_RAD,
+        motion_tolerance_m=FINE_STEP_MOTION_TOL_M,
+        orientation_motion_tolerance_rad=(
+            FINE_STEP_ORIENTATION_MOTION_TOL_RAD
+        ),
+        position_response_noise_margin_m=(
+            FINE_STEP_POSITION_RESPONSE_NOISE_MARGIN_M
+        ),
+        orientation_response_noise_margin_rad=(
+            FINE_STEP_ORIENTATION_RESPONSE_NOISE_MARGIN_RAD
+        ),
+        settle_steps=FINE_STEP_SETTLE_STEPS,
+    )
+    fine_controller_lead = BoundedPlanarCommandLead(
+        growth_step_m=FINE_CONTROLLER_LEAD_GROWTH_M,
+        max_lead_m=FINE_CONTROLLER_MAX_LEAD_M,
+    )
+    fine_step_previous_ee_pos = None
+    fine_step_previous_ee_orientation = None
+    fine_step_start_ee_pos = None
+    fine_step_command_delta_xy = None
+    fine_step_start_orientation_error_rad = None
     scan_hold_quat = None  # INIT_POSE 완료 시점의 실제 EE 자세 (SCAN_APPROACH가 그대로 유지)
 
     # ── 너트 조립(Nut Assembly) 상태 변수 ──
-    nut_index      = 0        # 1: 너트 1번, 2: 너트 2번
+    nut_index      = 0        # 전체 장면의 물리 너트 번호(1~6)
+    nut_slot       = 0        # 현재 station 안의 bolt/nut 슬롯(1 또는 2)
     NUT_SCAN_POS   = None     # 너트 스캔 위치 (SCAN_NUT1/2마다 해당 너트 오프셋으로 새로 계산)
     NUT_SCAN_LIFT_POS = None  # 방향 정렬용 중간 경유 위치 (현재 XY, 스캔 고도)
+    nut_pose_settle_count = 0  # 실제 위치+quaternion 연속 안정화 표본
     BUSBAR_SCAN_LIFT_POS = None  # 버스바 스캔용 방향 정렬 중간 경유 위치 (현재 XY, 스캔 고도)
     nut_pick_pos   = None     # 현재 너트의 물리 파지 좌표
     nut_approach_pos = None   # 현재 너트 파지 상공 접근 좌표
     nut_peg_clear_pos = None  # 파지 직후 peg에서 수직으로 빠져나올 중간 목표
+    nut_peg_clear_start_pos = None  # 실제 80mm 이탈을 재는 파지 종료 EE 위치
+    nut_peg_clear_start_nut_z = None  # 마찰 파지된 실제 너트의 이탈 기준 높이
+    nut_peg_clear_xy_lead = np.zeros(2, dtype=float)
+    nut_peg_clear_z_lead = 0.0  # RMPFlow 정상상태 Z 오차를 보상하는 command-only lead
     nut_peg_clear_hold = 0    # 중간 목표 도착 후 안정화 카운터
-    bolt_target_pos  = None   # 체결 목표 좌표
-    bolt_touch_pos   = None   # 착좌(Screwing 시작) 목표 좌표
+    nut_pick_active_array_index = None  # PICK 성공 전 cancel/conflict 시 tray glue 복구 대상
+    nut_ee_reference_offset = None  # release/settled transport의 nut_position - ee_position
+    nut_ee_previous_offset = None  # release settle 중 tick 간 상대 위치 변화 측정
+    nut_lift_command_z = None  # peg-clear부터 안전 상공까지 이어지는 bounded Z command
+    bolt_target_pos   = None  # 체결 목표 좌표
+    bolt_travel_pos   = None  # 볼트 XY의 안전 상공(NUT_APPROACH_Z) 좌표
+    bolt_approach_pos = None  # 볼트 바로 위(BOLT_APPROACH_Z) 좌표
+    bolt_touch_pos    = None  # 착좌(Screwing 시작) 목표 좌표
+    nut_xy_lead       = np.zeros(2, dtype=float)  # RMPFlow 정상상태 XY 오차 보정
 
     screw_sub          = "rotate"
     screw_pass_idx      = 0
@@ -1937,7 +2436,59 @@ def main():
     amr_goal_stamp = ""
     amr_drive_publish_step = 0
     current_station = 3  # /amr/goal_pose로 자동 판별, 기본값은 station 3
+    amr_goal_busbar_station = None
+    last_arrived_busbar_station = None
     wheels_locked = True  # wheel target 0으로 정지한 상태
+
+    def restore_active_nut_to_tray_glue(reason):
+        """Abort an unfinished PICK and restore its original AMR-local slot."""
+        nonlocal nut_pick_active_array_index
+        nonlocal nut_ee_reference_offset
+        nonlocal nut_ee_previous_offset
+        nonlocal nut_lift_command_z
+        nonlocal nut_release_timer
+
+        array_index = nut_pick_active_array_index
+        if array_index is None:
+            return False
+
+        nut_xf = nut_xforms_all[array_index]
+        local_offset = nut_local_offsets[array_index]
+        nut_root = nut_roots_all[array_index]
+        if nut_xf is not None and local_offset is not None:
+            # Physics must be disabled before moving the prim back to its
+            # original tray-relative pose.  The ordinary glue loop owns it
+            # again from the next frame onward.
+            disable_physics_recursively(stage, nut_root)
+            remove_nut_amr_joint(stage, nut_root)
+            glue_position, glue_orientation = compose_world_pose(
+                *robot.get_world_pose(),
+                *local_offset,
+            )
+            nut_xf.set_world_pose(
+                position=glue_position,
+                orientation=glue_orientation,
+            )
+            nut_released[array_index] = False
+            print(
+                f"[NUT PICK ROLLBACK] 너트 {array_index + 1}번을 "
+                f"원래 tray glue 위치로 복구 ({reason})"
+            )
+        else:
+            print(
+                f"[ERROR] 너트 {array_index + 1}번 tray glue 복구에 "
+                "필요한 Xform/offset이 없습니다"
+            )
+
+        robot.gripper.apply_action(
+            ArticulationAction(joint_positions=GRIPPER_OPEN)
+        )
+        nut_pick_active_array_index = None
+        nut_ee_reference_offset = None
+        nut_ee_previous_offset = None
+        nut_lift_command_z = None
+        nut_release_timer = 0
+        return True
 
     def publish_status(status_str: str):
         msg = String()
@@ -1960,15 +2511,31 @@ def main():
 
         # 1. Play / Stop 상태 보정
         if playing and not was_playing:
-            stale_busbar_camera_wait = (
-                phase == "WAIT_BUSBAR_CAMERA_LATCH"
+            is_playback_restart = playback_started_once
+            interrupted_phase = (
+                phase if phase not in {"IDLE", "DONE"} else None
             )
+            restart_amr_goal_stamp = (
+                amr_goal_stamp
+                if is_playback_restart and amr_moving and amr_goal_stamp
+                else ""
+            )
+            restart_amr_pose = (
+                measure_amr_pose(robot)
+                if restart_amr_goal_stamp
+                else None
+            )
+            if restart_amr_goal_stamp:
+                _apply_amr_wheel_speeds(
+                    robot,
+                    wheel_indices,
+                    0.0,
+                    0.0,
+                )
             world.reset()
             prepare_amr_physics(stage)
             wheel_indices = _configure_runtime_wheel_drive(robot)
-            _apply_amr_wheel_speeds(
-                robot, wheel_indices, 0.0, 0.0
-            )
+            lock_amr_base(stage, NOVA_CARTER_ROOT, robot=robot)
             drive_controller.clear_goal()
             for asset in busbar_assets.values():
                 enable_physics_recursively(stage, asset["root_path"])
@@ -2019,15 +2586,37 @@ def main():
             step_count = 0
             grasp_timer = 0
             nut_release_timer = 0
+            target_fine_yaw_rad = 0.0
+            fine_alignment_generation += 1
+            fine_step_gate.reset()
+            fine_controller_lead.reset()
+            fine_step_previous_ee_pos = None
+            fine_step_previous_ee_orientation = None
+            fine_step_start_ee_pos = None
+            fine_step_command_delta_xy = None
+            fine_step_start_orientation_error_rad = None
 
             nut_index = 0
+            nut_slot = 0
             NUT_SCAN_POS = None
+            nut_pose_settle_count = 0
             nut_pick_pos = None
             nut_approach_pos = None
             nut_peg_clear_pos = None
+            nut_peg_clear_start_pos = None
+            nut_peg_clear_start_nut_z = None
+            nut_peg_clear_xy_lead = np.zeros(2, dtype=float)
+            nut_peg_clear_z_lead = 0.0
             nut_peg_clear_hold = 0
+            nut_pick_active_array_index = None
+            nut_ee_reference_offset = None
+            nut_ee_previous_offset = None
+            nut_lift_command_z = None
             bolt_target_pos = None
+            bolt_travel_pos = None
+            bolt_approach_pos = None
             bolt_touch_pos = None
+            nut_xy_lead = np.zeros(2, dtype=float)
             screw_sub = "rotate"
             screw_pass_idx = 0
             screw_pass_theta = 0.0
@@ -2037,21 +2626,61 @@ def main():
             amr_target_xy_theta = None
             amr_goal_stamp = ""
             amr_drive_publish_step = 0
+            amr_goal_busbar_station = None
+            last_arrived_busbar_station = None
             wheels_locked = True
 
-            if stale_busbar_camera_wait:
+            # world.reset() invalidates RMPFlow's cached articulation/base
+            # state. 최초 play는 policy만 다시 anchor하고, 실제 playback
+            # restart는 저수준 관절 target도 현재 pose hold로 덮어쓴다.
+            if is_playback_restart:
                 hold_current_arm_pose()
                 phase = "IDLE"
                 step_count = 0
+                isaac_node.requested_task = None
                 isaac_node.latest_target_pose = None
+                isaac_node.latest_fine_alignment_delta = None
+                isaac_node.alignment_success = False
+                isaac_node.expected_fine_alignment_generation = None
+                isaac_node.pub_wrist_perception_reset.publish(Empty())
                 isaac_node.pub_busbar_perception_reset.publish(Empty())
-                publish_status(
-                    "FAILURE:PLAYBACK_RESTART_DURING_BUSBAR_LATCH"
-                )
-                print(
-                    "\n[ARM] playback 재시작으로 fixed-camera latch 대기를 "
-                    "취소하고 팔을 현재 자세로 hold합니다"
-                )
+                isaac_node.pub_bolt_perception_reset.publish(Empty())
+                reset_cmd = String()
+                reset_cmd.data = "RESET_BOLT_DETECTION"
+                isaac_node.pub_errorfix_command.publish(reset_cmd)
+                if restart_amr_goal_stamp:
+                    isaac_node.publish_amr_drive_state(
+                        "CANCELED",
+                        "playback 재시작으로 실제 wheel 주행을 중단했습니다",
+                        restart_amr_goal_stamp,
+                        pose=restart_amr_pose,
+                    )
+                    print(
+                        "\n[AMR PHYSICS] playback 재시작으로 goal "
+                        f"{restart_amr_goal_stamp} 취소 -> wheel brake"
+                    )
+                if interrupted_phase is not None:
+                    publish_status(
+                        "FAILURE:PLAYBACK_RESTART_DURING_"
+                        f"{interrupted_phase}"
+                    )
+                    print(
+                        "\n[ARM] playback 재시작으로 "
+                        f"{interrupted_phase} phase를 중단하고 팔을 현재 "
+                        "자세로 hold합니다"
+                    )
+                else:
+                    # phase가 IDLE이어도 ArmNode가 perception 응답 또는
+                    # target/task 토픽 순서를 기다리는 중일 수 있다.
+                    publish_status("FAILURE:PLAYBACK_RESTART")
+                    print(
+                        "\n[ARM] playback 재시작 -> stale target/task/cache "
+                        "폐기 및 현재 자세 hold"
+                    )
+            else:
+                arm_controller.reset()
+                sync_rmpflow_base_pose()
+            playback_started_once = True
 
         # battery4_main의 너트 AMR glue 추종. PICK된 너트는 nut_released=True가 되어
         # 여기서 제외되고 이후부터 정상 다이나믹 바디로 움직인다.
@@ -2086,9 +2715,51 @@ def main():
                 amr_moving = False
                 amr_target_xy_theta = None
                 amr_goal_stamp = ""
+                amr_goal_busbar_station = None
+                last_arrived_busbar_station = None
                 if not wheels_locked:
                     lock_amr_base(stage, NOVA_CARTER_ROOT, robot=robot)
                     wheels_locked = True
+
+            # 팔 FSM과 AMR wheel 주행은 동시에 실행하지 않는다. 새 goal 자체는
+            # 즉시 소비하되 wheel을 0/brake 상태로 유지하고 명시적으로 거부한다.
+            if (
+                isaac_node.amr_goal_pose is not None
+                and phase not in {"IDLE", "DONE"}
+            ):
+                rejected_goal = isaac_node.amr_goal_pose
+                isaac_node.amr_goal_pose = None
+                rejected_stamp = goal_stamp_key(rejected_goal)
+                _apply_amr_wheel_speeds(
+                    robot, wheel_indices, 0.0, 0.0
+                )
+                pose = measure_amr_pose(robot)
+                if amr_moving and amr_goal_stamp:
+                    isaac_node.publish_amr_drive_state(
+                        "CANCELED",
+                        "팔 작업 중 새 목표가 도착해 이전 wheel 주행을 중단했습니다",
+                        amr_goal_stamp,
+                        pose=pose,
+                    )
+                drive_controller.clear_goal()
+                amr_moving = False
+                amr_target_xy_theta = None
+                amr_goal_stamp = ""
+                amr_goal_busbar_station = None
+                last_arrived_busbar_station = None
+                lock_amr_base(stage, NOVA_CARTER_ROOT, robot=robot)
+                wheels_locked = True
+                sync_rmpflow_base_pose()
+                isaac_node.publish_amr_drive_state(
+                    "FAILED",
+                    f"팔 phase({phase}) 실행 중 AMR 목표를 거부했습니다",
+                    rejected_stamp,
+                    pose=pose,
+                )
+                print(
+                    f"\n[AMR PHYSICS] 팔 phase '{phase}' 실행 중 새 목표 "
+                    f"{rejected_stamp} 거부 -> wheel brake 유지"
+                )
 
             if isaac_node.amr_goal_pose is not None:
                 goal_msg = isaac_node.amr_goal_pose
@@ -2100,6 +2771,8 @@ def main():
                 # 새 목표를 해석하기 전에 이전 command를 즉시 끊는다. 유효하지 않은
                 # 목표여도 기존 주행이 계속되는 일이 없어야 한다.
                 _apply_amr_wheel_speeds(robot, wheel_indices, 0.0, 0.0)
+                last_arrived_busbar_station = None
+                amr_goal_busbar_station = None
                 if amr_moving and amr_goal_stamp:
                     pose = measure_amr_pose(robot)
                     isaac_node.publish_amr_drive_state(
@@ -2191,6 +2864,12 @@ def main():
                             f"{g_pos.y:.4f})가 알려진 스테이션과 "
                             f"안 맞음 -> current_station={current_station} 유지"
                         )
+                    amr_goal_busbar_station = (
+                        resolve_busbar_stop_from_amr_xy(
+                            g_pos.x,
+                            g_pos.y,
+                        )
+                    )
                     isaac_node.publish_amr_drive_state(
                         "ACTIVE",
                         "목표를 수락하고 실제 wheel 주행을 시작합니다",
@@ -2245,6 +2924,10 @@ def main():
                     lock_amr_base(stage, NOVA_CARTER_ROOT, robot=robot)
                     wheels_locked = True
                     sync_rmpflow_base_pose()
+                    last_arrived_busbar_station = (
+                        amr_goal_busbar_station
+                    )
+                    amr_goal_busbar_station = None
                     amr_goal_stamp = ""
                 elif amr_drive_publish_step % 60 == 0:
                     isaac_node.publish_amr_drive_state(
@@ -2290,10 +2973,27 @@ def main():
             # 주행 중 task 거부 경로가 cancel 문자열을 지워 내부 WAIT phase가 남는다.
             if task == "CANCEL_ARM_TASK":
                 hold_current_arm_pose()
+                restore_active_nut_to_tray_glue("explicit cancel")
                 phase = "IDLE"
                 step_count = 0
+                nut_peg_clear_start_pos = None
+                nut_peg_clear_start_nut_z = None
+                nut_peg_clear_xy_lead = np.zeros(2, dtype=float)
+                nut_peg_clear_z_lead = 0.0
+                nut_peg_clear_hold = 0
+                nut_pose_settle_count = 0
+                target_fine_yaw_rad = 0.0
+                fine_step_gate.reset()
+                fine_controller_lead.reset()
+                fine_step_previous_ee_pos = None
+                fine_step_previous_ee_orientation = None
+                fine_step_start_ee_pos = None
+                fine_step_command_delta_xy = None
+                fine_step_start_orientation_error_rad = None
                 isaac_node.latest_target_pose = None
+                isaac_node.latest_fine_alignment_delta = None
                 isaac_node.alignment_success = False
+                isaac_node.expected_fine_alignment_generation = None
                 reset_cmd = String()
                 reset_cmd.data = "RESET_BOLT_DETECTION"
                 isaac_node.pub_errorfix_command.publish(reset_cmd)
@@ -2325,6 +3025,8 @@ def main():
                 amr_moving = False
                 amr_target_xy_theta = None
                 amr_goal_stamp = ""
+                amr_goal_busbar_station = None
+                last_arrived_busbar_station = None
                 sync_rmpflow_base_pose()
                 publish_status("FAILURE:AMR_STILL_DRIVING")
                 if (
@@ -2336,9 +3038,55 @@ def main():
                     step_count = 0
                 task = ""
 
+            # ArmNode는 ExecuteArmTask를 직렬화하지만 /task_command 자체는
+            # 토픽이므로 중복 publisher나 지연 callback이 active phase를 덮어쓸
+            # 수 있다. CONTINUE handshake만 정확한 WAIT phase에서 허용하고,
+            # 그 외 경합은 두 task 모두 안전하게 중단해 이전 저수준 관절 target이
+            # 계속 실행되지 않도록 현재 관절을 hold한다.
+            continue_handshake = (
+                task == "CONTINUE_BUSBAR_WRIST_SCAN"
+                and phase == "WAIT_BUSBAR_CAMERA_LATCH"
+            )
+            if (
+                task
+                and phase not in {"IDLE", "DONE"}
+                and not continue_handshake
+            ):
+                conflicting_phase = phase
+                hold_current_arm_pose()
+                restore_active_nut_to_tray_glue(
+                    f"task conflict: {task}"
+                )
+                phase = "IDLE"
+                step_count = 0
+                nut_pose_settle_count = 0
+                isaac_node.latest_target_pose = None
+                isaac_node.latest_fine_alignment_delta = None
+                isaac_node.alignment_success = False
+                isaac_node.expected_fine_alignment_generation = None
+                target_fine_yaw_rad = 0.0
+                fine_step_gate.reset()
+                fine_controller_lead.reset()
+                fine_step_previous_ee_pos = None
+                fine_step_previous_ee_orientation = None
+                fine_step_start_ee_pos = None
+                fine_step_command_delta_xy = None
+                fine_step_start_orientation_error_rad = None
+                reset_cmd = String()
+                reset_cmd.data = "RESET_BOLT_DETECTION"
+                isaac_node.pub_errorfix_command.publish(reset_cmd)
+                publish_status("FAILURE:ARM_TASK_CONFLICT")
+                print(
+                    f"\n[ARM] active phase '{conflicting_phase}' 중 새 task "
+                    f"'{task}' 수신 -> 현재 관절 hold 및 task 경합 거부"
+                )
+                task = ""
+
             if task == "SCAN_BATTERY":
-                # 최신 방식대로 실제 bolt_2 XY로 카메라만 평행 이동하고 기존 Z·자세는
-                # 유지한다. reset 뒤의 3-frame barrier는 perception 인스턴스가 맡는다.
+                # 최신 방식대로 현재 station의 bolt_2 XY로 카메라만 평행
+                # 이동하고 기존 Z·자세는 유지한다. 공급대 전체 중점은 인접
+                # 배터리팩까지 시야에 넣어 잘못된 bolt쌍을 고를 수 있다.
+                # reset 뒤의 3-frame barrier는 perception 인스턴스가 맡는다.
                 bolt_paths = STATION_BOLT_PRIM_PATHS.get(current_station)
                 if bolt_paths is None or any(
                     not stage.GetPrimAtPath(path).IsValid()
@@ -2351,7 +3099,7 @@ def main():
                     publish_status("FAILURE:BOLT_CAMERA_TARGET_NOT_FOUND")
                 else:
                     bolt_camera_position, bolt_camera_orientation = (
-                        bolt_camera_pose_for_asset(
+                        bolt_camera_pose_for_target(
                             stage,
                             bolt_paths[1],
                             bolt_camera_init_pos,
@@ -2390,17 +3138,48 @@ def main():
                 # 이전 task나 error_fix가 남긴 PoseStamped를 다음 station 버스바
                 # target으로 오인하지 않도록 스캔 세대 시작점에서 비운다.
                 isaac_node.latest_target_pose = None
+                (
+                    busbar_amr_pose,
+                    busbar_amr_position_error,
+                    busbar_amr_yaw_error,
+                ) = busbar_station_pose_error(robot, current_station)
                 # 공급대 전체를 한 시야에 넣으면 최고 confidence 후보가 다른
                 # station으로 바뀔 수 있다. 단일 논리 카메라를 현재 station의 실제
                 # busbar prim 위 고정 시점으로 전환해 후보를 하나로 제한한다.
                 asset = busbar_assets.get(current_station)
-                if asset is None:
+                if (
+                    last_arrived_busbar_station != current_station
+                    or busbar_amr_position_error > AMR_POS_TOL
+                    or busbar_amr_yaw_error > AMR_YAW_TOL
+                ):
+                    print(
+                        f"\n[ERROR] [{task}] AMR이 station "
+                        f"{current_station} 버스바 정차점에 없습니다 | "
+                        f"pose=({busbar_amr_pose.x:.4f},"
+                        f"{busbar_amr_pose.y:.4f},"
+                        f"{busbar_amr_pose.yaw:.4f}) | "
+                        f"position error="
+                        f"{busbar_amr_position_error * 1000:.1f}mm, "
+                        f"yaw error="
+                        f"{math.degrees(busbar_amr_yaw_error):.1f}deg, "
+                        "last arrived busbar station="
+                        f"{last_arrived_busbar_station}"
+                    )
+                    publish_status(
+                        "FAILURE:AMR_NOT_AT_BUSBAR_STATION"
+                    )
+                    hold_current_arm_pose()
+                    phase = "IDLE"
+                    step_count = 0
+                elif asset is None:
                     print(
                         f"\n[ERROR] [{task}] 스테이션 {current_station} "
                         "버스바 prim 매핑이 없습니다."
                     )
                     publish_status("FAILURE:BUSBAR_CAMERA_TARGET_NOT_FOUND")
                 else:
+                    arm_controller.reset()
+                    sync_rmpflow_base_pose()
                     (
                         busbar_camera_position,
                         busbar_camera_orientation,
@@ -2440,21 +3219,27 @@ def main():
                     phase = "IDLE"
                     step_count = 0
                 else:
-                    if current_station in STATION_BUSBAR_SCAN_XY:
-                        scan_xy = STATION_BUSBAR_SCAN_XY[current_station]
-                        BUSBAR_SCAN_POS = np.array(
-                            [scan_xy[0], scan_xy[1], BUSBAR_SCAN_Z],
-                            dtype=float,
+                    arm_controller.reset()
+                    sync_rmpflow_base_pose()
+                    asset = busbar_assets.get(current_station)
+                    if asset is None:
+                        print(
+                            f"\n[ERROR] [{task}] 스테이션 "
+                            f"{current_station} 버스바 prim 매핑이 없습니다."
                         )
-                    else:
-                        cur_pos = world_xf(
-                            stage,
-                            f"{M0609_PATH}/{EE_LINK_NAME}",
-                        ).ExtractTranslation()
-                        BUSBAR_SCAN_POS = np.array(
-                            [cur_pos[0] - 0.5, cur_pos[1] + 0.5, BUSBAR_SCAN_Z],
-                            dtype=float,
+                        publish_status(
+                            "FAILURE:BUSBAR_SCAN_TARGET_NOT_FOUND"
                         )
+                        hold_current_arm_pose()
+                        phase = "IDLE"
+                        step_count = 0
+                        continue
+
+                    mesh_center, _ = asset["xform"].get_world_pose()
+                    BUSBAR_SCAN_POS = busbar_wrist_scan_target(
+                        mesh_center,
+                        scan_z=BUSBAR_SCAN_Z,
+                    )
                     cur_pos = world_xf(
                         stage,
                         f"{M0609_PATH}/{EE_LINK_NAME}",
@@ -2467,11 +3252,46 @@ def main():
                     step_count = 0
                     print(
                         "\n>>> [SCAN_BUSBAR] fixed pose latch 확인 -> "
-                        "최신 station별 wrist scan 자세 이동 시작"
+                        "선택 Mesh 기준 가림 회피 wrist scan 자세 이동 시작 "
+                        f"(Target: X={BUSBAR_SCAN_POS[0]:.3f}, "
+                        f"Y={BUSBAR_SCAN_POS[1]:.3f}, "
+                        f"Z={BUSBAR_SCAN_POS[2]:.3f})"
                     )
 
             elif task == "PICK_BUSBAR":
-                if isaac_node.latest_target_pose is not None:
+                (
+                    busbar_amr_pose,
+                    busbar_amr_position_error,
+                    busbar_amr_yaw_error,
+                ) = busbar_station_pose_error(robot, current_station)
+                if (
+                    last_arrived_busbar_station != current_station
+                    or busbar_amr_position_error > AMR_POS_TOL
+                    or busbar_amr_yaw_error > AMR_YAW_TOL
+                ):
+                    print(
+                        f"\n[ERROR] [{task}] AMR이 station "
+                        f"{current_station} 버스바 정차점에 없습니다 | "
+                        f"pose=({busbar_amr_pose.x:.4f},"
+                        f"{busbar_amr_pose.y:.4f},"
+                        f"{busbar_amr_pose.yaw:.4f}) | "
+                        f"position error="
+                        f"{busbar_amr_position_error * 1000:.1f}mm, "
+                        f"yaw error="
+                        f"{math.degrees(busbar_amr_yaw_error):.1f}deg, "
+                        "last arrived busbar station="
+                        f"{last_arrived_busbar_station}"
+                    )
+                    publish_status(
+                        "FAILURE:AMR_NOT_AT_BUSBAR_STATION"
+                    )
+                    hold_current_arm_pose()
+                    isaac_node.latest_target_pose = None
+                    phase = "IDLE"
+                    step_count = 0
+                elif isaac_node.latest_target_pose is not None:
+                    arm_controller.reset()
+                    sync_rmpflow_base_pose()
                     target_pose = isaac_node.latest_target_pose
                     isaac_node.latest_target_pose = None
                     target = target_pose.pose.position
@@ -2539,19 +3359,23 @@ def main():
 
             elif task == "FINE_ALIGNMENT":
                 print(f"\n>>> [{task}] 비전 정밀 오차 보정 준비")
+                isaac_node.alignment_success = False
+                isaac_node.expected_fine_alignment_generation = None
                 bolt_paths = STATION_BOLT_PRIM_PATHS.get(current_station)
-                if bolt_paths is None or not stage.GetPrimAtPath(
-                    bolt_paths[1]
-                ).IsValid():
+                if bolt_paths is None or any(
+                    not stage.GetPrimAtPath(path).IsValid()
+                    for path in bolt_paths
+                ):
                     print(
                         f"[ERROR] [{task}] station {current_station} "
                         "오차보정 기준 bolt prim이 없습니다."
                     )
                     publish_status("FAILURE:ERRORFIX_BOLT_NOT_FOUND")
                 else:
-                    # error_fix 역시 station의 bolt_2 XY와 기존 Z·자세를 사용한다.
+                    # error_fix는 중앙의 단일 기준 bolt를 추적하므로 FINE_ALIGNMENT
+                    # 동안에는 station bolt_2 XY와 기존 Z·자세를 사용한다.
                     bolt_camera_position, bolt_camera_orientation = (
-                        bolt_camera_pose_for_asset(
+                        bolt_camera_pose_for_target(
                             stage,
                             bolt_paths[1],
                             bolt_camera_init_pos,
@@ -2570,15 +3394,24 @@ def main():
                     reset_cmd.data = "RESET_BOLT_DETECTION"
                     isaac_node.pub_errorfix_command.publish(reset_cmd)
                     start_cmd = String()
-                    start_cmd.data = "START_ERRORFIX_CORRECTION"
+                    fine_alignment_generation += 1
+                    start_cmd.data = (
+                        "START_ERRORFIX_CORRECTION:"
+                        f"{fine_alignment_generation}"
+                    )
+                    isaac_node.expected_fine_alignment_generation = (
+                        fine_alignment_generation
+                    )
+                    # MOVE_BATTERY_CENTER에서 사용한 absolute /target_pose를
+                    # fine-alignment delta로 재해석하지 않는다.
+                    isaac_node.latest_target_pose = None
+                    isaac_node.latest_fine_alignment_delta = None
                     isaac_node.pub_errorfix_command.publish(start_cmd)
 
                     print(
-                        " -> station 기준 bolt_2 고정캠 이동/reset 및 "
+                        " -> station bolt_2 기준 고정캠 이동/reset 및 "
                         "START_ERRORFIX_CORRECTION 전송"
                     )
-
-                    isaac_node.alignment_success = False
 
                     cur_ee = world_xf(
                         stage,
@@ -2589,6 +3422,14 @@ def main():
                         cur_ee[1],
                         BATTERY_CENTER_Z,
                     ])
+                    target_fine_yaw_rad = 0.0
+                    fine_step_gate.reset()
+                    fine_controller_lead.reset()
+                    fine_step_previous_ee_pos = None
+                    fine_step_previous_ee_orientation = None
+                    fine_step_start_ee_pos = None
+                    fine_step_command_delta_xy = None
+                    fine_step_start_orientation_error_rad = None
                     phase = "FINE_ALIGNMENT"
                     step_count = 0
 
@@ -2629,6 +3470,7 @@ def main():
                         # 시켜서 회전과 이동을 분리한다.
                         cur_pos = world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation()
                         NUT_SCAN_LIFT_POS = np.array([cur_pos[0], cur_pos[1], NUT_SCAN_Z])
+                        nut_pose_settle_count = 0
                         phase = "NUT_SCAN_LIFT"
                         step_count = 0
                         print(f"\n>>> [{task}] 1) 방향 정렬 및 스캔 고도 상승 시작 (Target: X={NUT_SCAN_LIFT_POS[0]:.3f}, Y={NUT_SCAN_LIFT_POS[1]:.3f}, Z={NUT_SCAN_LIFT_POS[2]:.3f})")
@@ -2639,24 +3481,36 @@ def main():
             elif task in ("PICK_NUT1", "PICK_NUT2"):
                 nut_slot = 1 if task == "PICK_NUT1" else 2
                 nut_index = STATION_NUT_INDICES.get(current_station, (1, 2))[nut_slot - 1]
+                nut_peg_clear_start_pos = None
+                nut_peg_clear_start_nut_z = None
+                nut_peg_clear_xy_lead = np.zeros(2, dtype=float)
+                nut_peg_clear_z_lead = 0.0
+                nut_peg_clear_hold = 0
                 if HOME_EE_POS is not None:
-                    # battery4_main 방식: 실제 파지를 시작할 때 대상 너트만 AMR glue에서
-                    # 해제하고 물리/콜리전을 활성화한다.
                     nut_array_index = nut_index - 1
-                    nut_released[nut_array_index] = True
-                    remove_nut_amr_joint(stage, nut_roots_all[nut_array_index])
-                    enable_physics_recursively(stage, nut_roots_all[nut_array_index])
-
-                    # glue 해제 직전의 실측 위치를 그대로 파지 XY로 사용한다.
+                    # 접근·하강 중에는 원래 tray glue와 physics-disabled 상태를
+                    # 그대로 유지한다. 손가락이 완전히 닫힌 뒤에만 NUT_GRASP가
+                    # 대상 하나를 dynamics로 넘긴다.
                     nut_xf, nut_label = resolve_nut_assets(nut_index, nut1_xform, nut2_xform, extra_nut_xforms)
                     if nut_xf is None:
                         print(f"\n[ERROR] [{task}] 너트 {nut_index}번 Xform을 찾을 수 없습니다.")
                         publish_status("FAILURE:NUT_XFORM_NOT_FOUND")
+                    elif nut_released[nut_array_index]:
+                        print(
+                            f"\n[ERROR] [{task}] 너트 {nut_index}번은 이미 "
+                            "tray glue에서 해제된 상태입니다"
+                        )
+                        publish_status("FAILURE:NUT_ALREADY_RELEASED")
                     else:
                         nut_live_pos, _ = nut_xf.get_world_pose()
                         pick_x, pick_y = float(nut_live_pos[0]), float(nut_live_pos[1])
                         nut_pick_pos = np.array([pick_x, pick_y, NUT_PICK_Z])
                         nut_approach_pos = np.array([pick_x, pick_y, NUT_APPROACH_Z])
+                        nut_pick_active_array_index = nut_array_index
+                        nut_ee_reference_offset = None
+                        nut_ee_previous_offset = None
+                        nut_lift_command_z = None
+                        nut_release_timer = 0
                         phase = "NUT_APPROACH"
                         step_count = 0
                         print(f"\n>>> [{task}] 너트 {nut_index}번 상공 접근 시작 (Target: X={nut_approach_pos[0]:.3f}, Y={nut_approach_pos[1]:.3f})")
@@ -2669,11 +3523,23 @@ def main():
                 nut_index = STATION_NUT_INDICES.get(current_station, (1, 2))[nut_slot - 1]
                 bolt_world_xy = STATION_BOLT_WORLD_POS.get(current_station, STATION_BOLT_WORLD_POS[3])[nut_slot]
                 bolt_target_pos = np.array([bolt_world_xy[0], bolt_world_xy[1], 0.0])
+                bolt_travel_pos = np.array([
+                    bolt_target_pos[0],
+                    bolt_target_pos[1],
+                    NUT_APPROACH_Z,
+                ])
+                bolt_approach_pos = np.array([
+                    bolt_target_pos[0],
+                    bolt_target_pos[1],
+                    BOLT_APPROACH_Z,
+                ])
                 bolt_touch_pos = np.array([bolt_target_pos[0], bolt_target_pos[1], 0.3697])
+                nut_xy_lead = np.zeros(2, dtype=float)
                 phase = "MOVE_TO_BOLT_NUT"
                 step_count = 0
                 print(f"\n>>> [{task}] 너트 {nut_index}번(스테이션{current_station} 슬롯{nut_slot}) -> 볼트 {nut_slot}번 체결 시작 "
-                      f"(Target: X={bolt_target_pos[0]:.4f}, Y={bolt_target_pos[1]:.4f})")
+                      f"(Target: X={bolt_target_pos[0]:.4f}, Y={bolt_target_pos[1]:.4f}) "
+                      f"| 먼저 Z={NUT_APPROACH_Z:.3f}m에서 수평 이동")
 
         # 3. FSM 제어 루프
         if playing and phase != "IDLE" and phase != "DONE":
@@ -3018,39 +3884,388 @@ def main():
             elif phase == "FINE_ALIGNMENT":
                 publish_progress("FINE_ALIGNMENT_TRACKING", 85.0)
 
-                cur_ee_pos = world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation()
-
-                if isaac_node.latest_target_pose is not None:
-                    offset = isaac_node.latest_target_pose.pose.position
-                    if abs(offset.x) <= 0.0025 and abs(offset.y) <= 0.0025:             
-                        target_fine_pos[0] += offset.x
-                        target_fine_pos[1] += offset.y
-                        target_fine_pos[2] = BATTERY_CENTER_Z
-                        
-                        print(f"\n[FINE_ALIGNMENT] Vision Offset Received -> dx: {offset.x:+.4f}m, dy: {offset.y:+.4f}m")
-                        print(f"               └─ New Target Pos -> X: {target_fine_pos[0]:.4f}, Y: {target_fine_pos[1]:.4f}, Z: {target_fine_pos[2]:.4f}")
-
-                    isaac_node.latest_target_pose = None
-
-                sys.stdout.write(
-                    f"\r\033[K[FINE_ALIGNMENT Loop] Cur EE: ({cur_ee_pos[0]:.4f}, {cur_ee_pos[1]:.4f}) "
-                    f"-> Target: ({target_fine_pos[0]:.4f}, {target_fine_pos[1]:.4f})"
+                ee_path = f"{M0609_PATH}/{EE_LINK_NAME}"
+                cur_ee_pos, cur_ee_orientation = _world_pose_for_path(
+                    stage,
+                    ee_path,
                 )
-                sys.stdout.flush()
+                fine_step_started_this_tick = False
 
-                actions = arm_controller.forward(
-                    target_end_effector_position=target_fine_pos,
-                    target_end_effector_orientation=euler_to_quaternion_wxyz(0.0, 3.1415, 0.0)
+                correction_msg = (
+                    isaac_node.latest_fine_alignment_delta
                 )
-                robot.apply_action(actions)
+                if correction_msg is not None:
+                    isaac_node.latest_fine_alignment_delta = None
+                    if fine_step_gate.active_stamp_ns is not None:
+                        print(
+                            "\n[WARN] 이전 FINE_ALIGNMENT delta가 실제 "
+                            "settle되기 전에 온 추가 delta를 폐기합니다"
+                        )
+                    else:
+                        correction = correction_msg.pose
+                        offset = correction.position
+                        try:
+                            expected_frame_id = (
+                                f"{FINE_ALIGNMENT_DELTA_FRAME}:"
+                                f"{fine_alignment_generation}"
+                            )
+                            if (
+                                correction_msg.header.frame_id
+                                != expected_frame_id
+                            ):
+                                raise LookupError(
+                                    "stale fine-alignment generation"
+                                )
+                            stamp_ns = pose_stamp_ns(correction_msg)
+                            offset_values = (
+                                float(offset.x),
+                                float(offset.y),
+                                float(offset.z),
+                            )
+                            if not all(
+                                math.isfinite(value)
+                                for value in offset_values
+                            ):
+                                raise ValueError(
+                                    "delta position에 NaN 또는 inf가 있습니다"
+                                )
+                            if (
+                                abs(offset.x) > 0.0025
+                                or abs(offset.y) > 0.0025
+                                or abs(offset.z) > 1.0e-9
+                            ):
+                                raise ValueError(
+                                    "delta position이 safety bound를 "
+                                    "벗어났습니다"
+                                )
+                            yaw_delta = planar_yaw_delta(
+                                quaternion_x=correction.orientation.x,
+                                quaternion_y=correction.orientation.y,
+                                quaternion_z=correction.orientation.z,
+                                quaternion_w=correction.orientation.w,
+                            )
+                        except LookupError as exc:
+                            print(
+                                "\n[WARN] 현재 task와 다른 "
+                                f"FINE_ALIGNMENT delta 폐기: {exc}"
+                            )
+                        except (TypeError, ValueError) as exc:
+                            print(
+                                "\n[ERROR] 잘못된 FINE_ALIGNMENT delta를 "
+                                f"거부합니다: {exc}"
+                            )
+                            hold_current_arm_pose()
+                            publish_status(
+                                "FAILURE:INVALID_FINE_ALIGNMENT_DELTA"
+                            )
+                            reset_cmd = String()
+                            reset_cmd.data = "RESET_BOLT_DETECTION"
+                            isaac_node.pub_errorfix_command.publish(
+                                reset_cmd
+                            )
+                            fine_step_gate.reset()
+                            fine_controller_lead.reset()
+                            fine_step_previous_ee_pos = None
+                            fine_step_previous_ee_orientation = None
+                            fine_step_start_ee_pos = None
+                            fine_step_command_delta_xy = None
+                            fine_step_start_orientation_error_rad = None
+                            isaac_node.expected_fine_alignment_generation = (
+                                None
+                            )
+                            phase = "IDLE"
+                        else:
+                            delta_xy = np.array(
+                                [offset.x, offset.y],
+                                dtype=float,
+                            )
+                            delta_xy_norm = float(
+                                np.linalg.norm(delta_xy)
+                            )
+                            target_fine_pos[0] += offset.x
+                            target_fine_pos[1] += offset.y
+                            target_fine_pos[2] = BATTERY_CENTER_Z
+                            target_fine_yaw_rad += yaw_delta
+                            target_fine_yaw_rad = (
+                                target_fine_yaw_rad + math.pi
+                            ) % (2.0 * math.pi) - math.pi
+                            step_target_orientation = (
+                                euler_to_quaternion_wxyz(
+                                    0.0,
+                                    3.1415,
+                                    target_fine_yaw_rad,
+                                )
+                            )
+                            fine_step_gate.begin(
+                                stamp_ns,
+                                required_position_response_m=(
+                                    delta_xy_norm
+                                    * FINE_STEP_MIN_RESPONSE_RATIO
+                                ),
+                                required_orientation_response_rad=(
+                                    abs(yaw_delta)
+                                    * FINE_STEP_MIN_RESPONSE_RATIO
+                                ),
+                            )
+                            fine_controller_lead.reset()
+                            fine_controller_lead.begin(
+                                delta_xy[0],
+                                delta_xy[1],
+                            )
+                            fine_step_previous_ee_pos = (
+                                cur_ee_pos.copy()
+                            )
+                            fine_step_previous_ee_orientation = (
+                                cur_ee_orientation.copy()
+                            )
+                            fine_step_start_ee_pos = cur_ee_pos.copy()
+                            fine_step_command_delta_xy = delta_xy.copy()
+                            fine_step_start_orientation_error_rad = (
+                                _quat_angular_error(
+                                    cur_ee_orientation,
+                                    step_target_orientation,
+                                )
+                            )
+                            fine_step_started_this_tick = True
 
-                robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_CLOSE))
+                            print(
+                                "\n[FINE_ALIGNMENT] consensus delta 수신 "
+                                f"-> dx={offset.x:+.4f}m, "
+                                f"dy={offset.y:+.4f}m, "
+                                f"dyaw={math.degrees(yaw_delta):+.3f}deg, "
+                                f"stamp={stamp_ns}"
+                            )
+                            print(
+                                "               └─ New Target "
+                                f"X={target_fine_pos[0]:.4f}, "
+                                f"Y={target_fine_pos[1]:.4f}, "
+                                f"Z={target_fine_pos[2]:.4f}, "
+                                "yaw="
+                                f"{math.degrees(target_fine_yaw_rad):+.3f}deg"
+                            )
+                            print(
+                                "               └─ Controller-only XY lead "
+                                f"armed: +{FINE_CONTROLLER_LEAD_GROWTH_M * 1000:.2f}"
+                                "mm/tick, "
+                                f"cap={FINE_CONTROLLER_MAX_LEAD_M * 1000:.2f}mm; "
+                                "logical target/Z/yaw unchanged until settle"
+                            )
 
-                if isaac_node.alignment_success:
-                    print("\n\n★ [FINE_ALIGNMENT SUCCESS] 미세 오차 보정 성공 및 정렬 완료!")
-                    publish_progress("FINE_ALIGNMENT_COMPLETE", 100.0)
-                    publish_status("SUCCESS")
-                    phase = "IDLE"
+                if phase == "FINE_ALIGNMENT":
+                    target_fine_orientation = (
+                        euler_to_quaternion_wxyz(
+                            0.0,
+                            3.1415,
+                            target_fine_yaw_rad,
+                        )
+                    )
+                    position_response_m = 0.0
+                    required_position_response_m = 0.0
+                    if fine_step_gate.active_stamp_ns is not None:
+                        required_position_response_m = (
+                            fine_step_gate.required_position_response_m
+                        )
+                        if (
+                            fine_step_start_ee_pos is not None
+                            and fine_step_command_delta_xy is not None
+                        ):
+                            position_response_m = (
+                                planar_command_response(
+                                    start_x=fine_step_start_ee_pos[0],
+                                    start_y=fine_step_start_ee_pos[1],
+                                    current_x=cur_ee_pos[0],
+                                    current_y=cur_ee_pos[1],
+                                    command_x=fine_step_command_delta_xy[0],
+                                    command_y=fine_step_command_delta_xy[1],
+                                )
+                            )
+
+                    lead_status = fine_controller_lead.advance(
+                        observed_response_m=position_response_m,
+                        required_response_m=(
+                            required_position_response_m
+                        ),
+                    )
+                    controller_x, controller_y = (
+                        fine_controller_lead.command_xy(
+                            target_fine_pos[0],
+                            target_fine_pos[1],
+                        )
+                    )
+                    fine_controller_target_pos = target_fine_pos.copy()
+                    fine_controller_target_pos[0] = controller_x
+                    fine_controller_target_pos[1] = controller_y
+                    if lead_status.grew and lead_status.saturated:
+                        print(
+                            "\n[WARN] FINE controller XY lead가 안전 "
+                            f"상한 {FINE_CONTROLLER_MAX_LEAD_M * 1000:.2f}mm"
+                            "에 도달했습니다; 실제 80% 응답 전에는 ACK하지 "
+                            "않습니다"
+                        )
+
+                    sys.stdout.write(
+                        "\r\033[K[FINE_ALIGNMENT Loop] "
+                        f"Cur EE=({cur_ee_pos[0]:.4f}, "
+                        f"{cur_ee_pos[1]:.4f}) -> "
+                        f"Logical=({target_fine_pos[0]:.4f}, "
+                        f"{target_fine_pos[1]:.4f}), "
+                        f"Controller=({fine_controller_target_pos[0]:.4f}, "
+                        f"{fine_controller_target_pos[1]:.4f}), "
+                        "response="
+                        f"{position_response_m * 1000:.3f}/"
+                        f"{required_position_response_m * 1000:.3f}mm, "
+                        f"lead={lead_status.magnitude_m * 1000:.2f}/"
+                        f"{FINE_CONTROLLER_MAX_LEAD_M * 1000:.2f}mm, "
+                        f"saturated={lead_status.saturated}, "
+                        "pending="
+                        f"{fine_step_gate.active_stamp_ns is not None}"
+                    )
+                    sys.stdout.flush()
+                    if (
+                        fine_step_gate.active_stamp_ns is not None
+                        and step_count % 60 == 0
+                    ):
+                        print(
+                            "\n[FINE_ALIGNMENT RESPONSE] actual="
+                            f"{position_response_m * 1000:.3f}mm, "
+                            "required="
+                            f"{required_position_response_m * 1000:.3f}mm, "
+                            f"lead={lead_status.magnitude_m * 1000:.3f}mm/"
+                            f"{FINE_CONTROLLER_MAX_LEAD_M * 1000:.3f}mm, "
+                            f"saturated={lead_status.saturated}"
+                        )
+
+                    actions = arm_controller.forward(
+                        target_end_effector_position=(
+                            fine_controller_target_pos
+                        ),
+                        target_end_effector_orientation=(
+                            target_fine_orientation
+                        ),
+                    )
+                    robot.apply_action(actions)
+                    robot.gripper.apply_action(
+                        ArticulationAction(
+                            joint_positions=GRIPPER_CLOSE
+                        )
+                    )
+
+                    if (
+                        fine_step_gate.active_stamp_ns is not None
+                        and not fine_step_started_this_tick
+                    ):
+                        previous_position = (
+                            fine_step_previous_ee_pos
+                            if fine_step_previous_ee_pos is not None
+                            else cur_ee_pos
+                        )
+                        previous_orientation = (
+                            fine_step_previous_ee_orientation
+                            if fine_step_previous_ee_orientation is not None
+                            else cur_ee_orientation
+                        )
+                        position_error_m = math.dist(
+                            cur_ee_pos,
+                            target_fine_pos,
+                        )
+                        orientation_error_rad = _quat_angular_error(
+                            cur_ee_orientation,
+                            target_fine_orientation,
+                        )
+                        orientation_response_rad = max(
+                            0.0,
+                            (
+                                fine_step_start_orientation_error_rad
+                                - orientation_error_rad
+                            )
+                            if (
+                                fine_step_start_orientation_error_rad
+                                is not None
+                            )
+                            else 0.0,
+                        )
+                        orientation_motion_rad = (
+                            _quat_angular_error(
+                                cur_ee_orientation,
+                                previous_orientation,
+                            )
+                        )
+                        settle_status = fine_step_gate.update(
+                            position_error_m=position_error_m,
+                            orientation_error_rad=orientation_error_rad,
+                            motion_m=math.dist(
+                                cur_ee_pos,
+                                previous_position,
+                            ),
+                            orientation_motion_rad=(
+                                orientation_motion_rad
+                            ),
+                            position_response_m=position_response_m,
+                            orientation_response_rad=(
+                                orientation_response_rad
+                            ),
+                        )
+                        fine_step_previous_ee_pos = cur_ee_pos.copy()
+                        fine_step_previous_ee_orientation = (
+                            cur_ee_orientation.copy()
+                        )
+                        if settle_status.settled:
+                            committed_lead = fine_controller_lead.status()
+                            committed_x, committed_y = (
+                                fine_controller_lead.commit_xy(
+                                    target_fine_pos[0],
+                                    target_fine_pos[1],
+                                )
+                            )
+                            target_fine_pos[0] = committed_x
+                            target_fine_pos[1] = committed_y
+                            settled_msg = String()
+                            settled_msg.data = (
+                                "FINE_ALIGNMENT_STEP_SETTLED:"
+                                f"{settle_status.stamp_ns}"
+                            )
+                            isaac_node.pub_errorfix_command.publish(
+                                settled_msg
+                            )
+                            fine_step_previous_ee_pos = None
+                            fine_step_previous_ee_orientation = None
+                            fine_step_start_ee_pos = None
+                            fine_step_command_delta_xy = None
+                            fine_step_start_orientation_error_rad = None
+                            print(
+                                "\n[FINE_ALIGNMENT] 실제 EE pose/정지 "
+                                f"{FINE_STEP_SETTLE_STEPS}틱 확인 -> "
+                                "post-motion 3-frame 측정 재개 "
+                                f"(stamp={settle_status.stamp_ns}, "
+                                "response="
+                                f"{position_response_m * 1000:.3f}/"
+                                f"{required_position_response_m * 1000:.3f}"
+                                "mm, committed lead="
+                                f"{committed_lead.magnitude_m * 1000:.3f}mm)"
+                            )
+
+                    if (
+                        isaac_node.alignment_success
+                        and fine_step_gate.active_stamp_ns is None
+                    ):
+                        print(
+                            "\n\n★ [FINE_ALIGNMENT SUCCESS] 미세 오차 "
+                            "보정 성공 및 정렬 완료!"
+                        )
+                        publish_progress(
+                            "FINE_ALIGNMENT_COMPLETE",
+                            100.0,
+                        )
+                        publish_status("SUCCESS")
+                        fine_step_gate.reset()
+                        fine_controller_lead.reset()
+                        fine_step_previous_ee_pos = None
+                        fine_step_previous_ee_orientation = None
+                        fine_step_start_ee_pos = None
+                        fine_step_command_delta_xy = None
+                        fine_step_start_orientation_error_rad = None
+                        isaac_node.expected_fine_alignment_generation = None
+                        phase = "IDLE"
 
             # [8단계] 버스바 수직 하강 체결
             elif phase == "BUSBAR_DESCEND_TO_BOLT":
@@ -3061,7 +4276,13 @@ def main():
 
                 actions = arm_controller.forward(
                     target_end_effector_position=step_target_pos,
-                    target_end_effector_orientation=euler_to_quaternion_wxyz(0.0, 3.1415, 0.0)
+                    target_end_effector_orientation=(
+                        euler_to_quaternion_wxyz(
+                            0.0,
+                            3.1415,
+                            target_fine_yaw_rad,
+                        )
+                    ),
                 )
                 robot.apply_action(actions)
                 robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_CLOSE))
@@ -3092,7 +4313,13 @@ def main():
                 retract_pos = np.array([target_mid_pos[0], target_mid_pos[1], BATTERY_CENTER_Z])
                 actions = arm_controller.forward(
                     target_end_effector_position=retract_pos,
-                    target_end_effector_orientation=euler_to_quaternion_wxyz(0.0, 3.1415, 0.0)
+                    target_end_effector_orientation=(
+                        euler_to_quaternion_wxyz(
+                            0.0,
+                            3.1415,
+                            target_fine_yaw_rad,
+                        )
+                    ),
                 )
                 robot.apply_action(actions)
                 robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_OPEN))
@@ -3113,12 +4340,43 @@ def main():
             elif phase == "NUT_SCAN_LIFT":
                 publish_progress("NUT_SCAN_LIFT", 30.0)
                 cur_pos = world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation()
+                _, cur_quat = robot.end_effector.get_world_pose()
                 actions = arm_controller.forward(target_end_effector_position=NUT_SCAN_LIFT_POS, target_end_effector_orientation=quat_nut)
                 robot.apply_action(actions)
                 robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_OPEN))
 
-                err = math.dist(cur_pos, tuple(NUT_SCAN_LIFT_POS))
-                if err < 0.02 or step_count > MAX_STUCK_STEPS:
+                position_err = math.dist(
+                    cur_pos,
+                    tuple(NUT_SCAN_LIFT_POS),
+                )
+                orientation_err = _quat_angular_error(
+                    cur_quat,
+                    quat_nut,
+                )
+                nut_pose_settle_count, pose_settled = (
+                    consecutive_pose_settle(
+                        position_err,
+                        orientation_err,
+                        nut_pose_settle_count,
+                        position_tolerance_m=NUT_POSE_POSITION_TOL_M,
+                        orientation_tolerance_rad=(
+                            NUT_POSE_ORIENTATION_TOL_RAD
+                        ),
+                        required_steps=NUT_POSE_SETTLE_STEPS,
+                    )
+                )
+
+                if step_count % 30 == 0:
+                    print(
+                        "[NUT_SCAN_LIFT] "
+                        f"position_err={position_err * 1000:.1f}mm, "
+                        f"orientation_err="
+                        f"{math.degrees(orientation_err):.2f}deg, "
+                        f"stable={nut_pose_settle_count}/"
+                        f"{NUT_POSE_SETTLE_STEPS}"
+                    )
+
+                if pose_settled:
                     print(f"[OK] 방향 정렬 및 고도 상승 완료 -> 너트 스캔 위치로 수평 이동")
                     phase = "NUT_SCAN_APPROACH"
                     step_count = 0
@@ -3180,6 +4438,10 @@ def main():
                     # 성공했던 66f1825 방식: 너트를 AMR에 고정해 둔 채 손가락부터
                     # 닫는다. 열린 상태에서 조인트를 먼저 풀면 너트가 움직여 파지
                     # 중심에서 벗어날 수 있다.
+                    enable_collision_recursively(
+                        stage,
+                        nut_roots_all[nut_pick_active_array_index],
+                    )
                     print(f"[OK] {nut_label} 하강 완료! -> 물리 파지(Gripper Close) 시작")
                     phase = "NUT_GRASP"
                     grasp_timer = 0
@@ -3196,89 +4458,529 @@ def main():
                 robot.gripper.apply_action(ArticulationAction(joint_positions=grip_target))
 
                 if grasp_timer >= GRIP_CLOSE_RAMP_STEPS:
-                    nut_label = resolve_nut_assets(nut_index, nut1_xform, nut2_xform)[1]
-                    # 바로 다음 태스크로 넘기지 않고, 현재 XY를 고정한 채 peg 길이보다
-                    # 충분히 위로 먼저 수직 이탈한다. 이 구간에서도 그리퍼는 계속 닫는다.
+                    nut_xf_cur, nut_label = resolve_nut_assets(
+                        nut_index,
+                        nut1_xform,
+                        nut2_xform,
+                        extra_nut_xforms,
+                    )
                     ee_grasp_pos = np.asarray(
                         world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation(),
                         dtype=float,
                     )
-                    clear_z = min(NUT_APPROACH_Z, ee_grasp_pos[2] + NUT_PEG_CLEARANCE_Z)
-                    nut_peg_clear_pos = np.array([ee_grasp_pos[0], ee_grasp_pos[1], clear_z])
-                    nut_peg_clear_hold = 0
-                    print(f"[OK] {nut_label} 물리 파지 완료! -> XY 고정 수직 이탈 "
-                          f"{NUT_PEG_CLEARANCE_Z*1000:.0f}mm 시작 (Target Z={clear_z:.4f})")
-                    phase = "NUT_LIFT_CLEAR_PEG"
-                    step_count = 0
+                    clear_z = ee_grasp_pos[2] + NUT_PEG_CLEARANCE_Z
+                    command_clear_z = (
+                        clear_z + NUT_PEG_CLEAR_COMMAND_MARGIN_M
+                    )
+                    if nut_xf_cur is None:
+                        print(
+                            f"[ERROR] {nut_label} 실제 Xform이 없어 "
+                            "peg 이탈을 검증할 수 없습니다"
+                        )
+                        restore_active_nut_to_tray_glue(
+                            "missing nut xform after close"
+                        )
+                        publish_status("FAILURE:NUT_XFORM_NOT_FOUND")
+                        phase = "IDLE"
+                    elif nut_pick_active_array_index != nut_index - 1:
+                        print(
+                            f"[ERROR] {nut_label} active PICK 상태가 "
+                            "현재 너트와 일치하지 않습니다"
+                        )
+                        restore_active_nut_to_tray_glue(
+                            "active nut mismatch"
+                        )
+                        publish_status("FAILURE:NUT_PICK_STATE_MISMATCH")
+                        phase = "IDLE"
+                    elif command_clear_z > NUT_APPROACH_Z:
+                        print(
+                            f"[ERROR] {nut_label} 80mm 이탈 command "
+                            f"Z={command_clear_z:.4f}가 안전 상공 "
+                            f"Z={NUT_APPROACH_Z:.4f}를 넘습니다"
+                        )
+                        restore_active_nut_to_tray_glue(
+                            "unsafe peg-clear target"
+                        )
+                        publish_status("FAILURE:NUT_PEG_CLEAR_TARGET_UNSAFE")
+                        phase = "IDLE"
+                    elif not nut_released[nut_pick_active_array_index]:
+                        # 손가락을 완전히 닫기 전에는 절대 tray glue를 풀지
+                        # 않는다. 이 시점부터만 dynamics/contact가 너트를
+                        # 소유하며 cancel/conflict는 원래 glue로 되돌린다.
+                        nut_start_pos, _ = nut_xf_cur.get_world_pose()
+                        nut_start_pos = np.asarray(
+                            nut_start_pos,
+                            dtype=float,
+                        )
+                        nut_ee_reference_offset = nut_from_ee_offset(
+                            ee_grasp_pos,
+                            nut_start_pos,
+                        )
+                        nut_ee_previous_offset = (
+                            nut_ee_reference_offset.copy()
+                        )
+                        remove_nut_amr_joint(
+                            stage,
+                            nut_roots_all[
+                                nut_pick_active_array_index
+                            ],
+                        )
+                        enable_physics_recursively(
+                            stage,
+                            nut_roots_all[
+                                nut_pick_active_array_index
+                            ],
+                        )
+                        nut_released[nut_pick_active_array_index] = True
+                        nut_release_timer = 0
+                        print(
+                            f"[NUT GRIP RELEASE] {nut_label} 닫힘 완료 "
+                            "후 tray glue 해제; EE-relative 결합 안정화 시작"
+                        )
+                    else:
+                        nut_start_pos, _ = nut_xf_cur.get_world_pose()
+                        nut_start_pos = np.asarray(
+                            nut_start_pos,
+                            dtype=float,
+                        )
+                        current_nut_from_ee = nut_from_ee_offset(
+                            ee_grasp_pos,
+                            nut_start_pos,
+                        )
+                        coupling_error = nut_ee_coupling_error(
+                            ee_grasp_pos,
+                            nut_start_pos,
+                            nut_ee_reference_offset,
+                        )
+                        settle_motion = float(np.linalg.norm(
+                            current_nut_from_ee
+                            - nut_ee_previous_offset
+                        ))
+                        if (
+                            coupling_error
+                            > NUT_EE_COUPLING_TOLERANCE_M
+                        ):
+                            print(
+                                f"[ERROR] {nut_label} tray glue 해제 후 "
+                                "EE-relative drift="
+                                f"{coupling_error*1000:.1f}mm"
+                            )
+                            restore_active_nut_to_tray_glue(
+                                "grip coupling lost during settle"
+                            )
+                            publish_status(
+                                "FAILURE:NUT_GRIP_COUPLING_LOST"
+                            )
+                            phase = "IDLE"
+                        else:
+                            # dynamics 전환 직후 nut가 닫힌 손가락 안에서
+                            # self-seat할 수 있다. 최초 release 기준 10mm
+                            # 안전 한계는 계속 지키되, 상대 위치가 실제로
+                            # 정지한 tick만 연속 안정화로 인정한다.
+                            if (
+                                settle_motion
+                                <= NUT_EE_SETTLE_MOTION_TOLERANCE_M
+                            ):
+                                nut_release_timer += 1
+                            else:
+                                nut_release_timer = 0
+                            nut_ee_previous_offset = (
+                                current_nut_from_ee.copy()
+                            )
+                            if nut_release_timer >= GRIP_SETTLE_STEPS:
+                                # release 순간의 preload 기준이 아니라,
+                                # dynamics에서 15틱 정지한 실제 결합 위치를
+                                # peg-clear/lift 운반 기준으로 latch한다.
+                                nut_ee_reference_offset = (
+                                    current_nut_from_ee.copy()
+                                )
+                                nut_ee_previous_offset = None
+                                # 바로 다음 태스크로 넘기지 않고, 현재 XY를
+                                # 고정한 채 peg 길이보다 충분히 위로 먼저
+                                # 수직 이탈한다.
+                                nut_peg_clear_pos = np.array([
+                                    ee_grasp_pos[0],
+                                    ee_grasp_pos[1],
+                                    clear_z,
+                                ])
+                                nut_peg_clear_start_pos = (
+                                    ee_grasp_pos.copy()
+                                )
+                                nut_peg_clear_start_nut_z = float(
+                                    nut_start_pos[2]
+                                )
+                                nut_lift_command_z = float(
+                                    ee_grasp_pos[2]
+                                )
+                                nut_peg_clear_xy_lead = np.zeros(
+                                    2,
+                                    dtype=float,
+                                )
+                                nut_peg_clear_z_lead = 0.0
+                                nut_peg_clear_hold = 0
+                                print(
+                                    f"[OK] {nut_label} 결합 "
+                                    f"{GRIP_SETTLE_STEPS}틱 검증 완료! -> "
+                                    "release drift="
+                                    f"{coupling_error*1000:.1f}mm, "
+                                    "settle motion="
+                                    f"{settle_motion*1000:.2f}mm; "
+                                    "XY 고정 수직 이탈 "
+                                    f"{NUT_PEG_CLEARANCE_Z*1000:.0f}mm "
+                                    "시작 "
+                                    f"(required Z={clear_z:.4f}, command "
+                                    f"goal Z={command_clear_z:.4f}, "
+                                    f"ramp={NUT_LIFT_COMMAND_MAX_STEP_M*1000:.1f}"
+                                    "mm/tick)"
+                                )
+                                phase = "NUT_LIFT_CLEAR_PEG"
+                                step_count = 0
 
             # [13.5단계] 공급대 peg에서 완전히 빠질 때까지 XY 고정 수직 상승
             elif phase == "NUT_LIFT_CLEAR_PEG":
                 publish_progress("NUT_LIFT_CLEAR_PEG", 75.0)
+                cur_pos = np.asarray(
+                    world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation(),
+                    dtype=float,
+                )
+
+                # 실제 80mm에 도달한 뒤 15틱을 세는 동안에는 그 순간의 lead를
+                # 고정한다. lead가 즉시 감쇠해 다시 80mm 아래로 내려가는 것을
+                # 방지하면서도 성공 판정은 command가 아닌 실제 변위로만 수행한다.
+                if nut_lift_command_z is None:
+                    nut_lift_command_z = float(cur_pos[2])
+                if nut_peg_clear_hold == 0:
+                    nut_peg_clear_command, nut_peg_clear_xy_lead = lead_xy_target(
+                        nut_peg_clear_pos,
+                        cur_pos,
+                        nut_peg_clear_xy_lead,
+                    )
+                    nut_peg_clear_tracking_pos = (
+                        nut_peg_clear_pos.copy()
+                    )
+                    nut_peg_clear_tracking_pos[2] += (
+                        NUT_PEG_CLEAR_COMMAND_MARGIN_M
+                    )
+                    z_command, nut_peg_clear_z_lead = lead_z_target(
+                        nut_peg_clear_tracking_pos,
+                        cur_pos,
+                        nut_peg_clear_z_lead,
+                    )
+                    nut_lift_command_z = rate_limited_z_target(
+                        z_command[2],
+                        nut_lift_command_z,
+                        max_step=NUT_LIFT_COMMAND_MAX_STEP_M,
+                    )
+                    nut_peg_clear_command[2] = nut_lift_command_z
+                else:
+                    nut_peg_clear_command = nut_peg_clear_pos.copy()
+                    nut_peg_clear_command[:2] += nut_peg_clear_xy_lead
+                    nut_peg_clear_command[2] = nut_lift_command_z
+
                 actions = arm_controller.forward(
-                    target_end_effector_position=nut_peg_clear_pos,
+                    target_end_effector_position=nut_peg_clear_command,
                     target_end_effector_orientation=quat_nut,
                 )
                 robot.apply_action(actions)
                 robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_CLOSE_NUT))
 
-                cur_pos = np.asarray(
-                    world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation(),
-                    dtype=float,
+                actual_lift = float(
+                    cur_pos[2] - nut_peg_clear_start_pos[2]
                 )
-                z_err = abs(cur_pos[2] - nut_peg_clear_pos[2])
-                xy_err = float(np.linalg.norm(cur_pos[:2] - nut_peg_clear_pos[:2]))
-
-                # 목표에 실제 도착한 상태가 연속으로 유지되어야 다음 단계로 넘어간다.
-                if z_err < NUT_PEG_CLEAR_TOLERANCE and xy_err < PICK_TOLERANCE_STRICT:
-                    nut_peg_clear_hold += 1
+                nut_xf_cur = resolve_nut_assets(
+                    nut_index,
+                    nut1_xform,
+                    nut2_xform,
+                    extra_nut_xforms,
+                )[0]
+                xy_err = float(np.linalg.norm(
+                    cur_pos[:2] - nut_peg_clear_start_pos[:2]
+                ))
+                if (
+                    nut_xf_cur is None
+                    or nut_ee_reference_offset is None
+                ):
+                    print(
+                        "[ERROR] peg 이탈 중 너트 Xform/EE 결합 "
+                        "기준이 없습니다"
+                    )
+                    restore_active_nut_to_tray_glue(
+                        "missing peg-clear coupling state"
+                    )
+                    publish_status(
+                        "FAILURE:NUT_GRIP_COUPLING_STATE_MISSING"
+                    )
+                    phase = "IDLE"
                 else:
-                    nut_peg_clear_hold = 0
+                    nut_now_pos, _ = nut_xf_cur.get_world_pose()
+                    nut_now_pos = np.asarray(
+                        nut_now_pos,
+                        dtype=float,
+                    )
+                    actual_nut_lift = float(
+                        nut_now_pos[2] - nut_peg_clear_start_nut_z
+                    )
+                    coupling_error = nut_ee_coupling_error(
+                        cur_pos,
+                        nut_now_pos,
+                        nut_ee_reference_offset,
+                    )
 
-                if nut_peg_clear_hold >= NUT_PEG_CLEAR_HOLD_STEPS:
-                    print(f"[OK] peg 수직 이탈 완료 (Z={cur_pos[2]:.4f}) -> "
-                          f"안전 상공({NUT_APPROACH_Z}m) 상승")
-                    phase = "NUT_LIFT"
-                    step_count = 0
+                    # 독립적인 EE Z와 nut Z 조건만으로는 같은 물체를
+                    # 운반했다는 증거가 아니다. 저장한 EE-relative offset
+                    # 역시 유지되어야만 hold tick을 센다.
+                    if (
+                        coupling_error
+                        > NUT_EE_COUPLING_TOLERANCE_M
+                    ):
+                        print(
+                            "[ERROR] peg 이탈 중 너트 결합 상실: "
+                            f"relative drift={coupling_error*1000:.1f}mm"
+                        )
+                        restore_active_nut_to_tray_glue(
+                            "coupling lost during peg clear"
+                        )
+                        publish_status(
+                            "FAILURE:NUT_GRIP_COUPLING_LOST"
+                        )
+                        phase = "IDLE"
+                    else:
+                        if (
+                            actual_lift >= NUT_PEG_CLEARANCE_Z
+                            and actual_nut_lift >= NUT_PEG_CLEARANCE_Z
+                            and xy_err < PICK_TOLERANCE_STRICT
+                        ):
+                            nut_peg_clear_hold += 1
+                        else:
+                            nut_peg_clear_hold = 0
+
+                        if step_count % 120 == 0:
+                            print(
+                                "[NUT_PEG_CLEAR] "
+                                f"ee_lift={actual_lift*1000:.1f}mm, "
+                                f"nut_lift={actual_nut_lift*1000:.1f}mm/"
+                                f"{NUT_PEG_CLEARANCE_Z*1000:.0f}mm "
+                                f"coupling_drift="
+                                f"{coupling_error*1000:.1f}mm "
+                                f"target_z={nut_peg_clear_pos[2]:.4f} "
+                                f"command_z={nut_peg_clear_command[2]:.4f} "
+                                f"xy_drift={xy_err*1000:.1f}mm "
+                                f"hold={nut_peg_clear_hold}/"
+                                f"{NUT_PEG_CLEAR_HOLD_STEPS}"
+                            )
+
+                        if nut_peg_clear_hold >= NUT_PEG_CLEAR_HOLD_STEPS:
+                            print(
+                                "[OK] peg 수직 이탈 완료 "
+                                f"(EE 상승={actual_lift*1000:.1f}mm, "
+                                "너트 상승="
+                                f"{actual_nut_lift*1000:.1f}mm, "
+                                "결합 drift="
+                                f"{coupling_error*1000:.1f}mm, "
+                                f"XY drift={xy_err*1000:.1f}mm) -> "
+                                f"안전 상공({NUT_APPROACH_Z}m) 상승"
+                            )
+                            nut_peg_clear_xy_lead = np.zeros(
+                                2,
+                                dtype=float,
+                            )
+                            nut_peg_clear_z_lead = 0.0
+                            phase = "NUT_LIFT"
+                            step_count = 0
 
             # [14단계] peg 이탈 완료 후 안전 상공 상승
             elif phase == "NUT_LIFT":
                 publish_progress("NUT_LIFTING", 80.0)
-                actions = arm_controller.forward(target_end_effector_position=nut_approach_pos, target_end_effector_orientation=quat_nut)
+                cur_pos = np.asarray(
+                    world_xf(
+                        stage,
+                        f"{M0609_PATH}/{EE_LINK_NAME}",
+                    ).ExtractTranslation(),
+                    dtype=float,
+                )
+                if nut_lift_command_z is None:
+                    nut_lift_command_z = float(cur_pos[2])
+                nut_lift_command_z = rate_limited_z_target(
+                    nut_approach_pos[2],
+                    nut_lift_command_z,
+                    max_step=NUT_LIFT_COMMAND_MAX_STEP_M,
+                )
+                nut_lift_command = nut_approach_pos.copy()
+                nut_lift_command[2] = nut_lift_command_z
+                actions = arm_controller.forward(
+                    target_end_effector_position=nut_lift_command,
+                    target_end_effector_orientation=quat_nut,
+                )
                 robot.apply_action(actions)
-                robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_CLOSE_NUT))
+                robot.gripper.apply_action(
+                    ArticulationAction(
+                        joint_positions=GRIPPER_CLOSE_NUT
+                    )
+                )
 
-                cur_pos = world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation()
                 current_err = math.dist(cur_pos, tuple(nut_approach_pos))
-
-                if current_err < PICK_TOLERANCE_STRICT or (current_err < PICK_TOLERANCE_LOOSE_VAL and step_count > MAX_STUCK_STEPS):
-                    nut_label = resolve_nut_assets(nut_index, nut1_xform, nut2_xform)[1]
-                    print(f"\n★ [PICK_{nut_label} SUCCESS] 너트 파지 및 상승 완수!")
-
-                    # [진단] 너트가 실제로 EE 근처까지 따라 올라왔는지 실측 위치로 확인
-                    nut_xf_cur = resolve_nut_assets(nut_index, nut1_xform, nut2_xform, extra_nut_xforms)[0]
-                    nut_now_pos, _ = nut_xf_cur.get_world_pose() if nut_xf_cur else (None, None)
-                    ee_now_pos = world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation()
-                    print(f"[진단] 너트 실측 위치={tuple(round(v,4) for v in nut_now_pos) if nut_now_pos is not None else None} "
-                          f"| EE 위치={tuple(round(v,4) for v in ee_now_pos)}")
-
-                    publish_progress("NUT_PICK_COMPLETE", 100.0)
-                    publish_status("SUCCESS")
+                nut_xf_cur, nut_label = resolve_nut_assets(
+                    nut_index,
+                    nut1_xform,
+                    nut2_xform,
+                    extra_nut_xforms,
+                )
+                if (
+                    nut_xf_cur is None
+                    or nut_ee_reference_offset is None
+                ):
+                    print(
+                        f"[ERROR] {nut_label} 안전 상공 상승 중 "
+                        "Xform/EE 결합 기준이 없습니다"
+                    )
+                    restore_active_nut_to_tray_glue(
+                        "missing lift coupling state"
+                    )
+                    publish_status(
+                        "FAILURE:NUT_GRIP_COUPLING_STATE_MISSING"
+                    )
                     phase = "IDLE"
+                else:
+                    nut_now_pos, _ = nut_xf_cur.get_world_pose()
+                    nut_now_pos = np.asarray(
+                        nut_now_pos,
+                        dtype=float,
+                    )
+                    coupling_error = nut_ee_coupling_error(
+                        cur_pos,
+                        nut_now_pos,
+                        nut_ee_reference_offset,
+                    )
+                    if (
+                        coupling_error
+                        > NUT_EE_COUPLING_TOLERANCE_M
+                    ):
+                        print(
+                            f"[ERROR] {nut_label} 안전 상공 상승 중 "
+                            "EE-relative drift="
+                            f"{coupling_error*1000:.1f}mm"
+                        )
+                        restore_active_nut_to_tray_glue(
+                            "coupling lost during lift"
+                        )
+                        publish_status(
+                            "FAILURE:NUT_GRIP_COUPLING_LOST"
+                        )
+                        phase = "IDLE"
+                    elif (
+                        current_err < PICK_TOLERANCE_STRICT
+                        or (
+                            current_err
+                            < PICK_TOLERANCE_LOOSE_VAL
+                            and step_count > MAX_STUCK_STEPS
+                        )
+                    ):
+                        print(
+                            f"\n★ [PICK_{nut_label} SUCCESS] 너트 파지 및 "
+                            "상승 완수! "
+                            f"(결합 drift={coupling_error*1000:.1f}mm)"
+                        )
+                        print(
+                            "[진단] 너트 실측 위치="
+                            f"{tuple(round(v,4) for v in nut_now_pos)} "
+                            "| EE 위치="
+                            f"{tuple(round(v,4) for v in cur_pos)}"
+                        )
 
-            # [15단계] 볼트 상공 이동
+                        # 이 시점부터는 PICK가 확정되어 후속 ASSEMBLE이
+                        # dynamics/contact 상태를 이어받는다. 이후 새 task
+                        # conflict가 이 너트를 tray로 되돌리면 안 된다.
+                        nut_pick_active_array_index = None
+                        nut_ee_reference_offset = None
+                        nut_ee_previous_offset = None
+                        nut_lift_command_z = None
+                        nut_release_timer = 0
+                        publish_progress("NUT_PICK_COMPLETE", 100.0)
+                        publish_status("SUCCESS")
+                        phase = "IDLE"
+
+            # [15단계] 너트 파지 안전 고도에서 볼트 XY로 수평 이동.
+            # 큰 XY 이동과 0.9m -> 0.6m 하강을 한 번에 명령하면 RMPFlow가
+            # 목표 약 2cm 앞에서 수렴하지 못할 수 있어 두 축 이동을 분리한다.
             elif phase == "MOVE_TO_BOLT_NUT":
                 publish_progress("MOVE_TO_BOLT", 20.0)
-                bolt_approach_pos = np.array([bolt_target_pos[0], bolt_target_pos[1], BOLT_APPROACH_Z])
-                actions = arm_controller.forward(target_end_effector_position=bolt_approach_pos, target_end_effector_orientation=quat_nut)
+                cur_pos = np.asarray(
+                    world_xf(
+                        stage,
+                        f"{M0609_PATH}/{EE_LINK_NAME}",
+                    ).ExtractTranslation(),
+                    dtype=float,
+                )
+                bolt_travel_command, nut_xy_lead = lead_xy_target(
+                    bolt_travel_pos,
+                    cur_pos,
+                    nut_xy_lead,
+                )
+                actions = arm_controller.forward(
+                    target_end_effector_position=bolt_travel_command,
+                    target_end_effector_orientation=quat_nut,
+                )
                 robot.apply_action(actions)
                 robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_CLOSE_NUT))
 
-                cur_pos = world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation()
-                current_err = math.dist(cur_pos, tuple(bolt_approach_pos))
+                current_err = math.dist(cur_pos, tuple(bolt_travel_pos))
+                if step_count % 120 == 0:
+                    lead_mm = 1000.0 * np.linalg.norm(
+                        bolt_travel_command[:2] - bolt_travel_pos[:2]
+                    )
+                    print(
+                        f"[NUT_BOLT_XY] actual=({cur_pos[0]:.4f}, "
+                        f"{cur_pos[1]:.4f}, {cur_pos[2]:.4f}) | "
+                        f"err={current_err * 1000.0:.1f}mm | "
+                        f"command lead={lead_mm:.1f}mm"
+                    )
 
                 if current_err < PICK_TOLERANCE_STRICT or (current_err < PICK_TOLERANCE_LOOSE_VAL and step_count > MAX_STUCK_STEPS):
                     nut_label = resolve_nut_assets(nut_index, nut1_xform, nut2_xform)[1]
-                    print(f"[OK] 볼트 {nut_index}번 상공 도착! ({nut_label}) -> 착좌 하강 시작")
+                    print(f"[OK] 볼트 {nut_slot}번 안전 상공 XY 도착! ({nut_label}) "
+                          f"-> Z={BOLT_APPROACH_Z:.3f}m 수직 하강 시작")
+                    nut_xy_lead = np.zeros(2, dtype=float)
+                    phase = "MOVE_TO_BOLT_NUT_VERTICAL"
+                    step_count = 0
+
+            # [15.5단계] 볼트 XY를 고정한 채 체결 접근 고도로 수직 하강
+            elif phase == "MOVE_TO_BOLT_NUT_VERTICAL":
+                publish_progress("MOVE_TO_BOLT", 30.0)
+                cur_pos = np.asarray(
+                    world_xf(
+                        stage,
+                        f"{M0609_PATH}/{EE_LINK_NAME}",
+                    ).ExtractTranslation(),
+                    dtype=float,
+                )
+                bolt_approach_command, nut_xy_lead = lead_xy_target(
+                    bolt_approach_pos,
+                    cur_pos,
+                    nut_xy_lead,
+                )
+                actions = arm_controller.forward(
+                    target_end_effector_position=bolt_approach_command,
+                    target_end_effector_orientation=quat_nut,
+                )
+                robot.apply_action(actions)
+                robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_CLOSE_NUT))
+
+                current_err = math.dist(cur_pos, tuple(bolt_approach_pos))
+                if step_count % 120 == 0:
+                    lead_mm = 1000.0 * np.linalg.norm(
+                        bolt_approach_command[:2] - bolt_approach_pos[:2]
+                    )
+                    print(
+                        f"[NUT_BOLT_VERTICAL] actual=({cur_pos[0]:.4f}, "
+                        f"{cur_pos[1]:.4f}, {cur_pos[2]:.4f}) | "
+                        f"err={current_err * 1000.0:.1f}mm | "
+                        f"command lead={lead_mm:.1f}mm"
+                    )
+
+                if current_err < PICK_TOLERANCE_STRICT or (current_err < PICK_TOLERANCE_LOOSE_VAL and step_count > MAX_STUCK_STEPS):
+                    nut_label = resolve_nut_assets(nut_index, nut1_xform, nut2_xform)[1]
+                    print(f"[OK] 볼트 {nut_slot}번 체결 상공 도착! ({nut_label}) "
+                          "-> 착좌 하강 시작")
                     phase = "NUT_DESCEND_TO_BOLT"
                     step_count = 0
                     descend_target_z = BOLT_APPROACH_Z
@@ -3307,7 +5009,7 @@ def main():
                     prev_ee_z = ee_now_pos[2]
 
                     nut_label = resolve_nut_assets(nut_index, nut1_xform, nut2_xform)[1]
-                    print(f"[OK] 볼트 {nut_index}번 착좌 완료 ({nut_label})! -> Screwing 시작")
+                    print(f"[OK] 볼트 {nut_slot}번 착좌 완료 ({nut_label})! -> Screwing 시작")
                     phase = "NUT_SCREW"
                     step_count = 0
 
@@ -3469,14 +5171,18 @@ def main():
                 robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_OPEN))
 
                 if screw_unwind_deg <= 0.0:
-                    print(f"[OK] 6번 조인트 0도 원점 되감기 완료! -> 기본 방향(quat_nut) 정렬")
+                    print(
+                        "[OK] 6번 조인트 되감기 명령 완료! -> 실제 "
+                        "기본 방향(quat_nut) 수렴 대기"
+                    )
+                    nut_pose_settle_count = 0
                     phase = "NUT_RETRACT_ROTATE"
                     step_count = 0
 
             # [20단계] 기본 오리엔테이션 정렬
             elif phase == "NUT_RETRACT_ROTATE":
                 publish_progress("NUT_RETRACT_ROTATE", 98.0)
-                ee_now_pos, _ = robot.end_effector.get_world_pose()
+                ee_now_pos, ee_now_quat = robot.end_effector.get_world_pose()
                 lift_target_pos = np.array([ee_now_pos[0], ee_now_pos[1], NUT_APPROACH_Z])
 
                 actions = arm_controller.forward(target_end_effector_position=lift_target_pos, target_end_effector_orientation=quat_nut)
@@ -3484,8 +5190,35 @@ def main():
                 robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_OPEN))
 
                 cur_pos = world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation()
-                current_err = math.dist(cur_pos, tuple(lift_target_pos))
-                if current_err < PICK_TOLERANCE_STRICT or (current_err < PICK_TOLERANCE_LOOSE_VAL and step_count > MAX_STUCK_STEPS):
+                z_err = abs(float(cur_pos[2]) - NUT_APPROACH_Z)
+                orientation_err = _quat_angular_error(
+                    ee_now_quat,
+                    quat_nut,
+                )
+                nut_pose_settle_count, pose_settled = (
+                    consecutive_pose_settle(
+                        z_err,
+                        orientation_err,
+                        nut_pose_settle_count,
+                        position_tolerance_m=NUT_POSE_POSITION_TOL_M,
+                        orientation_tolerance_rad=(
+                            NUT_POSE_ORIENTATION_TOL_RAD
+                        ),
+                        required_steps=NUT_POSE_SETTLE_STEPS,
+                    )
+                )
+
+                if step_count % 30 == 0:
+                    print(
+                        "[NUT_RETRACT_ROTATE] "
+                        f"z_err={z_err * 1000:.1f}mm, "
+                        f"orientation_err="
+                        f"{math.degrees(orientation_err):.2f}deg, "
+                        f"stable={nut_pose_settle_count}/"
+                        f"{NUT_POSE_SETTLE_STEPS}"
+                    )
+
+                if pose_settled:
                     nut_label = resolve_nut_assets(nut_index, nut1_xform, nut2_xform)[1]
                     print(f"\n[OK] {nut_label} 상공 이탈 및 회전 정렬 완료!")
                     

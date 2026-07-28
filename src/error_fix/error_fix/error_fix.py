@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import sys
 import math
+import time
 import cv2
 import numpy as np
 
@@ -16,6 +17,12 @@ from sensor_msgs.msg import Image
 from geometry_msgs.msg import PoseStamped
 from std_msgs.msg import String
 from cv_bridge import CvBridge
+
+from error_fix.alignment_policy import (
+    FineAlignmentGate,
+    LatestFramePairSynchronizer,
+    advance_source_boundary,
+)
 
 
 class BatteryAssemblyVisionNode(Node):
@@ -52,12 +59,20 @@ class BatteryAssemblyVisionNode(Node):
         # ----------------------------------------------------------------------
         # 제어 및 오차 보정 파라미터
         # ----------------------------------------------------------------------
-        self.TOLERANCE_DEG = 3        # 목표 각도 정밀도: 0.5도 이하
+        self.POSITION_TOLERANCE_PX = 2
+        self.TOLERANCE_DEG = 3
+        self.HOLD_FRAMES = 30
+        self.ALIGNMENT_DECISION_FRAMES = 3
+        self.BOLT_REFERENCE_FRAMES = 3
+        self.BOLT_REFERENCE_TOLERANCE_PX = 5.0
+        self.FIXED_STEP_M = 0.0002
         self.MAX_VALID_PIXEL_ERR = 400  # 이상치 픽셀 오차 스킵 가드
 
-        # 최신 Depth 프레임 및 상태 변수
-        self.current_depth_frame = None
+        # 양쪽 callback이 갱신하는 최신 RGB/depth 후보와 source boundary.
+        self._last_observed_rgb_stamp_ns = None
+        self._last_observed_depth_stamp_ns = None
         self.fixed_bolt_coords = []
+        self._bolt_reference_candidates = []
         self.busbar_hole_coords = []
         self.busbar_hole_depths = []
         self.battery_angle = 0.0
@@ -70,6 +85,8 @@ class BatteryAssemblyVisionNode(Node):
         # 시작 제어 플래그
         self.is_active = False          # 트리거 수신 전까지는 False
         self.bolts_detected = False     # 노드 실행 직후 백그라운드에서 검출 진행
+        self.alignment_generation = None
+        self.alignment_legacy_session = False
         self._roi_logged = False        # ROI 크기를 한 번만 로그로 찍기 위한 플래그
 
         # 버스바 미검출 시 Hold 처리용 (픽셀 좌표 차이)
@@ -78,55 +95,127 @@ class BatteryAssemblyVisionNode(Node):
         self.last_valid_dtheta = 0.0
         self.has_valid_tracking = False
 
-        # 연속 30 Step 유지 카운터
-        self.hold_count = 0
+        self.alignment_gate = FineAlignmentGate(
+            position_tolerance_px=self.POSITION_TOLERANCE_PX,
+            angle_tolerance_deg=self.TOLERANCE_DEG,
+            hold_frames=self.HOLD_FRAMES,
+            correction_step_m=self.FIXED_STEP_M,
+            decision_frames=self.ALIGNMENT_DECISION_FRAMES,
+        )
+        self.frame_pair_sync = LatestFramePairSynchronizer(
+            max_skew_sec=0.1,
+            max_receipt_age_sec=1.0,
+        )
+        self.hold_count = self.alignment_gate.hold_count
 
         # 10Hz 오차 보정 제어 루프
         self.create_timer(0.1, self.control_loop)
 
         self.get_logger().info(
             "🚀 [Vision Node] 실행 완료. "
-            "고정 볼트 탐색을 시작합니다 (트리거 대기 중...)")
+            "bolt_2 optical-center 정렬 트리거 대기 중...")
 
     def task_command_callback(self, msg: String):
         """외부 Behavior 또는 Isaac Sim에서 오차 보정 시작 명령을 수신한다."""
         cmd = msg.data
-        if cmd in [
-            "START_ERRORFIX_CORRECTION",
+        starts_errorfix = (
+            cmd == "START_ERRORFIX_CORRECTION"
+            or cmd.startswith("START_ERRORFIX_CORRECTION:")
+        )
+        if starts_errorfix or cmd in [
             "START_VISION_CORRECTION",
             "MOVE_BATTERY_CENTER_SUCCESS",
         ]:
+            generation = None
+            if cmd.startswith("START_ERRORFIX_CORRECTION:"):
+                generation_text = cmd.partition(":")[2]
+                try:
+                    generation = int(generation_text)
+                except ValueError:
+                    self.get_logger().warn(
+                        f"잘못된 FINE_ALIGNMENT generation 무시: {cmd}")
+                    return
+                if generation <= 0:
+                    self.get_logger().warn(
+                        f"0 이하 FINE_ALIGNMENT generation 무시: {cmd}")
+                    return
             self.get_logger().info(
                 f"\n>>> [Vision Correction] 오차 보정 시작 신호 수신 ({cmd})!")
+            # START 자체도 새 경계를 세운다. RESET과 START 사이에 image
+            # callback이 끼어도 그 프레임은 기준 볼트 후보가 될 수 없다.
+            self._reset_bolt_detection()
+            self.alignment_generation = generation
+            self.alignment_legacy_session = generation is None
             self.is_active = True
-            self.hold_count = 0  # 새로 시작 시 연속 카운터 초기화
         elif cmd == "RESET_BOLT_DETECTION":
             self._reset_bolt_detection()
+        elif cmd.startswith("FINE_ALIGNMENT_STEP_SETTLED:"):
+            stamp_text = cmd.partition(":")[2]
+            try:
+                stamp_ns = int(stamp_text)
+            except ValueError:
+                self.get_logger().warn(
+                    f"잘못된 FINE_ALIGNMENT settle ack 무시: {cmd}")
+                return
+
+            if not self.alignment_gate.acknowledge_settled(stamp_ns):
+                self.get_logger().warn(
+                    "stale FINE_ALIGNMENT settle ack 무시: "
+                    f"{stamp_ns}")
+                return
+
+            # Ack 이전에 촬영되었거나 callback queue에 남아 있던 RGB/depth는
+            # 다음 correction의 3-frame 합의에 들어갈 수 없다.
+            self.frame_pair_sync.reset(
+                rgb_boundary_ns=self._last_observed_rgb_stamp_ns,
+                depth_boundary_ns=self._last_observed_depth_stamp_ns,
+            )
+            self.has_valid_tracking = False
+            self.get_logger().info(
+                "FINE_ALIGNMENT step settle 확인 "
+                f"(stamp_ns={stamp_ns}); post-motion 3-frame 대기")
+
+    def _reset_alignment_tracking(self):
+        """Clear cached observations and convergence state."""
+        self.alignment_gate.reset()
+        self.has_valid_tracking = False
+        self.last_valid_dx_px = 0
+        self.last_valid_dy_px = 0
+        self.last_valid_dtheta = 0.0
+        self.hold_count = self.alignment_gate.hold_count
 
     def _reset_bolt_detection(self):
         """Discard observations captured before the bolt camera was repositioned."""
         self.is_active = False
         self.bolts_detected = False
-        self.current_depth_frame = None
+        self.alignment_generation = None
+        self.alignment_legacy_session = False
         self.fixed_bolt_coords = []
+        self._bolt_reference_candidates = []
         self.busbar_hole_coords = []
         self.busbar_hole_depths = []
         self.battery_line_data = None
         self.busbar_line_data = None
         self.roi_rect = None
-        self.has_valid_tracking = False
-        self.last_valid_dx_px = 0
-        self.last_valid_dy_px = 0
-        self.last_valid_dtheta = 0.0
-        self.hold_count = 0
+        self.frame_pair_sync.reset(
+            rgb_boundary_ns=self._last_observed_rgb_stamp_ns,
+            depth_boundary_ns=self._last_observed_depth_stamp_ns,
+        )
+        self._reset_alignment_tracking()
         self._roi_logged = False
         self.get_logger().info(
             ">>> [Vision Node] 카메라 이동 감지 -> 고정 볼트 위치 재탐색 시작")
 
     def depth_callback(self, msg):
+        depth_stamp_ns = self._stamp_ns(msg)
+        depth_receipt_ns = time.monotonic_ns()
+        self._last_observed_depth_stamp_ns = advance_source_boundary(
+            self._last_observed_depth_stamp_ns,
+            depth_stamp_ns,
+        )
         try:
             depth_img = self.bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
-            self.current_depth_frame = np.nan_to_num(
+            depth_frame = np.nan_to_num(
                 depth_img,
                 nan=0.0,
                 posinf=0.0,
@@ -134,59 +223,119 @@ class BatteryAssemblyVisionNode(Node):
             )
         except Exception as e:
             self.get_logger().error(f"Failed to convert depth image: {e}")
+            return
+        self.frame_pair_sync.cache_depth(
+            depth_frame,
+            depth_stamp_ns,
+            depth_receipt_ns,
+        )
+        self._try_process_cached_pair()
 
     def rgb_callback(self, msg):
+        rgb_stamp_ns = self._stamp_ns(msg)
+        rgb_receipt_ns = time.monotonic_ns()
+        self._last_observed_rgb_stamp_ns = advance_source_boundary(
+            self._last_observed_rgb_stamp_ns,
+            rgb_stamp_ns,
+        )
         try:
             frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
         except Exception as e:
             self.get_logger().error(f"Failed to convert RGB image: {e}")
             return
 
+        self.frame_pair_sync.cache_rgb(
+            frame,
+            rgb_stamp_ns,
+            rgb_receipt_ns,
+        )
+        self._try_process_cached_pair()
+        if not self.is_active:
+            display_img = frame.copy()
+            cv2.putText(
+                display_img,
+                "Waiting for alignment trigger...",
+                (30, 40),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 255, 0),
+                2,
+            )
+            cv2.imshow("Battery Assembly Vision - RGB Tracking", display_img)
+            cv2.waitKey(1)
+
+    def _try_process_cached_pair(self):
+        """Process once when either callback completes one strict frame pair."""
+        if not self.is_active:
+            return
+        pair, pair_reason = self.frame_pair_sync.try_accept(
+            now_receipt_ns=time.monotonic_ns(),
+        )
+        if pair is None:
+            if pair_reason not in {'RGB unavailable', 'depth unavailable'}:
+                self.get_logger().warn(
+                    f'[frame barrier] {pair_reason}',
+                    throttle_duration_sec=2.0,
+                )
+            return
+        self._process_accepted_pair(
+            pair.rgb.payload,
+            pair.depth.payload,
+            pair.rgb.stamp_ns,
+        )
+
+    def _process_accepted_pair(
+        self,
+        frame,
+        depth_frame,
+        rgb_stamp_ns,
+    ):
+        """Run tracking only for a fresh synchronized pair accepted once."""
         display_img = frame.copy()
 
         # ----------------------------------------------------------------------
-        # [STEP 1] 고정 볼트 검출 (노드가 켜지자마자 백그라운드에서 항상 수행)
+        # 같은 위치의 post-reset bolt가 3 frame 이어져야 latch.
         # ----------------------------------------------------------------------
         if not self.bolts_detected:
-            self.detect_static_bolts_hough(frame)
-            if len(self.fixed_bolt_coords) > 0:
-                self.bolts_detected = True
-                bolt_x, bolt_y = self.fixed_bolt_coords[0]
-                self.get_logger().info(
-                    "✅ [초기화 완료] 고정 볼트 위치 선점 완료: "
-                    f"X={bolt_x}, Y={bolt_y}")
-            else:
-                cv2.putText(display_img, "Searching Static Bolts...", (30, 40),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-
-        # ----------------------------------------------------------------------
-        # [STEP 2] 트리거 수신 전 대기 모드 (시각화만 출력)
-        # ----------------------------------------------------------------------
-        if not self.is_active:
-            if self.bolts_detected:
+            # Executor가 camera origin을 station bolt_2 world XY로 옮기고
+            # intrinsic principal point도 정확히 image center이다. 버스바가
+            # bolt를 가리는 이 단계에서 Hough로 재검출하면 hole 자체를 bolt로
+            # 오인하거나 검출 0개로 영구 대기하므로 optical center를 기준으로
+            # 삼는다. fresh/synchronized pair 3개 조건은 그대로 유지한다.
+            detected = (
+                frame.shape[1] // 2,
+                frame.shape[0] // 2,
+            )
+            self._update_bolt_reference(detected)
+            if not self.bolts_detected:
+                self._submit_invalid_frame(rgb_stamp_ns)
                 cv2.putText(
                     display_img,
-                    "Static Bolt Ready. Waiting for Trigger...",
+                    "Stabilizing post-move bolt reference...",
                     (30, 40),
                     cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,
-                    (0, 255, 0),
+                    0.6,
+                    (0, 0, 255),
                     2,
                 )
-                for bx, by in self.fixed_bolt_coords:
-                    cv2.circle(display_img, (bx, by), 4, (0, 255, 0), -1)
-
-            cv2.imshow("Battery Assembly Vision - RGB Tracking", display_img)
-            cv2.waitKey(1)
-            return
+                cv2.imshow(
+                    "Battery Assembly Vision - RGB Tracking",
+                    display_img,
+                )
+                cv2.waitKey(1)
+                return
 
         # ----------------------------------------------------------------------
-        # [STEP 3] 버스바 구멍 추적 및 오차 연산 (트리거 수신 후에만 작동)
+        # 버스바 구멍 추적 및 오차 연산.
         # ----------------------------------------------------------------------
-        if self.bolts_detected and self.current_depth_frame is not None:
+        # 현재 RGB frame에서 hole을 다시 확인하기 전에는 이전 frame의
+        # tracking을 절대 재사용하지 않는다. 미검출 frame은 유효 표본이나
+        # hold 진행도를 늘리지 않는다.
+        self.has_valid_tracking = False
+        if self.bolts_detected:
             self.detect_yellow_busbar_holes_depth(
                 frame,
-                self.current_depth_frame,
+                depth_frame,
                 min_busbar_area=2000,
             )
 
@@ -234,6 +383,7 @@ class BatteryAssemblyVisionNode(Node):
                 if (
                     abs(dx_px) > self.MAX_VALID_PIXEL_ERR
                     or abs(dy_px) > self.MAX_VALID_PIXEL_ERR
+                    or not math.isfinite(angle_error)
                 ):
                     self.get_logger().warn(
                         "⚠️ [비전 노이즈 차단] 비정상적 픽셀 오차 감지! "
@@ -267,79 +417,158 @@ class BatteryAssemblyVisionNode(Node):
                     status_line = (
                         f"dx:{dx_px:+2d}px, dy:{dy_px:+2d}px, "
                         f"dTheta:{angle_error:+.2f}deg "
-                        f"[{self.hold_count}/30]")
+                        f"[{self.hold_count}/{self.HOLD_FRAMES}]")
                     sys.stdout.write(f"\r\033[K[Tracking Status] {status_line}")
                     sys.stdout.flush()
+
+        self.alignment_gate.submit(
+            rgb_stamp_ns,
+            valid=self.has_valid_tracking,
+            dx_px=self.last_valid_dx_px,
+            dy_px=self.last_valid_dy_px,
+            dtheta_deg=self.last_valid_dtheta,
+        )
+        self.hold_count = self.alignment_gate.hold_count
+        # A continuously ready image subscription can starve the timer in a
+        # SingleThreadedExecutor. Consume a decision in the accepted-frame
+        # path; consume() clears it, so the timer remains a safe fallback.
+        self._consume_alignment_decision()
 
         cv2.imshow("Battery Assembly Vision - RGB Tracking", display_img)
         cv2.waitKey(1)
 
-    def control_loop(self):
-        """픽셀 좌표와 볼트 좌표가 완전히 일치할 때까지 보정한다."""
-        if not self.is_active or not self.bolts_detected or not self.has_valid_tracking:
+    @staticmethod
+    def _stamp_ns(msg):
+        return (
+            int(msg.header.stamp.sec) * 1_000_000_000
+            + int(msg.header.stamp.nanosec)
+        )
+
+    def _submit_invalid_frame(self, rgb_stamp_ns):
+        self.has_valid_tracking = False
+        self.alignment_gate.submit(rgb_stamp_ns, valid=False)
+        self.hold_count = self.alignment_gate.hold_count
+
+    def _update_bolt_reference(self, detected):
+        if detected is None:
+            self.fixed_bolt_coords = []
+            self._bolt_reference_candidates = []
             return
 
-        bx, by = self.fixed_bolt_coords[0]
-        hx, hy = (
-            self.busbar_hole_coords[0]
-            if len(self.busbar_hole_coords) > 0
-            else (bx, by)
+        candidate = np.asarray(detected, dtype=float)
+        if self._bolt_reference_candidates:
+            anchor = np.mean(self._bolt_reference_candidates, axis=0)
+            if np.linalg.norm(candidate - anchor) > (
+                self.BOLT_REFERENCE_TOLERANCE_PX
+            ):
+                self._bolt_reference_candidates = []
+        self._bolt_reference_candidates.append(candidate)
+        self.fixed_bolt_coords = []
+
+        if len(self._bolt_reference_candidates) < self.BOLT_REFERENCE_FRAMES:
+            return
+        reference = np.mean(self._bolt_reference_candidates, axis=0)
+        bolt_x, bolt_y = (int(round(value)) for value in reference)
+        self.fixed_bolt_coords = [(bolt_x, bolt_y)]
+        self.bolts_detected = True
+        self.battery_angle = 0.0
+        self.battery_line_data = (
+            1.0,
+            0.0,
+            float(bolt_x),
+            float(bolt_y),
         )
-        dtheta = self.last_valid_dtheta
+        self.get_logger().info(
+            "✅ [초기화 완료] post-move bolt_2 optical center "
+            f"{self.BOLT_REFERENCE_FRAMES} frame 확인: "
+            f"X={bolt_x}, Y={bolt_y}")
 
-        # 🎯 [수렴 조건] 픽셀 오차가 0 (hx == bx, hy == by) & 각도 0.5도 이하
-        if hx == bx and hy == by and abs(dtheta) <= self.TOLERANCE_DEG:
-            self.hold_count += 1
+    def control_loop(self):
+        """Fallback consumer for a pending alignment decision."""
+        self._consume_alignment_decision()
 
-            # 연속 30 Step(약 3초) 달성 시 완수 신호 퍼블리시 및 종료
-            if self.hold_count >= 30:
+    def _consume_alignment_decision(self):
+        """Consume and apply a pending three-frame decision exactly once."""
+        if not self.is_active or not self.bolts_detected:
+            return
+
+        decision = self.alignment_gate.consume()
+        self.hold_count = self.alignment_gate.hold_count
+        if decision is None:
+            return
+        dtheta = decision.dtheta_deg
+
+        # ±2px detector quantization 안의 합의 표본은 이동 없이 hold한다.
+        if decision.aligned:
+            if decision.success:
                 self.get_logger().info(
                     "\n==========================================")
                 self.get_logger().info(
                     " ★ [정밀 정렬 완료] "
-                    "픽셀 완전 일치(0px 오차) 30 Step 유지 달성")
+                    f"±{self.POSITION_TOLERANCE_PX}px 범위의 서로 다른 "
+                    f"유효 RGB frame {self.HOLD_FRAMES}개 누적 달성")
                 self.get_logger().info(
                     "==========================================")
 
                 msg = String()
-                msg.data = "ALIGNMENT_SUCCESS"
+                if self.alignment_generation is not None:
+                    msg.data = (
+                        "ALIGNMENT_SUCCESS:"
+                        f"{self.alignment_generation}"
+                    )
+                elif self.alignment_legacy_session:
+                    # Bare START commands remain a legacy-only session.  They
+                    # never inherit or reuse a generation from a prior FINE
+                    # task, and the current executor intentionally ignores
+                    # their unscoped completion.
+                    msg.data = "ALIGNMENT_SUCCESS"
+                else:
+                    self.get_logger().error(
+                        "활성 alignment session 식별자가 없어 완료 신호를 "
+                        "발행하지 않습니다")
+                    self.is_active = False
+                    self._reset_alignment_tracking()
+                    return
                 self.pub_task_cmd.publish(msg)
                 self.is_active = False
-                self.hold_count = 0
+                self.alignment_generation = None
+                self.alignment_legacy_session = False
+                self._reset_alignment_tracking()
                 return
-        else:
-            self.hold_count = 0  # 1픽셀이라도 차이 날 경우 연속 카운터 초기화
+            return
 
-        FIXED_STEP = 0.0002  # 0.1mm (0.0001m) 고정 스텝
+        if not decision.consensus:
+            self.get_logger().warn(
+                "FINE_ALIGNMENT 3-frame 합의 실패; correction 생략",
+                throttle_duration_sec=2.0,
+            )
+            return
 
         # --- dx (위/아래) 설정 ---
-        if hy < by:          # 구멍이 위에 있음
-            step_x = +FIXED_STEP
-        elif hy > by:        # 구멍이 아래쪽에 있음
-            step_x = -FIXED_STEP
-        else:
-            step_x = 0.0
+        step_x = decision.correction_x_m
 
         # --- dy (왼쪽/오른쪽) 설정 ---
-        if hx < bx:          # 구멍이 오른쪽에 있음 (로봇 관점 dy 설정)
-            step_y = +FIXED_STEP
-        elif hx > bx:        # 구멍이 왼쪽에 있음
-            step_y = -FIXED_STEP
-        else:
-            step_y = 0.0
+        step_y = decision.correction_y_m
 
         # --- 각도 보정 ---
-        if dtheta > 0:
+        if dtheta > self.TOLERANCE_DEG:
             step_dtheta = -0.01
-        elif dtheta < 0:
+        elif dtheta < -self.TOLERANCE_DEG:
             step_dtheta = 0.01
         else:
             step_dtheta = 0.0
 
         # 메시지 작성 및 퍼블리시
         target_msg = PoseStamped()
-        target_msg.header.stamp = self.get_clock().now().to_msg()
-        target_msg.header.frame_id = "world"
+        target_msg.header.stamp.sec = int(
+            decision.stamp_ns // 1_000_000_000)
+        target_msg.header.stamp.nanosec = int(
+            decision.stamp_ns % 1_000_000_000)
+        target_msg.header.frame_id = "fine_alignment_delta"
+        if self.alignment_generation is not None:
+            target_msg.header.frame_id += (
+                f":{self.alignment_generation}"
+            )
 
         target_msg.pose.position.x = step_x
         target_msg.pose.position.y = step_y
@@ -356,11 +585,10 @@ class BatteryAssemblyVisionNode(Node):
     # --------------------------------------------------------------------------
     def detect_static_bolts_hough(self, frame):
         h, w = frame.shape[:2]
-        # bolt_camera가 이제 매 스테이션마다 그 스테이션의 볼트2 바로 위(world XY)로
-        # 옮겨진 뒤 이 함수가 호출되므로, 볼트는 항상 화면 중앙 부근에 잡힌다 - 예전엔
-        # 스테이션3 한 곳에 고정된 카메라 기준으로 오프셋을 맞춘 ROI였는데, 그걸 그대로
-        # 쓰면 다른 스테이션에서는 화면 중앙(=진짜 볼트)이 아니라 ROI가 가리키는 엉뚱한
-        # 자리를 보게 된다. 중앙 기준 ROI로 통일한다.
+        # FINE_ALIGNMENT가 시작될 때 bolt_camera를 현재 station의 bolt_2 바로
+        # 위(world XY)로 옮기고 RESET_BOLT_DETECTION을 먼저 보낸다. 따라서 이
+        # 보정 경로의 기준 bolt는 화면 중앙 부근에 있어야 한다. SCAN_BATTERY의
+        # pair-midpoint 관측은 FINE_ALIGNMENT reset에서 폐기된다.
         roi_frac_w, roi_frac_h = 0.22, 0.22
         roi_w, roi_h = int(w * roi_frac_w), int(h * roi_frac_h)
         x_start, y_start = int((w - roi_w) / 2), int((h - roi_h) / 2)

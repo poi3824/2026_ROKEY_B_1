@@ -40,6 +40,16 @@ def _perception_nodes(model_path):
                 'require_unique_camera_source': True,
                 'required_target_frames': 3,
                 'use_bolt_roi': config.use_bolt_roi,
+                'prefer_busbar_depth': config.prefer_busbar_depth,
+                'inference_image_size': (
+                    config.inference_image_size
+                    if config.inference_image_size is not None
+                    else 0
+                ),
+                'bolt_roi_x_min': config.bolt_roi_bounds[0],
+                'bolt_roi_x_max': config.bolt_roi_bounds[1],
+                'bolt_roi_y_min': config.bolt_roi_bounds[2],
+                'bolt_roi_y_max': config.bolt_roi_bounds[3],
             }],
             remappings=perception_remappings(config),
         )

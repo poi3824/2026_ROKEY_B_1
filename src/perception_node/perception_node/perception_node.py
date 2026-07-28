@@ -16,10 +16,13 @@ SRV /perception/get_grasp_pose (fms_interfaces/GetGraspPose) — 라벨별 최�
                                  타이머 주기(detection_period_sec)만큼은 대상이 카메라 시야에
                                  안정적으로 들어와 있어야 한다. grasp_query_max_age_sec보다
                                  캐시가 오래됐거나 해당 라벨 검출이 없으면 found=false.
-SRV /perception/get_bolt_pair  (fms_interfaces/GetBoltPair) — 'bolt' 라벨 중 이번 tick 상위
-                                 2개를 이전 tick 위치와 최근접 매칭해 A/B 각각 별도로
-                                 롤링 평균한 값을 반환. 버스바가 다리를 걸치는 볼트 2개의
-                                 실측 위치가 필요한 busbar_insert INSERT 단계에서 쓴다.
+SRV /perception/get_bolt_pair  (fms_interfaces/GetBoltPair) — confidence 0.6 이상 'bolt'
+                                 검출의 모든 조합 중 실제 배터리팩 볼트 간격과 맞고, 쌍의
+                                 ordered bolt_2가 화면 중앙에 가장 가까운 한 쌍을 고른다
+                                 (고정캠도 현재 station bolt_2 위로 이동). 쌍 중점 거리는
+                                 동률 보정에 쓰며,
+                                 이전 tick 위치와 최근접 매칭해 A/B 각각 별도로 롤링 평균한
+                                 값을 반환한다.
 PUB /vision/busbar_grasp        (fms_interfaces/BusbarGrasp) — 'busbar' 라벨이 이번 tick에
                                  검출됐을 때만 (롤링 평균) world 좌표로 발행. behavior_node가
                                  구독해 busbar_insert 액션 goal.target_pose로 그대로 실어 보낸다.
@@ -76,13 +79,31 @@ from tf2_ros.transform_listener import TransformListener
 from vision_msgs.msg import Detection3D, Detection3DArray, ObjectHypothesisWithPose
 
 from perception_node import overlay
-from perception_node.camera_geometry import make_camera_model, transform_pixel_to_world
-from perception_node.detector import YoloPoseDetector
+from perception_node.camera_geometry import (
+    busbar_pnp_world_pose,
+    make_camera_model,
+    select_busbar_world_point,
+    transform_pixel_to_world,
+)
+from perception_node.detector import (
+    BUSBAR_KEYPOINT_ORDER,
+    MIN_BUSBAR_KEYPOINT_CONFIDENCE,
+    YoloPoseDetector,
+    busbar_keypoints_are_reliable,
+)
 from perception_node.multi_camera_config import DEFAULT_MODEL_FILENAME
 from perception_node.perception_policy import (
+    BoltPairAssociationGate,
     CameraFrameGate,
+    DEFAULT_BOLT_PAIR_DX_M,
+    DEFAULT_BOLT_PAIR_DY_M,
+    DEFAULT_BOLT_PAIR_MAX_Z_DELTA_M,
+    DEFAULT_BOLT_PAIR_X_TOLERANCE_M,
+    DEFAULT_BOLT_PAIR_Y_TOLERANCE_M,
     TargetFrameBarrier,
+    advance_source_boundary,
     scale_roi,
+    select_central_bolt_pair,
     select_central_candidates,
     stamp_to_nanoseconds,
 )
@@ -120,7 +141,13 @@ class PerceptionNode(Node):
         self.declare_parameter('max_rgb_depth_skew_sec', 0.1)
         self.declare_parameter('max_input_receipt_age_sec', 1.0)
         self.declare_parameter('require_unique_camera_source', True)
+        self.declare_parameter('use_busbar_pnp', True)
+        self.declare_parameter('prefer_busbar_depth', False)
+        self.declare_parameter('max_busbar_pnp_reprojection_px', 20.0)
         self.declare_parameter('required_target_frames', 3)
+        # 0 preserves the checkpoint's default.  The bolt-camera launch
+        # contract selects 640 explicitly; wrist/busbar remain unchanged.
+        self.declare_parameter('inference_image_size', 0)
 
         # 🔥 bolt 라벨 스캔 시에만 적용할 ROI 영역 파라미터 (640x640 기준)
         self.declare_parameter('use_bolt_roi', True)
@@ -130,6 +157,26 @@ class PerceptionNode(Node):
         self.declare_parameter('bolt_roi_y_max', 450)
         self.declare_parameter('bolt_roi_reference_width', 640)
         self.declare_parameter('bolt_roi_reference_height', 640)
+        self.declare_parameter(
+            'bolt_pair_expected_dx_m',
+            DEFAULT_BOLT_PAIR_DX_M,
+        )
+        self.declare_parameter(
+            'bolt_pair_expected_dy_m',
+            DEFAULT_BOLT_PAIR_DY_M,
+        )
+        self.declare_parameter(
+            'bolt_pair_x_tolerance_m',
+            DEFAULT_BOLT_PAIR_X_TOLERANCE_M,
+        )
+        self.declare_parameter(
+            'bolt_pair_y_tolerance_m',
+            DEFAULT_BOLT_PAIR_Y_TOLERANCE_M,
+        )
+        self.declare_parameter(
+            'bolt_pair_max_z_delta_m',
+            DEFAULT_BOLT_PAIR_MAX_Z_DELTA_M,
+        )
 
         rgb_topic = self.get_parameter('rgb_topic').value
         depth_topic = self.get_parameter('depth_topic').value
@@ -150,7 +197,26 @@ class PerceptionNode(Node):
         self._max_input_receipt_age_sec = max_input_receipt_age_sec
         self._require_unique_camera_source = bool(
             self.get_parameter('require_unique_camera_source').value)
+        self._use_busbar_pnp = bool(
+            self.get_parameter('use_busbar_pnp').value)
+        self._prefer_busbar_depth = bool(
+            self.get_parameter('prefer_busbar_depth').value)
+        self._max_busbar_pnp_reprojection_px = float(
+            self.get_parameter(
+                'max_busbar_pnp_reprojection_px').value)
         required_target_frames = self.get_parameter('required_target_frames').value
+        inference_image_size = int(
+            self.get_parameter('inference_image_size').value)
+        self._bolt_pair_expected_delta_xy = (
+            float(self.get_parameter('bolt_pair_expected_dx_m').value),
+            float(self.get_parameter('bolt_pair_expected_dy_m').value),
+        )
+        self._bolt_pair_x_tolerance_m = float(
+            self.get_parameter('bolt_pair_x_tolerance_m').value)
+        self._bolt_pair_y_tolerance_m = float(
+            self.get_parameter('bolt_pair_y_tolerance_m').value)
+        self._bolt_pair_max_z_delta_m = float(
+            self.get_parameter('bolt_pair_max_z_delta_m').value)
         self._rgb_topic = str(rgb_topic)
         self._depth_topic = str(depth_topic)
         self._camera_info_topic = str(camera_info_topic)
@@ -160,14 +226,55 @@ class PerceptionNode(Node):
             or self._grasp_query_max_age_sec <= 0.0
         ):
             raise ValueError('grasp_query_max_age_sec must be a finite positive number')
+        if (
+            not math.isfinite(self._max_busbar_pnp_reprojection_px)
+            or self._max_busbar_pnp_reprojection_px <= 0.0
+        ):
+            raise ValueError(
+                'max_busbar_pnp_reprojection_px must be finite and positive')
+        if inference_image_size != 0 and inference_image_size < 32:
+            raise ValueError(
+                'inference_image_size must be 0 or an integer >= 32')
+        expected_dx, expected_dy = self._bolt_pair_expected_delta_xy
+        if (
+            not math.isfinite(expected_dx)
+            or not math.isfinite(expected_dy)
+            or math.hypot(expected_dx, expected_dy) <= 0.0
+        ):
+            raise ValueError(
+                'bolt_pair_expected_dx_m/dy_m must form a finite non-zero vector')
+        if (
+            not math.isfinite(self._bolt_pair_x_tolerance_m)
+            or self._bolt_pair_x_tolerance_m <= 0.0
+        ):
+            raise ValueError(
+                'bolt_pair_x_tolerance_m must be finite and positive')
+        if (
+            not math.isfinite(self._bolt_pair_y_tolerance_m)
+            or self._bolt_pair_y_tolerance_m <= 0.0
+        ):
+            raise ValueError(
+                'bolt_pair_y_tolerance_m must be finite and positive')
+        if (
+            not math.isfinite(self._bolt_pair_max_z_delta_m)
+            or self._bolt_pair_max_z_delta_m < 0.0
+        ):
+            raise ValueError(
+                'bolt_pair_max_z_delta_m must be finite and non-negative')
 
         self._bridge = CvBridge()
-        self._detector = YoloPoseDetector(model_path)
+        self._detector = YoloPoseDetector(
+            model_path,
+            inference_image_size=(
+                inference_image_size if inference_image_size else None
+            ),
+        )
         self._frame_gate = CameraFrameGate(
             max_skew_sec=max_rgb_depth_skew_sec,
             max_receipt_age_sec=max_input_receipt_age_sec,
         )
         self._target_barrier = TargetFrameBarrier(required_target_frames)
+        self._bolt_pair_association = BoltPairAssociationGate()
 
         self._latest_rgb = None
         self._latest_rgb_header = None
@@ -175,6 +282,8 @@ class PerceptionNode(Node):
         self._latest_depth = None
         self._latest_depth_header = None
         self._latest_depth_received_at = 0.0
+        self._last_observed_rgb_stamp_ns = None
+        self._last_observed_depth_stamp_ns = None
         self._camera_model = None
         self._camera_frame_id = None
 
@@ -230,11 +339,31 @@ class PerceptionNode(Node):
         self._latest_rgb = self._bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
         self._latest_rgb_header = msg.header
         self._latest_rgb_received_at = time.monotonic()
+        try:
+            stamp_ns = stamp_to_nanoseconds(
+                msg.header.stamp)
+        except ValueError:
+            pass
+        else:
+            self._last_observed_rgb_stamp_ns = advance_source_boundary(
+                self._last_observed_rgb_stamp_ns,
+                stamp_ns,
+            )
 
     def _on_depth(self, msg: Image):
         self._latest_depth = self._bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
         self._latest_depth_header = msg.header
         self._latest_depth_received_at = time.monotonic()
+        try:
+            stamp_ns = stamp_to_nanoseconds(
+                msg.header.stamp)
+        except ValueError:
+            pass
+        else:
+            self._last_observed_depth_stamp_ns = advance_source_boundary(
+                self._last_observed_depth_stamp_ns,
+                stamp_ns,
+            )
 
     def _on_camera_info(self, msg: CameraInfo):
         self._camera_model = make_camera_model(msg)
@@ -254,8 +383,13 @@ class PerceptionNode(Node):
         self._recent_bolt_a.clear()
         self._recent_bolt_b.clear()
         self._latest_bolt_pair = None
+        self._bolt_pair_association.reset()
         self._target_barrier.reset()
-        self._frame_gate.reset(preserve_source_sequence=True)
+        self._frame_gate.reset(
+            preserve_source_sequence=True,
+            rgb_boundary_ns=self._last_observed_rgb_stamp_ns,
+            depth_boundary_ns=self._last_observed_depth_stamp_ns,
+        )
         self._reset_ack_pub.publish(Empty())
         self.get_logger().info(
             'perception cache reset; waiting for three new target frames')
@@ -370,8 +504,13 @@ class PerceptionNode(Node):
                 if not (bolt_x_min <= px_x <= bolt_x_max and bolt_y_min <= px_y <= bolt_y_max):
                     continue  # 배터리 스캔 영역 밖의 볼트는 스킵
 
-            camera_point, world_point, status = self._transform_pixel(
-                det['pixel'], depth, header.stamp)
+            if label == BUSBAR_LABEL and self._use_busbar_pnp:
+                camera_point, world_point, status = (
+                    self._resolve_busbar_pose(det, depth, header.stamp)
+                )
+            else:
+                camera_point, world_point, status = self._transform_pixel(
+                    det['pixel'], depth, header.stamp)
 
             if debug_image is not None:
                 overlay.draw_detection(debug_image, det, camera_point, world_point, status)
@@ -394,8 +533,7 @@ class PerceptionNode(Node):
                 selected = select_central_candidates(
                     candidates, (image_width, image_height), limit=1)
             elif label == BOLT_LABEL:
-                selected = select_central_candidates(
-                    candidates, (image_width, image_height), limit=2)
+                continue
             else:
                 selected = sorted(
                     candidates, key=lambda candidate: candidate['score'], reverse=True)[:1]
@@ -413,21 +551,28 @@ class PerceptionNode(Node):
             self._record_target_frame(label, rgb_stamp_ns)
             self._publish_vision_topic(label, mean_point, header.stamp)
 
-        bolt_this_tick = [
+        bolt_pair = select_central_bolt_pair(
+            resolved_by_label.get(BOLT_LABEL, ()),
+            (image_width, image_height),
+            expected_delta_xy=self._bolt_pair_expected_delta_xy,
+            x_tolerance_m=self._bolt_pair_x_tolerance_m,
+            y_tolerance_m=self._bolt_pair_y_tolerance_m,
+            max_z_delta_m=self._bolt_pair_max_z_delta_m,
+        )
+        if bolt_pair is None:
+            if len(resolved_by_label.get(BOLT_LABEL, ())) >= 2:
+                self.get_logger().warn(
+                    '[bolt-pair] same-pack geometry와 맞는 볼트쌍 없음',
+                    throttle_duration_sec=2.0,
+                )
+        elif self._update_bolt_pair([
             (
                 candidate['score'],
                 candidate['world_point'],
                 candidate['pixel'],
             )
-            for candidate in select_central_candidates(
-                resolved_by_label.get(BOLT_LABEL, ()),
-                (image_width, image_height),
-                limit=2,
-            )
-        ]
-        if self._update_bolt_pair(
-            bolt_this_tick, now, image_width, image_height
-        ):
+            for candidate in bolt_pair
+        ], now):
             self._record_target_frame(BOLT_LABEL, rgb_stamp_ns)
 
         self._detections_pub.publish(array_msg)
@@ -522,31 +667,35 @@ class PerceptionNode(Node):
             )
         return tuple(mean), n
 
-    def _update_bolt_pair(self, bolt_candidates, now, image_w=None, image_h=None):
-        if len(bolt_candidates) < 2:
+    def _update_bolt_pair(self, bolt_candidates, now):
+        if len(bolt_candidates) != 2:
             if bolt_candidates:
                 self.get_logger().warn(
-                    f"[bolt-pair] 유효한 world 좌표 볼트 부족: {len(bolt_candidates)}/2",
+                    f"[bolt-pair] 유효한 same-pack 볼트 수 오류: "
+                    f"{len(bolt_candidates)}/2",
                     throttle_duration_sec=2.0)
             return False
 
-        # 점수 기준 정렬 대신 화면 중앙(이미지 픽셀 중심) 근처 우선 정렬로 보정
-        image_cx = (image_w or 0) / 2.0
-        image_cy = (image_h or 0) / 2.0
-        bolt_candidates = sorted(
-            bolt_candidates,
-            key=lambda c: np.hypot(c[2][0] - image_cx, c[2][1] - image_cy)
-        )[:2]
-
-        points = [np.asarray(wp, dtype=float) for _, wp, _px in bolt_candidates]
-
-        prev_a = self._recent_bolt_a[-1][0] if self._recent_bolt_a else None
-        prev_b = self._recent_bolt_b[-1][0] if self._recent_bolt_b else None
-        if prev_a is not None and prev_b is not None:
-            d_same = np.linalg.norm(points[0] - prev_a) + np.linalg.norm(points[1] - prev_b)
-            d_cross = np.linalg.norm(points[0] - prev_b) + np.linalg.norm(points[1] - prev_a)
-            if d_cross < d_same:
-                points = [points[1], points[0]]
+        raw_points = [
+            np.asarray(wp, dtype=float)
+            for _, wp, _px in bolt_candidates
+        ]
+        ordered_points, restarted, endpoint_distance = (
+            self._bolt_pair_association.record(raw_points)
+        )
+        points = [
+            np.asarray(point, dtype=float)
+            for point in ordered_points
+        ]
+        if restarted:
+            self.get_logger().warn(
+                '[bolt-pair] 다른 same-pack 후보로 전환 감지 '
+                f'(anchor endpoint 이동={endpoint_distance * 1000:.1f}mm > '
+                f'{self._bolt_pair_association.max_endpoint_distance_m * 1000:.0f}mm)'
+                ' -> smoothing/3-frame barrier 재시작',
+                throttle_duration_sec=1.0,
+            )
+            self._clear_bolt_track(reset_association=False)
 
         mean_a, std_a, n_a = self._smooth_bucket(self._recent_bolt_a, points[0], now)
         mean_b, std_b, n_b = self._smooth_bucket(self._recent_bolt_b, points[1], now)
@@ -561,6 +710,16 @@ class PerceptionNode(Node):
         self._latest_bolt_pair = (tuple(mean_a), tuple(mean_b), now, min(n_a, n_b))
         return True
 
+    def _clear_bolt_track(self, *, reset_association: bool) -> None:
+        """Discard bolt observations and optionally their physical-pair anchor."""
+        self._recent_bolt_a.clear()
+        self._recent_bolt_b.clear()
+        self._latest_bolt_pair = None
+        self._latest_target_received_at.pop(BOLT_LABEL, None)
+        self._target_barrier.reset_target(BOLT_LABEL)
+        if reset_association:
+            self._bolt_pair_association.reset()
+
     def _make_pose_stamped(self, world_point, stamp) -> PoseStamped:
         wx, wy, wz = world_point
         pose = PoseStamped()
@@ -572,15 +731,101 @@ class PerceptionNode(Node):
         pose.pose.orientation.w = 1.0
         return pose
 
-    def _transform_pixel(self, pixel_uv, depth_image, stamp):
-        def log_tf_error(ex):
-            self.get_logger().warn(
-                f'{self._world_frame} <- {self._camera_frame_id} tf 조회 실패, 검출 skip: {ex}',
-                throttle_duration_sec=5.0)
+    def _log_tf_error(self, ex):
+        self.get_logger().warn(
+            f'{self._world_frame} <- {self._camera_frame_id} '
+            f'tf 조회 실패, 검출 skip: {ex}',
+            throttle_duration_sec=5.0)
 
+    def _transform_pixel(self, pixel_uv, depth_image, stamp):
         return transform_pixel_to_world(
             self._camera_model, depth_image, pixel_uv, self._tf_buffer,
-            self._world_frame, self._camera_frame_id, stamp, on_tf_error=log_tf_error)
+            self._world_frame, self._camera_frame_id, stamp,
+            on_tf_error=self._log_tf_error)
+
+    def _resolve_busbar_pose(self, det, depth_image, stamp):
+        """
+        Resolve a v1/v3 busbar using centroid depth plus planar PnP.
+
+        Six-landmark centroid depth is the most accurate path when it lands on
+        the busbar. If a wrist view samples the floor through the open centre,
+        its Z differs sharply from the geometry-only PnP estimate and PnP wins.
+        """
+        depth_camera, depth_world, depth_status = self._transform_pixel(
+            det['pixel'], depth_image, stamp)
+        pnp_world = None
+        pnp_status = 'unavailable'
+        reprojection_error = None
+        keypoints = np.asarray(det.get('keypoints_px', ()), dtype=float)
+        keypoints_reliable = busbar_keypoints_are_reliable(
+            keypoints,
+            det.get('keypoints_conf', ()),
+            (
+                int(self._camera_model.width),
+                int(self._camera_model.height),
+            ),
+        )
+        if not keypoints_reliable:
+            pnp_status = (
+                "landmark confidence/in-frame gate failed "
+                f"(min={MIN_BUSBAR_KEYPOINT_CONFIDENCE:.2f})"
+            )
+        elif keypoints.shape == (len(BUSBAR_KEYPOINT_ORDER), 2):
+            pnp = busbar_pnp_world_pose(
+                self._camera_model,
+                keypoints,
+                self._tf_buffer,
+                self._world_frame,
+                self._camera_frame_id,
+                stamp,
+                on_tf_error=self._log_tf_error,
+            )
+            pnp_status = pnp['status']
+            if pnp['status'] == '':
+                reprojection_error = pnp['reprojection_error_px']
+                if reprojection_error > (
+                    self._max_busbar_pnp_reprojection_px
+                ):
+                    pnp_status = (
+                        f'reprojection {reprojection_error:.2f}px exceeds '
+                        f'{self._max_busbar_pnp_reprojection_px:.2f}px'
+                    )
+                    self.get_logger().warn(
+                        f'[busbar] PnP rejected: {pnp_status}',
+                        throttle_duration_sec=3.0,
+                    )
+                    pnp = None
+            if pnp is not None and pnp_status == '':
+                hole_a = pnp['hole_world']['hole_A']
+                hole_b = pnp['hole_world']['hole_B']
+                pnp_world = (
+                    pnp['mid_xy'][0],
+                    pnp['mid_xy'][1],
+                    (hole_a[2] + hole_b[2]) / 2.0,
+                )
+
+        world_point, source, z_disagreement = select_busbar_world_point(
+            depth_world,
+            pnp_world,
+            prefer_depth=self._prefer_busbar_depth,
+        )
+        if world_point is None:
+            return depth_camera, None, (
+                f'depth={depth_status or "ok"}, pnp={pnp_status}'
+            )
+
+        details = []
+        if reprojection_error is not None:
+            details.append(f'pnp_reprojection={reprojection_error:.2f}px')
+        if z_disagreement is not None:
+            details.append(f'z_delta={z_disagreement:.3f}m')
+        self.get_logger().info(
+            f'[busbar] pose_source={source}'
+            + (f' ({", ".join(details)})' if details else ''),
+            throttle_duration_sec=3.0,
+        )
+        camera_point = depth_camera if source == 'depth' else None
+        return camera_point, world_point, ''
 
     def _make_detection3d(self, det, world_point, stamp) -> Detection3D:
         detection = Detection3D()

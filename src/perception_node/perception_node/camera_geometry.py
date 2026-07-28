@@ -16,6 +16,9 @@ tf 조회는 이미지 header.stamp가 아니라 "가장 최근에 들어온 tf"
 extrapolation 실패가 난다. 카메라가 매 순간 크게 움직이지 않는 스캔 상황이라면
 최신 tf를 그대로 써도 정확도 손실이 실질적으로 무시할 만하다.
 """
+import math
+
+import cv2
 import numpy as np
 from geometry_msgs.msg import PointStamped
 from image_geometry import PinholeCameraModel
@@ -25,6 +28,8 @@ from sensor_msgs.msg import CameraInfo
 from tf2_geometry_msgs import do_transform_point
 from tf2_ros import TransformException
 from tf2_ros.buffer import Buffer
+
+from perception_node.detector import BUSBAR_KEYPOINT_ORDER
 
 
 def make_camera_model(camera_info: CameraInfo) -> PinholeCameraModel:
@@ -57,6 +62,37 @@ def sample_depth(depth_image: np.ndarray, u: float, v: float):
     return depth_value
 
 
+def camera_point_to_world(
+    camera_point,
+    tf_buffer: Buffer,
+    world_frame: str,
+    camera_frame_id: str,
+    stamp,
+    timeout_sec: float = 0.2,
+    on_tf_error=None,
+):
+    """Transform a camera-frame point into world coordinates, or return None."""
+    point_camera = PointStamped()
+    point_camera.header.stamp = stamp
+    point_camera.header.frame_id = camera_frame_id
+    point_camera.point.x, point_camera.point.y, point_camera.point.z = camera_point
+
+    try:
+        transform = tf_buffer.lookup_transform(
+            world_frame,
+            camera_frame_id,
+            Time(),
+            timeout=Duration(seconds=timeout_sec),
+        )
+    except TransformException as ex:
+        if on_tf_error is not None:
+            on_tf_error(ex)
+        return None
+
+    point_world = do_transform_point(point_camera, transform)
+    return point_world.point.x, point_world.point.y, point_world.point.z
+
+
 def transform_pixel_to_world(
     model: PinholeCameraModel,
     depth_image: np.ndarray,
@@ -83,20 +119,183 @@ def transform_pixel_to_world(
 
     camera_point = pixel_to_camera_point(model, u, v, depth_value)
 
-    point_camera = PointStamped()
-    point_camera.header.stamp = stamp
-    point_camera.header.frame_id = camera_frame_id
-    point_camera.point.x, point_camera.point.y, point_camera.point.z = camera_point
-
-    try:
-        transform = tf_buffer.lookup_transform(
-            world_frame, camera_frame_id, Time(),  # Time() = 시각 0 = "가장 최근 tf"
-            timeout=Duration(seconds=timeout_sec))
-    except TransformException as ex:
-        if on_tf_error is not None:
-            on_tf_error(ex)
+    world_point = camera_point_to_world(
+        camera_point,
+        tf_buffer,
+        world_frame,
+        camera_frame_id,
+        stamp,
+        timeout_sec,
+        on_tf_error,
+    )
+    if world_point is None:
         return camera_point, None, 'tf fail'
-
-    point_world = do_transform_point(point_camera, transform)
-    world_point = (point_world.point.x, point_world.point.y, point_world.point.z)
     return camera_point, world_point, ''
+
+
+# ---------------------------------------------------------------------------
+# Busbar 6-keypoint PnP path.
+#
+# The object points come from /World/Z_busbar3/Mesh. The authored prim scale
+# is 0.75, so applying it here converts the mesh-local metre coordinates into
+# the actual simulated dimensions used by the v1/v3 training labels.
+BUSBAR_WORLD_SCALE = 0.75
+_BUSBAR_LOCAL_KEYPOINTS_M = {
+    "hole_A": (-0.241638, -0.138881, 0.003000),
+    "hole_B": (0.241638, 0.138881, 0.003000),
+    "elbow_A": (-0.211638, -0.030000, 0.003000),
+    "elbow_B": (0.211638, 0.030000, 0.003000),
+    "tip_A": (-0.271638, -0.168881, 0.003000),
+    "tip_B": (0.271638, 0.168881, 0.003000),
+}
+BUSBAR_OBJECT_POINTS_M = np.array(
+    [_BUSBAR_LOCAL_KEYPOINTS_M[name] for name in BUSBAR_KEYPOINT_ORDER],
+    dtype=np.float64,
+) * BUSBAR_WORLD_SCALE
+
+
+def solve_busbar_pnp(model: PinholeCameraModel, keypoints_px: np.ndarray):
+    """
+    Solve a planar busbar camera pose from the six v1/v3 landmarks.
+
+    Returns ``(rvec, tvec, reprojection_error_px)`` or None for malformed,
+    degenerate, or behind-camera solutions.
+    """
+    image_points = np.asarray(keypoints_px, dtype=np.float64)
+    if (
+        image_points.shape != (len(BUSBAR_KEYPOINT_ORDER), 2)
+        or not np.all(np.isfinite(image_points))
+        or np.ptp(image_points[:, 0]) < 1.0
+        or np.ptp(image_points[:, 1]) < 1.0
+    ):
+        return None
+
+    camera_matrix = np.asarray(model.intrinsicMatrix(), dtype=np.float64)
+    distortion = np.asarray(model.distortionCoeffs(), dtype=np.float64)
+    try:
+        ok, rvecs, tvecs, errors = cv2.solvePnPGeneric(
+            BUSBAR_OBJECT_POINTS_M.reshape(-1, 1, 3),
+            image_points.reshape(-1, 1, 2),
+            camera_matrix,
+            distortion,
+            flags=cv2.SOLVEPNP_IPPE,
+        )
+    except cv2.error:
+        return None
+    if not ok or not rvecs or errors is None:
+        return None
+
+    candidates = [
+        index
+        for index, tvec in enumerate(tvecs)
+        if (
+            np.all(np.isfinite(tvec))
+            and float(np.asarray(tvec).reshape(3)[2]) > 0.0
+        )
+    ]
+    if not candidates:
+        return None
+    best = min(
+        candidates,
+        key=lambda index: float(np.asarray(errors[index]).reshape(-1)[0]),
+    )
+    return (
+        rvecs[best],
+        tvecs[best],
+        float(np.asarray(errors[best]).reshape(-1)[0]),
+    )
+
+
+def busbar_pnp_world_pose(
+    model: PinholeCameraModel,
+    keypoints_px: np.ndarray,
+    tf_buffer: Buffer,
+    world_frame: str,
+    camera_frame_id: str,
+    stamp,
+    timeout_sec: float = 0.2,
+    on_tf_error=None,
+):
+    """Return the two hole world points, midpoint, and yaw for a busbar."""
+    solved = solve_busbar_pnp(model, keypoints_px)
+    if solved is None:
+        return {'status': 'pnp fail'}
+    rvec, tvec, reprojection_error = solved
+    rotation, _ = cv2.Rodrigues(rvec)
+
+    hole_world = {}
+    for name in ("hole_A", "hole_B"):
+        local_point = (
+            np.asarray(_BUSBAR_LOCAL_KEYPOINTS_M[name], dtype=np.float64)
+            * BUSBAR_WORLD_SCALE
+        )
+        camera_point = (
+            rotation @ local_point.reshape(3, 1) + tvec
+        ).reshape(3)
+        world_point = camera_point_to_world(
+            tuple(camera_point),
+            tf_buffer,
+            world_frame,
+            camera_frame_id,
+            stamp,
+            timeout_sec,
+            on_tf_error,
+        )
+        if world_point is None:
+            return {'status': 'tf fail'}
+        hole_world[name] = world_point
+
+    ax, ay, _ = hole_world["hole_A"]
+    bx, by, _ = hole_world["hole_B"]
+    return {
+        'hole_world': hole_world,
+        'mid_xy': ((ax + bx) / 2.0, (ay + by) / 2.0),
+        'yaw_rad': math.atan2(by - ay, bx - ax),
+        'reprojection_error_px': reprojection_error,
+        'status': '',
+    }
+
+
+def dual_path_discrepancy_m(pnp_xy, depth_xy) -> float:
+    """Return planar disagreement between PnP and depth estimates in metres."""
+    return math.hypot(pnp_xy[0] - depth_xy[0], pnp_xy[1] - depth_xy[1])
+
+
+def select_busbar_world_point(
+    depth_world,
+    pnp_world,
+    max_z_disagreement_m: float = 0.10,
+    prefer_depth: bool = False,
+):
+    """
+    Select the safer of the depth and six-keypoint PnP busbar estimates.
+
+    Landmark-centroid depth is more accurate when it lands on the busbar.
+    Wrist-camera views can instead sample the floor through the open centre;
+    in that case the large Z disagreement makes the geometry-only PnP result
+    the safer estimate.
+
+    Returns ``(world_point, source, z_disagreement_m)``. ``source`` is
+    ``"depth"``, ``"pnp"``, or ``"none"``.
+    """
+
+    def _valid_point(point):
+        if point is None:
+            return False
+        values = np.asarray(point, dtype=float)
+        return values.shape == (3,) and np.all(np.isfinite(values))
+
+    depth_valid = _valid_point(depth_world)
+    pnp_valid = _valid_point(pnp_world)
+    if depth_valid and pnp_valid:
+        z_disagreement = abs(float(depth_world[2]) - float(pnp_world[2]))
+        if prefer_depth:
+            return tuple(depth_world), 'depth', z_disagreement
+        if z_disagreement <= max_z_disagreement_m:
+            return tuple(depth_world), 'depth', z_disagreement
+        return tuple(pnp_world), 'pnp', z_disagreement
+    if depth_valid:
+        return tuple(depth_world), 'depth', None
+    if pnp_valid:
+        return tuple(pnp_world), 'pnp', None
+    return None, 'none', None

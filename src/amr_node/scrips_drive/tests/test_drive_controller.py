@@ -414,6 +414,33 @@ def test_arrival_requires_twelve_consecutive_stationary_ticks():
     assert command.phase == 'arrived'
 
 
+def test_24mm_position_drift_resets_arrival_stability_counter():
+    controller = GoToPoseController(_fast_config())
+    goal = Goal2D(0.0, 0.0, 0.0)
+    stationary = PoseState(0.0, 0.0, 0.0)
+    controller.set_goal(goal, current_pose=stationary)
+
+    for _ in range(11):
+        command = controller.compute(stationary, 1.0 / 60.0)
+        assert not command.arrived
+
+    drifted = controller.compute(
+        PoseState(0.024, 0.0, 0.0),
+        1.0 / 60.0,
+    )
+    assert drifted.distance_error == pytest.approx(0.024)
+    assert not drifted.arrived
+
+    # Returning inside the strict boundary starts a new 12-tick window; the
+    # eleven pre-drift observations must not carry over.
+    for _ in range(11):
+        reacquired = controller.compute(stationary, 1.0 / 60.0)
+        assert not reacquired.arrived
+    reacquired = controller.compute(stationary, 1.0 / 60.0)
+    assert reacquired.arrived
+    assert reacquired.distance_error <= controller.config.position_tolerance
+
+
 def test_motion_resets_arrival_stability_counter():
     controller = GoToPoseController(_fast_config())
     controller.set_goal(

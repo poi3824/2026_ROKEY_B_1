@@ -350,6 +350,61 @@ def test_phase_wait_stops_on_isaac_failure(arm_module, monkeypatch):
     )
 
 
+def test_short_ordering_wait_stops_on_isaac_failure(
+    arm_module,
+    monkeypatch,
+):
+    node = arm_module.ArmNode()
+    node.isaac_status = "FAILURE: playback restart"
+    monkeypatch.setattr(
+        arm_module.time,
+        "sleep",
+        lambda _duration: pytest.fail("terminal failure must not sleep"),
+    )
+
+    assert not node._wait_while_active(
+        0.1,
+        _Goal("PICK_BUSBAR"),
+    )
+
+
+def test_wrist_confirmation_stops_on_isaac_failure(arm_module):
+    node = arm_module.ArmNode()
+    node.isaac_status = "FAILURE: arm task conflict"
+    node._call_grasp_pose = (
+        lambda *_args: pytest.fail(
+            "terminal failure must stop before a service retry"
+        )
+    )
+
+    found, pose, message = node.wait_for_wrist_busbar_confirmation(
+        _pose(arm_module, 0.0, 0.0, 0.0, 1),
+        _Goal("SCAN_BUSBAR"),
+    )
+
+    assert not found
+    assert pose is None
+    assert "Isaac failure" in message
+
+
+def test_bolt_pair_wait_stops_on_isaac_failure(arm_module):
+    node = arm_module.ArmNode()
+    node.isaac_status = "FAILURE: playback restart"
+    node.client_get_bolt_pair = types.SimpleNamespace(
+        wait_for_service=lambda **_kwargs: pytest.fail(
+            "terminal failure must stop before service discovery"
+        )
+    )
+
+    found, pose, message = node.request_bolt_pair_midpoint_async(
+        _Goal("SCAN_BATTERY"),
+    )
+
+    assert not found
+    assert pose is None
+    assert "Isaac failure" in message
+
+
 def test_wrist_confirmation_requires_fresh_increasing_samples(arm_module):
     node = arm_module.ArmNode()
     fixed = _pose(arm_module, 1.0, 2.0, 0.3, 90)

@@ -536,8 +536,20 @@ class GoToPoseController:
         self._last_linear = 0.0
         self._last_angular = 0.0
         self._position_trim_active = False
+        # Capture/release hysteresis keeps the controller from chattering while
+        # it corrects final yaw, but it must never relax the public ARRIVED
+        # contract.  Count a stable tick only while the *measured* pose remains
+        # inside the strict 20 mm / 0.03 rad bounds.
+        within_arrival_tolerance = (
+            distance <= self.config.position_tolerance
+            and (
+                not goal.yaw_required
+                or abs(yaw_error) <= self.config.yaw_tolerance
+            )
+        )
         stationary = (
-            abs(pose.linear_speed) <= self.config.settle_linear_speed
+            within_arrival_tolerance
+            and abs(pose.linear_speed) <= self.config.settle_linear_speed
             and abs(pose.angular_speed) <= self.config.settle_angular_speed
         )
         if stationary:

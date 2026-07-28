@@ -5,13 +5,11 @@ perception 브랜치 프로토타입(perception_prototype/detection.py)의 마�
 로직을 그대로 재사용한다. 마스크 중심은 박스 중심이 아니라 "실제 채워진 모양의
 무게중심"으로 계산한다 (busbar처럼 비대칭인 물체는 박스 중심이 빈 공간에 잡힐 수 있음).
 
-keypoints 모델(YoloPoseDetector)은 9개 cuboid keypoint(Center + 8 corner,
-training/keypoints/data/data.yaml 순서)를 낸다. 파지점은 기하 평균이 아니라
-Center 키포인트를 그대로 쓴다 — training/eval/compare_grasp_point.py의 predict_pose()와
-동일한 관례. Center는 3D ground truth를 픽셀로 투영한 값이라 그리퍼에 가려져도
-정확하다는게 keypoints 모델의 이점이지만, depth 기반 역투영(camera_geometry)은
-여전히 그 픽셀 위치의 depth 값을 읽으므로 가려진 상태에서의 depth 정확도는 보장하지
-않는다 (occlusion-aware 3D 보정은 범위 밖).
+기본 v3와 전환용 v1 pose 모델은 모두 같은 6-keypoint 계약을 사용한다. busbar의
+6점은 hole_A/B, elbow_A/B, tip_A/B이고, bolt/nut은 슬롯 0(top_center)만 유효하다.
+따라서 busbar의 대표 픽셀은 confidence 0.5 이상인 화면 내 A/B 대칭쌍의
+중점 평균, bolt/nut은 슬롯 0이다. 모든 원본 keypoint와 confidence도 반환해
+camera_geometry의 busbar PnP 경로가 사용한다.
 """
 import cv2
 import numpy as np
@@ -64,49 +62,194 @@ class YoloSegDetector:
         return detections
 
 
-# training/keypoints/data/data.yaml의 kpt_shape: [9, 3] 순서와 동일.
-KEYPOINT_ORDER = ["Center", "LDB", "LDF", "LUB", "LUF", "RDB", "RDF", "RUB", "RUF"]
-CENTER_KEYPOINT_INDEX = KEYPOINT_ORDER.index("Center")
+# isaacpjt/M0609/datasets/pose/data.yaml(kpt_shape=[6,3]) 순서와 동일.
+BUSBAR_LABEL = "busbar"
+BUSBAR_KEYPOINT_ORDER = [
+    "hole_A",
+    "hole_B",
+    "elbow_A",
+    "elbow_B",
+    "tip_A",
+    "tip_B",
+]
+SINGLE_KEYPOINT_SLOT = 0
+MIN_BUSBAR_KEYPOINT_CONFIDENCE = 0.5
+BUSBAR_SYMMETRIC_KEYPOINT_PAIRS = (
+    (0, 1),  # hole_A / hole_B
+    (2, 3),  # elbow_A / elbow_B
+    (4, 5),  # tip_A / tip_B
+)
 
 
-# class YoloPoseDetector:
-#     """YOLO-pose(keypoints) 모델 기반 검출. 파지 픽셀 = Center 키포인트."""
+def busbar_keypoint_valid_mask(
+    keypoints_px,
+    keypoints_conf,
+    image_size: tuple[int, int],
+    min_confidence: float = MIN_BUSBAR_KEYPOINT_CONFIDENCE,
+) -> np.ndarray:
+    """Mark finite, confident busbar landmarks inside the source image."""
+    image_width, image_height = image_size
+    if image_width <= 0 or image_height <= 0:
+        raise ValueError("image dimensions must be positive")
+    if (
+        not np.isfinite(min_confidence)
+        or min_confidence < 0.0
+        or min_confidence > 1.0
+    ):
+        raise ValueError("min_confidence must be finite and in [0, 1]")
 
-#     def __init__(self, model_path: str):
-#         self._model = YOLO(model_path)
-#         self.names = self._model.names
+    keypoints = np.asarray(keypoints_px, dtype=float)
+    confidences = np.asarray(keypoints_conf, dtype=float)
+    if (
+        keypoints.shape != (len(BUSBAR_KEYPOINT_ORDER), 2)
+        or confidences.shape != (len(BUSBAR_KEYPOINT_ORDER),)
+    ):
+        return np.zeros(len(BUSBAR_KEYPOINT_ORDER), dtype=bool)
 
-#     def detect(
-#         self, image: np.ndarray, conf_threshold: float,
-#         iou_threshold: float = 0.7,
-#     ) -> list[dict]:
-#         """반환: [{"label", "score", "pixel": (u, v), "bbox_px": (x0,y0,x1,y1),
-#         "keypoints_px": np.ndarray shape (9,2)}, ...]"""
-#         results = self._model(image, conf=conf_threshold, iou=iou_threshold, verbose=False)[0]
-#         detections = []
-#         if results.keypoints is None:
-#             return detections
+    return (
+        np.all(np.isfinite(keypoints), axis=1)
+        & np.isfinite(confidences)
+        & (confidences >= min_confidence)
+        & (0.0 <= keypoints[:, 0])
+        & (keypoints[:, 0] < image_width)
+        & (0.0 <= keypoints[:, 1])
+        & (keypoints[:, 1] < image_height)
+    )
 
-#         keypoints_xy = results.keypoints.xy.cpu().numpy()
-#         for box, kpts, cls, conf in zip(
-#             results.boxes.xyxy, keypoints_xy, results.boxes.cls, results.boxes.conf
-#         ):
-#             u, v = kpts[CENTER_KEYPOINT_INDEX]
-#             detections.append({
-#                 "label": self.names[int(cls)],
-#                 "score": float(conf),
-#                 "pixel": (float(u), float(v)),
-#                 "bbox_px": tuple(box.tolist()),
-#                 "keypoints_px": kpts,
-#             })
-#         return detections
+
+def valid_busbar_keypoints(
+    keypoints_px,
+    keypoints_conf,
+    image_size: tuple[int, int],
+    min_confidence: float = MIN_BUSBAR_KEYPOINT_CONFIDENCE,
+) -> np.ndarray:
+    """Return finite, confident busbar landmarks inside the source image."""
+    keypoints = np.asarray(keypoints_px, dtype=float)
+    valid = busbar_keypoint_valid_mask(
+        keypoints,
+        keypoints_conf,
+        image_size,
+        min_confidence,
+    )
+    if keypoints.shape != (len(BUSBAR_KEYPOINT_ORDER), 2):
+        return np.empty((0, 2), dtype=float)
+    return keypoints[valid]
+
+
+def busbar_symmetric_pair_centers(
+    keypoints_px,
+    keypoints_conf,
+    image_size: tuple[int, int],
+    min_confidence: float = MIN_BUSBAR_KEYPOINT_CONFIDENCE,
+) -> np.ndarray:
+    """
+    Return centers from complete physical A/B landmark pairs.
+
+    Every A/B pair is symmetric about the authored busbar origin.  Averaging
+    arbitrary surviving landmarks can therefore move the depth sample toward
+    one end of the busbar; incomplete pairs are deliberately ignored.
+    """
+    keypoints = np.asarray(keypoints_px, dtype=float)
+    valid = busbar_keypoint_valid_mask(
+        keypoints,
+        keypoints_conf,
+        image_size,
+        min_confidence,
+    )
+    if keypoints.shape != (len(BUSBAR_KEYPOINT_ORDER), 2):
+        return np.empty((0, 2), dtype=float)
+
+    pair_centers = [
+        (keypoints[index_a] + keypoints[index_b]) / 2.0
+        for index_a, index_b in BUSBAR_SYMMETRIC_KEYPOINT_PAIRS
+        if valid[index_a] and valid[index_b]
+    ]
+    if not pair_centers:
+        return np.empty((0, 2), dtype=float)
+    return np.asarray(pair_centers, dtype=float)
+
+
+def busbar_keypoints_are_reliable(
+    keypoints_px,
+    keypoints_conf,
+    image_size: tuple[int, int],
+    min_confidence: float = MIN_BUSBAR_KEYPOINT_CONFIDENCE,
+) -> bool:
+    """Validate every physical busbar landmark before pose estimation."""
+    valid_keypoints = valid_busbar_keypoints(
+        keypoints_px,
+        keypoints_conf,
+        image_size,
+        min_confidence,
+    )
+    return valid_keypoints.shape == (len(BUSBAR_KEYPOINT_ORDER), 2)
+
+
+def representative_pixel(
+    label: str,
+    keypoints_px: np.ndarray,
+    bbox_px,
+    *,
+    keypoints_conf=(),
+    image_size: tuple[int, int] | None = None,
+) -> tuple[float, float]:
+    """
+    Return the class-specific pixel used by the depth fallback path.
+
+    Six-point v1/v3 models use the mean center of their complete, confident,
+    finite, in-frame A/B busbar landmark pairs. Bolt/nut and legacy models
+    keep slot 0. The bounding-box center is used when no trustworthy
+    representative exists.
+    """
+    x0, y0, x1, y1 = (float(value) for value in bbox_px)
+    bbox_center = ((x0 + x1) / 2.0, (y0 + y1) / 2.0)
+    keypoints = np.asarray(keypoints_px, dtype=float)
+    if (
+        keypoints.ndim != 2
+        or keypoints.shape[1] != 2
+    ):
+        return bbox_center
+
+    if label == BUSBAR_LABEL and keypoints.shape[0] == len(BUSBAR_KEYPOINT_ORDER):
+        if image_size is None:
+            return bbox_center
+        pair_centers = busbar_symmetric_pair_centers(
+            keypoints,
+            keypoints_conf,
+            image_size,
+        )
+        if not len(pair_centers):
+            return bbox_center
+        u, v = pair_centers.mean(axis=0)
+    elif keypoints.shape[0] > SINGLE_KEYPOINT_SLOT:
+        if not np.all(np.isfinite(keypoints)):
+            return bbox_center
+        u, v = keypoints[SINGLE_KEYPOINT_SLOT]
+    else:
+        return bbox_center
+    return float(u), float(v)
+
 
 class YoloPoseDetector:
-    """YOLO-pose(keypoints) 모델 기반 검출."""
+    """YOLO-pose detector using the v1/v3 six-keypoint contract."""
 
-    def __init__(self, model_path: str):
+    def __init__(
+        self,
+        model_path: str,
+        inference_image_size: int | None = None,
+    ):
         self._model = YOLO(model_path)
         self.names = self._model.names
+        if inference_image_size is not None:
+            if (
+                isinstance(inference_image_size, bool)
+                or int(inference_image_size) < 32
+            ):
+                raise ValueError(
+                    "inference_image_size must be None or an integer >= 32"
+                )
+            inference_image_size = int(inference_image_size)
+        self._inference_image_size = inference_image_size
 
     def detect(
         self,
@@ -114,25 +257,52 @@ class YoloPoseDetector:
         conf_threshold: float,
         iou_threshold: float = 0.7,
     ) -> list[dict]:
-        results = self._model(image, conf=conf_threshold, iou=iou_threshold, verbose=False)[0]
+        predict_kwargs = {
+            "conf": conf_threshold,
+            "iou": iou_threshold,
+            "verbose": False,
+        }
+        if self._inference_image_size is not None:
+            # The v3 checkpoint retains its 1280px training override.  On the
+            # 640x640 fixed bolt view that scale suppresses the bolt directly
+            # under Camera_bolt below the required 0.6 confidence.  The
+            # camera-specific launch contract explicitly selects 640px.
+            predict_kwargs["imgsz"] = self._inference_image_size
+        results = self._model(image, **predict_kwargs)[0]
         detections = []
         if results.keypoints is None:
             return detections
 
         keypoints_xy = results.keypoints.xy.cpu().numpy()
-        for box, kpts, cls, conf in zip(
-            results.boxes.xyxy, keypoints_xy, results.boxes.cls, results.boxes.conf
+        keypoints_conf = results.keypoints.conf
+        if keypoints_conf is None:
+            confidences = [None] * len(keypoints_xy)
+        else:
+            confidences = keypoints_conf.cpu().numpy()
+
+        for box, kpts, kpts_conf, cls, conf in zip(
+            results.boxes.xyxy,
+            keypoints_xy,
+            confidences,
+            results.boxes.cls,
+            results.boxes.conf,
         ):
             box_list = box.tolist()
-            # 🔥 Bounding Box의 중앙 (u, v) 픽셀 계산
-            u = (box_list[0] + box_list[2]) / 2.0
-            v = (box_list[1] + box_list[3]) / 2.0
+            label = self.names[int(cls)]
+            u, v = representative_pixel(
+                label,
+                kpts,
+                box_list,
+                keypoints_conf=kpts_conf,
+                image_size=(image.shape[1], image.shape[0]),
+            )
 
             detections.append({
-                "label": self.names[int(cls)],
+                "label": label,
                 "score": float(conf),
-                "pixel": (float(u), float(v)),  # Bounding Box 중심 사용
+                "pixel": (u, v),
                 "bbox_px": tuple(box_list),
                 "keypoints_px": kpts,
+                "keypoints_conf": kpts_conf,
             })
         return detections

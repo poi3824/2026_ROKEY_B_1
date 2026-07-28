@@ -759,10 +759,17 @@ class ArmNode(Node):
         """짧은 publisher ordering 대기 중에도 cancel/shutdown을 확인한다."""
         deadline = time.monotonic() + duration_sec
         while rclpy.ok() and time.monotonic() < deadline:
-            if goal_handle.is_cancel_requested:
+            if (
+                goal_handle.is_cancel_requested
+                or self._isaac_has_failed()
+            ):
                 return False
             time.sleep(min(0.02, max(0.0, deadline - time.monotonic())))
-        return rclpy.ok() and not goal_handle.is_cancel_requested
+        return (
+            rclpy.ok()
+            and not goal_handle.is_cancel_requested
+            and not self._isaac_has_failed()
+        )
 
     def _record_perception_reset_ack(self, camera_name):
         """Record that one camera instance processed its reset callback."""
@@ -910,7 +917,15 @@ class ArmNode(Node):
                     response.message,
                 )
             time.sleep(0.05)
-        return False, None, "Action cancel 또는 ROS 종료"
+        return False, None, (
+            "Action cancel"
+            if goal_handle.is_cancel_requested
+            else (
+                "Isaac failure"
+                if self._isaac_has_failed()
+                else "ROS 종료"
+            )
+        )
 
     def request_grasp_pose_until_found(
         self,
@@ -954,7 +969,11 @@ class ArmNode(Node):
         return False, None, (
             "Action cancel로 GetGraspPose 재시도 중단"
             if goal_handle.is_cancel_requested
-            else "ROS 종료로 GetGraspPose 재시도 중단"
+            else (
+                "Isaac failure로 GetGraspPose 재시도 중단"
+                if self._isaac_has_failed()
+                else "ROS 종료로 GetGraspPose 재시도 중단"
+            )
         )
 
     def wait_for_wrist_busbar_confirmation(
@@ -969,7 +988,11 @@ class ArmNode(Node):
         consecutive = 0
         last_message = "reset 뒤 새 wrist 버스바 검출을 기다리는 중"
 
-        while rclpy.ok() and not goal_handle.is_cancel_requested:
+        while (
+            rclpy.ok()
+            and not goal_handle.is_cancel_requested
+            and not self._isaac_has_failed()
+        ):
             found, wrist_pose, message = self._call_grasp_pose(
                 self.client_get_wrist_pose,
                 "busbar",
@@ -1059,7 +1082,11 @@ class ArmNode(Node):
         return False, None, (
             "Action cancel로 wrist 검증 중단"
             if goal_handle.is_cancel_requested
-            else "ROS 종료로 wrist 검증 중단"
+            else (
+                "Isaac failure로 wrist 검증 중단"
+                if self._isaac_has_failed()
+                else "ROS 종료로 wrist 검증 중단"
+            )
         )
 
     def request_bolt_pair_midpoint_async(
@@ -1068,7 +1095,11 @@ class ArmNode(Node):
     ):
         """고정 bolt camera의 새 볼트쌍이 올 때까지 무제한 재시도한다."""
         last_message = "GetBoltPair 검출 대기"
-        while rclpy.ok() and not goal_handle.is_cancel_requested:
+        while (
+            rclpy.ok()
+            and not goal_handle.is_cancel_requested
+            and not self._isaac_has_failed()
+        ):
             if not self.client_get_bolt_pair.wait_for_service(
                 timeout_sec=1.0
             ):
@@ -1089,7 +1120,11 @@ class ArmNode(Node):
                 ):
                     break
                 continue
-            while rclpy.ok() and not goal_handle.is_cancel_requested:
+            while (
+                rclpy.ok()
+                and not goal_handle.is_cancel_requested
+                and not self._isaac_has_failed()
+            ):
                 if future.done():
                     try:
                         response = future.result()
@@ -1149,7 +1184,11 @@ class ArmNode(Node):
         return False, None, (
             "Action cancel로 GetBoltPair 재시도 중단"
             if goal_handle.is_cancel_requested
-            else "ROS 종료로 GetBoltPair 재시도 중단"
+            else (
+                "Isaac failure로 GetBoltPair 재시도 중단"
+                if self._isaac_has_failed()
+                else "ROS 종료로 GetBoltPair 재시도 중단"
+            )
         )
 
 
