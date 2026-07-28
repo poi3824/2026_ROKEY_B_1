@@ -36,10 +36,11 @@ class FleetManagerNode(Node):
         """어느 단자(스테이션)가 비어 있는지 확인.
 
         TODO: 비전 스캔 결과(전체 스테이션 상태)를 받아 실제 빈 단자를 판단.
-        지금은 데모용으로 station_1~3에 순차적으로 ASSEMBLE job을 채워 넣는다.
+        지금은 데모용으로 station_1~2(behavior_node.STATION_POSES 참고)에 순차적으로
+        ASSEMBLE job을 채워 넣는다.
         """
         if not self._pending_jobs and not self._job_in_progress:
-            for station_id in ('station_1', 'station_2', 'station_3'):
+            for station_id in ('station_1', 'station_2'):
                 self._pending_jobs.append({
                     'station_id': station_id,
                     'job_type': 'ASSEMBLE',

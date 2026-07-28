@@ -156,8 +156,8 @@ class ArmNode(Node):
         self._DEFAULT_POS_GRAB_PICK = np.array([0.5128, 0.4477, 0.455, 0.0, 3.1415, 1.5708])
 
         target_mid_pos = np.array([1.03115, -0.07855, 0.0693])
-        self._POS_INSERT_ABOVE = np.array([target_mid_pos[0], target_mid_pos[1], 0.6, 0.0, 3.1415, 1.5708])
-        self._POS_INSERT_PLACE = np.array([target_mid_pos[0], target_mid_pos[1], target_mid_pos[2], 0.0, 3.1415, 1.5708])
+        self._POS_INSERT_ABOVE = np.array([target_mid_pos[0], target_mid_pos[1], 0.6, 0.0, 3.1415, 0])
+        self._POS_INSERT_PLACE = np.array([target_mid_pos[0], target_mid_pos[1], target_mid_pos[2], 0.0, 3.1415, 0])
 
         # ★ [단계별 차등 허용 오차]
         self._PICK_TOLERANCE_STRICT = 0.01    # Pick 단계: 0.01m (10mm)
