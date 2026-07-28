@@ -186,21 +186,13 @@ STATION_NUT_INDICES = {
     5: (5, 6),
 }
 
-# 스테이션 4/5는 버스바 스캔 위치도 실측 절대좌표로 고정 (station 3은 기존처럼 현재
-# EE 위치 기준 상대 오프셋 계산을 그대로 쓴다).
-STATION_BUSBAR_SCAN_XY = {
-    4: np.array([-0.2271, 1.8945]),
-    5: np.array([-0.9586, 1.8945]),
-}
-
 # behavior_node.py의 AMR_STATION_POSES와 동일한 좌표 - /amr/goal_pose로 어느 스테이션에
 # 와있는지 자동 판별하는 데 쓴다(battery/busbar 두 지점 다 등록해서 어느 태스크
 # 시점이든 매칭되게 함).
-_Y_BUSBAR = (1.2392 + 1.205 + 1.2367) / 3.0
 STATION_AMR_POINTS = {
     3: [(0.6667, -0.0382), (0.5867, 1.9078)],
-    4: [(0.6667, -0.6617), (-0.6606, _Y_BUSBAR)],
-    5: [(0.6667, -1.1964), (-1.1298, _Y_BUSBAR)],
+    4: [(0.6667, -0.6617), (-0.2271, 1.9078)],
+    5: [(0.6667, -1.1964), (-0.9586, 1.9078)],
 }
 
 # 너트 체결(Screwing) 파라미터
@@ -1170,19 +1162,20 @@ def main():
                 print(f"\n>>> [{task}] 초기 관절 자세 복귀 시작")
 
             elif task == "SCAN_BUSBAR":
-                if current_station in STATION_BUSBAR_SCAN_XY:
-                    # 스테이션 4/5는 실측 절대좌표 고정값을 그대로 쓴다.
-                    sxy = STATION_BUSBAR_SCAN_XY[current_station]
-                    BUSBAR_SCAN_POS = np.array([sxy[0], sxy[1], BUSBAR_SCAN_Z])
-                else:
-                    cur_pos = world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation()
-                    BUSBAR_SCAN_POS = np.array([cur_pos[0] - 0.5, cur_pos[1] + 0.5, BUSBAR_SCAN_Z])
+                # AMR 차체의 정차 좌표를 로봇 팔 EE 목표로 사용하면 스테이션 4/5에서
+                # 팔이 엉뚱한 월드 좌표로 향한다. 모든 스테이션에서 현재 EE 기준의
+                # 검증된 상대 오프셋으로 버스바 스캔 위치를 계산한다.
+                cur_pos = world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation()
+                BUSBAR_SCAN_POS = np.array([
+                    cur_pos[0] - 0.5,
+                    cur_pos[1] + 0.5,
+                    BUSBAR_SCAN_Z,
+                ])
                 # 너트1 때와 같은 문제 - XY 이동과 orientation 변경(quat_busbar)을 동시에
                 # 크게 시키면 RMPFlow가 팔꿈치/손목을 꼬아서 돌아가는 경로를 잡는다(스테이션4
                 # 버스바 스캔에서 실측 확인됨). 제자리에서 방향+고도만 먼저 맞추고
                 # (SCAN_BUSBAR_LIFT), 그 다음 같은 높이/방향을 유지한 채 옆으로만 이동
                 # (SCAN_BUSBAR_APPROACH)시켜서 회전과 이동을 분리한다.
-                cur_pos = world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation()
                 BUSBAR_SCAN_LIFT_POS = np.array([cur_pos[0], cur_pos[1], BUSBAR_SCAN_Z])
                 phase = "SCAN_BUSBAR_LIFT"
                 step_count = 0
