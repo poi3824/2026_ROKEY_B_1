@@ -180,8 +180,13 @@ NUT_PEG_CLEARANCE_Z = 0.08                                   # 파지 직후 XY 
 NUT_PEG_CLEAR_TOLERANCE = 0.003                              # 수직 이탈 완료 허용오차(3mm)
 NUT_PEG_CLEAR_HOLD_STEPS = 15                                # 이탈 높이 도착 후 파지 안정화
                                                               # 대기(60Hz 기준 0.25초)
-NUT_GRASP_PRELOAD_M = 0.0010                                 # 면간 폭보다 1.0mm 좁게 명령해
+NUT_GRASP_PRELOAD_M = 0.0008                                 # 면간 폭보다 0.8mm 좁게 명령해
                                                               # 접촉 파지력을 만든다
+NUT_GRIP_STIFFNESS = 2.0e5                                   # 페그 위 너트를 옆으로 밀지
+NUT_GRIP_DAMPING = 2.0e3                                     # 않도록 유지력은 확보하되
+NUT_GRIP_MAX_FORCE = 50.0                                    # URDF effort 한계로 제한
+NUT_PEG_CLEAR_SPEED_M_STEP = 0.0003                          # 60Hz 기준 18mm/s 수직 인발
+NUT_PEG_FOLLOW_TOLERANCE_M = 0.008                           # EE-너트 상승량 허용 차이
 BOLT_APPROACH_Z    = 0.6                                     # 너트 체결 상공 고도
 
 # ★ 스테이션별 볼트 1/2번 실측 월드 좌표 (test_isaac 씬 고정 배치 기준) ★
@@ -791,6 +796,19 @@ def stiffen_gripper_grip(robot, joint_names=None):
     _set_runtime_gains(robot, joint_names, 1.0e9, 1.0e6, 1.0e9)
 
 
+def hold_nut_grip(robot, joint_names=None):
+    """페그에서 빼는 동안 너트를 유지하되 과도한 측면 압착력은 제한한다."""
+    if joint_names is None:
+        joint_names = GRIPPER_JOINTS
+    _set_runtime_gains(
+        robot,
+        joint_names,
+        NUT_GRIP_STIFFNESS,
+        NUT_GRIP_DAMPING,
+        NUT_GRIP_MAX_FORCE,
+    )
+
+
 def quat_wxyz_to_yaw(quat_wxyz):
     """월드 Z축 기준 yaw(rad)만 추출 (AMR은 평면 위를 움직이므로 roll/pitch는 무시)."""
     w, x, y, z = quat_wxyz
@@ -1074,7 +1092,11 @@ def main():
     nut_grasp_quat = quat_nut.copy()  # 육각 너트 평면에 맞춘 현재 파지 자세
     nut_grip_target = GRIPPER_CLOSE_NUT.copy()  # 면간 폭에 맞춘 RG2 관절 목표
     nut_peg_clear_pos = None  # 파지 직후 peg에서 수직으로 빠져나올 중간 목표
+    nut_peg_clear_command_pos = None  # 급격한 80mm 목표 대신 매 틱 올리는 명령
     nut_peg_clear_hold = 0    # 중간 목표 도착 후 안정화 카운터
+    nut_clear_start_ee_z = None
+    nut_clear_start_object_z = None
+    nut_clear_follow_fail_steps = 0
     bolt_target_pos  = None   # 체결 목표 좌표
     bolt_touch_pos   = None   # 착좌(Screwing 시작) 목표 좌표
 
@@ -1174,7 +1196,11 @@ def main():
             nut_grasp_quat = quat_nut.copy()
             nut_grip_target = GRIPPER_CLOSE_NUT.copy()
             nut_peg_clear_pos = None
+            nut_peg_clear_command_pos = None
             nut_peg_clear_hold = 0
+            nut_clear_start_ee_z = None
+            nut_clear_start_object_z = None
+            nut_clear_follow_fail_steps = 0
             bolt_target_pos = None
             bolt_touch_pos = None
             screw_sub = "rotate"
@@ -1988,7 +2014,7 @@ def main():
                 if grasp_timer == GRIP_CLOSE_RAMP_STEPS:
                     # 목표각에 도달한 뒤 런타임 드라이브 강성을 올리고 잠깐 기다려
                     # 양쪽 면에 접촉력이 안정적으로 형성된 다음 상승한다.
-                    stiffen_gripper_grip(robot)
+                    hold_nut_grip(robot)
                     print(
                         f"[NUT GRIP] 목표 {nut_grip_target[0]:.4f}rad 도달 -> "
                         f"{GRIP_SETTLE_STEPS}틱 접촉력 안정화"
@@ -2004,7 +2030,24 @@ def main():
                     )
                     clear_z = min(NUT_APPROACH_Z, ee_grasp_pos[2] + NUT_PEG_CLEARANCE_Z)
                     nut_peg_clear_pos = np.array([ee_grasp_pos[0], ee_grasp_pos[1], clear_z])
+                    nut_peg_clear_command_pos = ee_grasp_pos.copy()
                     nut_peg_clear_hold = 0
+                    nut_clear_start_ee_z = float(ee_grasp_pos[2])
+                    nut_xf_current = resolve_nut_assets(
+                        nut_index,
+                        nut1_xform,
+                        nut2_xform,
+                        extra_nut_xforms,
+                    )[0]
+                    nut_start_pos, _ = (
+                        nut_xf_current.get_world_pose()
+                        if nut_xf_current else (None, None)
+                    )
+                    nut_clear_start_object_z = (
+                        float(nut_start_pos[2])
+                        if nut_start_pos is not None else None
+                    )
+                    nut_clear_follow_fail_steps = 0
                     print(f"[OK] {nut_label} 물리 파지 완료! -> XY 고정 수직 이탈 "
                           f"{NUT_PEG_CLEARANCE_Z*1000:.0f}mm 시작 (Target Z={clear_z:.4f})")
                     phase = "NUT_LIFT_CLEAR_PEG"
@@ -2013,8 +2056,13 @@ def main():
             # [13.5단계] 공급대 peg에서 완전히 빠질 때까지 XY 고정 수직 상승
             elif phase == "NUT_LIFT_CLEAR_PEG":
                 publish_progress("NUT_LIFT_CLEAR_PEG", 75.0)
+                nut_peg_clear_command_pos[2] = min(
+                    nut_peg_clear_command_pos[2]
+                    + NUT_PEG_CLEAR_SPEED_M_STEP,
+                    nut_peg_clear_pos[2],
+                )
                 actions = arm_controller.forward(
-                    target_end_effector_position=nut_peg_clear_pos,
+                    target_end_effector_position=nut_peg_clear_command_pos,
                     target_end_effector_orientation=nut_grasp_quat,
                 )
                 robot.apply_action(actions)
@@ -2027,8 +2075,49 @@ def main():
                 z_err = abs(cur_pos[2] - nut_peg_clear_pos[2])
                 xy_err = float(np.linalg.norm(cur_pos[:2] - nut_peg_clear_pos[:2]))
 
+                nut_xf_current = resolve_nut_assets(
+                    nut_index,
+                    nut1_xform,
+                    nut2_xform,
+                    extra_nut_xforms,
+                )[0]
+                nut_now_pos, _ = (
+                    nut_xf_current.get_world_pose()
+                    if nut_xf_current else (None, None)
+                )
+                nut_following = True
+                if (
+                    nut_now_pos is not None
+                    and nut_clear_start_object_z is not None
+                    and nut_clear_start_ee_z is not None
+                ):
+                    ee_rise = max(0.0, float(cur_pos[2]) - nut_clear_start_ee_z)
+                    nut_rise = max(
+                        0.0,
+                        float(nut_now_pos[2]) - nut_clear_start_object_z,
+                    )
+                    nut_following = (
+                        nut_rise + NUT_PEG_FOLLOW_TOLERANCE_M >= ee_rise
+                    )
+                    if ee_rise > 0.01 and not nut_following:
+                        nut_clear_follow_fail_steps += 1
+                    else:
+                        nut_clear_follow_fail_steps = max(
+                            0, nut_clear_follow_fail_steps - 1
+                        )
+
+                if nut_clear_follow_fail_steps >= 15:
+                    print("[ERROR] 수직 인발 중 EE만 상승하고 너트가 따라오지 않습니다")
+                    publish_status("FAILURE:NUT_LOST_DURING_CLEAR")
+                    phase = "IDLE"
+                    continue
+
                 # 목표에 실제 도착한 상태가 연속으로 유지되어야 다음 단계로 넘어간다.
-                if z_err < NUT_PEG_CLEAR_TOLERANCE and xy_err < PICK_TOLERANCE_STRICT:
+                if (
+                    z_err < NUT_PEG_CLEAR_TOLERANCE
+                    and xy_err < PICK_TOLERANCE_STRICT
+                    and nut_following
+                ):
                     nut_peg_clear_hold += 1
                 else:
                     nut_peg_clear_hold = 0
