@@ -142,6 +142,10 @@ class InsertionConfig:
     max_lateral_force_n: float = 20.0
     max_seek_depth_m: float = 0.003
     seek_speed_m_s: float = 0.0025
+    seek_rotation_speed_deg_s: float = 20.0
+    seek_depth_hold_s: float = 0.5
+    contact_position_error_m: float = 0.0006
+    contact_position_hold_steps: int = 6
     force_compliance_m_per_n_s: float = 0.00003
     max_force_step_m: float = 0.00008
     spiral_radius_m: float = 0.0015
@@ -193,12 +197,14 @@ class ForceGuidedNutInsertion:
         self.y_offset = 0.0
         self.elapsed = 0.0
         self.contact_steps = 0
+        self.position_contact_steps = 0
         self.cross_steps = 0
         self.attempt = 1
         self.best_score = float("inf")
         self.best_xy = (0.0, 0.0)
         self.thread_start_z = float(tcp_z)
         self.invalid_steps = 0
+        self.state_start_rotation_deg = 0.0
 
     def _command(self, message: str = "") -> InsertionCommand:
         return InsertionCommand(
@@ -213,9 +219,11 @@ class ForceGuidedNutInsertion:
         )
 
     def _change_state(self, state: InsertionState, sample: NutSensorSample):
+        self.state_start_rotation_deg = self.rotation_deg
         self.state = state
         self.elapsed = 0.0
         self.contact_steps = 0
+        self.position_contact_steps = 0
         self.cross_steps = 0
         if state == InsertionState.CENTER_SEARCH:
             self.best_score = float("inf")
@@ -269,19 +277,58 @@ class ForceGuidedNutInsertion:
                 self.z_offset - cfg.seek_speed_m_s * dt,
                 -cfg.max_seek_depth_m,
             )
+            # 센서축/접촉 판정이 늦어져도 그냥 누르기만 하지 않도록, 접근 중부터
+            # 나사 체결 반대 방향으로 천천히 돌린다. 접촉 후 본 역회전(-backoff)은
+            # THREAD_BACKOFF에서 이어서 수행한다.
+            self.rotation_deg = max(
+                -cfg.backoff_deg * 0.5,
+                -cfg.seek_rotation_speed_deg_s * self.elapsed,
+            )
             if sample.axial_force >= cfg.contact_force_n:
                 self.contact_steps += 1
             else:
                 self.contact_steps = max(0, self.contact_steps - 1)
-            if self.contact_steps >= cfg.contact_hold_steps:
+
+            # joint_6 Fz가 실제 삽입축과 완전히 일치하지 않거나 반력이 작게 잡혀도,
+            # 명령한 하강량에 비해 TCP가 내려가지 않으면 기계적 접촉으로 판단한다.
+            commanded_down = max(0.0, -self.z_offset)
+            actual_down = max(0.0, self.origin_z - sample.tcp_z)
+            position_error = commanded_down - actual_down
+            if (
+                commanded_down >= cfg.contact_position_error_m
+                and position_error >= cfg.contact_position_error_m
+            ):
+                self.position_contact_steps += 1
+            else:
+                self.position_contact_steps = max(
+                    0, self.position_contact_steps - 1
+                )
+
+            force_contact = self.contact_steps >= cfg.contact_hold_steps
+            position_contact = (
+                self.position_contact_steps >= cfg.contact_position_hold_steps
+            )
+            if force_contact or position_contact:
                 self._change_state(InsertionState.CENTER_SEARCH, sample)
-                return self._command("축력 접촉 감지, 나선 중심 탐색 시작")
-            if self.z_offset <= -cfg.max_seek_depth_m:
+                source = "축력" if force_contact else "TCP 하강 정지"
+                return self._command(
+                    f"{source} 접촉 감지, 나선 중심 탐색 시작"
+                )
+            seek_travel_s = cfg.max_seek_depth_m / cfg.seek_speed_m_s
+            if (
+                self.z_offset <= -cfg.max_seek_depth_m
+                and self.elapsed >= seek_travel_s + cfg.seek_depth_hold_s
+            ):
                 self.state = InsertionState.FAILED
                 return self._command("최대 탐색 깊이까지 접촉을 감지하지 못했습니다")
 
         elif self.state == InsertionState.CENTER_SEARCH:
             self._force_control(sample, dt)
+            self.rotation_deg = max(
+                -cfg.backoff_deg,
+                self.state_start_rotation_deg
+                - cfg.seek_rotation_speed_deg_s * self.elapsed,
+            )
             ratio = min(self.elapsed / cfg.spiral_duration_s, 1.0)
             radius = cfg.spiral_radius_m * ratio
             angle = 2.0 * math.pi * cfg.spiral_turns * ratio
@@ -307,7 +354,8 @@ class ForceGuidedNutInsertion:
             self._force_control(sample, dt)
             self.rotation_deg = max(
                 -cfg.backoff_deg,
-                -cfg.thread_find_speed_deg_s * self.elapsed,
+                self.state_start_rotation_deg
+                - cfg.thread_find_speed_deg_s * self.elapsed,
             )
             if self.rotation_deg <= -cfg.backoff_deg:
                 self._change_state(InsertionState.THREAD_FORWARD, sample)

@@ -85,6 +85,45 @@ def test_contact_center_backoff_and_thread_engagement_sequence():
     assert command.engaged
 
 
+def test_seek_contact_rotates_and_position_stall_enters_center_search():
+    controller = ForceGuidedNutInsertion(
+        _fast_config(
+            contact_force_n=100.0,
+            contact_position_error_m=0.0001,
+            contact_position_hold_steps=2,
+            seek_rotation_speed_deg_s=30.0,
+        )
+    )
+    controller.reset(1.0)
+
+    command = controller.update(_sample(axial=0.0, z=1.0), 0.1)
+    assert command.state == InsertionState.SEEK_CONTACT
+    assert command.rotation_deg < 0.0
+
+    command = controller.update(_sample(axial=0.0, z=1.0), 0.1)
+    assert command.state == InsertionState.CENTER_SEARCH
+    assert "TCP 하강 정지" in command.message
+
+
+def test_center_search_keeps_reverse_rotation_active():
+    controller = ForceGuidedNutInsertion(
+        _fast_config(
+            contact_hold_steps=1,
+            center_min_time_s=10.0,
+            spiral_duration_s=1.0,
+            seek_rotation_speed_deg_s=20.0,
+        )
+    )
+    controller.reset(1.0)
+    first = controller.update(_sample(), 0.1)
+    assert first.state == InsertionState.CENTER_SEARCH
+    initial_rotation = first.rotation_deg
+
+    command = controller.update(_sample(lateral=10.0), 0.1)
+    assert command.state == InsertionState.CENTER_SEARCH
+    assert command.rotation_deg < initial_rotation
+
+
 def test_cross_thread_recovery_stops_after_attempt_limit():
     controller = ForceGuidedNutInsertion(
         _fast_config(contact_hold_steps=1, max_attempts=1)

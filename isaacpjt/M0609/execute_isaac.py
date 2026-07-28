@@ -236,6 +236,9 @@ NUT_INSERT_CONFIG = InsertionConfig(
     target_axial_force_n=10.0,
     max_axial_force_n=55.0,
     max_lateral_force_n=20.0,
+    seek_rotation_speed_deg_s=20.0,
+    contact_position_error_m=0.0006,
+    contact_position_hold_steps=6,
     cross_thread_torque_nm=25.0,
     max_attempts=3,
 )
@@ -2105,12 +2108,23 @@ def main():
                     nut_insert_last_state = insert_cmd.state
 
                 if step_count % 20 == 0:
+                    wrist_positions = robot.get_joint_positions(
+                        [wrist_dof_index]
+                    )
+                    wrist_angle_deg = (
+                        math.degrees(float(wrist_positions[0]))
+                        if wrist_positions is not None
+                        and len(wrist_positions) > 0
+                        else float("nan")
+                    )
                     print(
                         f"  [NUT{nut_index} INSERT] {insert_cmd.state.value} | "
                         f"Fz={sensor.axial_force:.1f}N | "
                         f"Fxy={sensor.lateral_force:.1f}N | "
                         f"T={sensor.torque:.1f}Nm | "
                         f"Grip={sensor.gripper_force:.1f} | "
+                        f"RotCmd={insert_cmd.rotation_deg:.1f}° | "
+                        f"J6={wrist_angle_deg:.1f}° | "
                         f"offset=({insert_cmd.x_offset*1000:.2f},"
                         f"{insert_cmd.y_offset*1000:.2f},"
                         f"{insert_cmd.z_offset*1000:.2f})mm"
