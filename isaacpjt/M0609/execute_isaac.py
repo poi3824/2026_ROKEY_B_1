@@ -6,7 +6,7 @@ BehaviorNode (FSM) 및 ArmNode, Vision Correction Node 통신 연동 버전
 [동작 방식]
 0. INIT_POSE            : 관절값 [0, 0, 90, 0, 90, 90] 도 단위로 초기 위치 정렬
 1. SCAN_BATTERY         : 볼트캠 이동/reset 후 최신 wrist scan 자세로 이동
-2. SCAN_BUSBAR          : busbar 상대 자세로 고정캠 이동/reset 후 wrist scan 자세로 이동
+2. SCAN_BUSBAR          : 고정캠 이동/reset 및 fixed pose latch 후 wrist scan 자세로 이동
 3. PICK_BUSBAR          : Z=0.6m 상공 접근 -> Z=0.455m 파지 위치 하강 -> 물리 파지 및 상승
 4. MOVE_BATTERY_CENTER  : ArmNode에서 보낸 배터리 중점 좌표 상공(Z=0.7m)으로 이동
 5. FINE_ALIGNMENT       : 비전 노드의 START_ERRORFIX_CORRECTION 트리거 발송 후, 1픽셀 오차 보정 피드백에 맞춰 미세 정렬
@@ -28,6 +28,7 @@ import sys
 import json
 import math
 import atexit
+import tempfile
 import numpy as np
 from pathlib import Path
 
@@ -80,6 +81,7 @@ from drive_controller import (
     Goal2D,
     GoToPoseController,
     PoseState,
+    normalize_angle,
 )
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -95,20 +97,36 @@ USD_PATH = str(
 )
 
 # 고정카메라 영상은 실제 Camera prim에서 렌더링하고, TF만 그 아래 ROS optical
-# frame에서 발행한다. 현재 USD에는 동일 영상을 글로벌 /rgb 계열로 다시 발행하는
-# legacy graph도 있어 손목카메라와 섞이므로 런타임에 해당 graph만 비활성화한다.
-FIXED_CAMERA_RENDER_PRODUCTS = {
-    "/World/Graph/camera_graph/RenderProduct_busbar": "/World/Camera_busbar",
-    "/World/Graph/camera_graph/RenderProduct_bolt": "/World/Camera_bolt",
+# frame에서 발행한다. fin USD의 /World/Graph/camera_graph에 추가된 고정카메라
+# RenderProduct는 optical Xform을 Camera로 사용해 잘못된 fallback 영상을 만든다.
+# 반면 기존 독립 graph의 RenderProduct는 올바른 Camera prim을 사용하므로, 그
+# graph를 전용 namespace/frame으로 재배선하고 잘못된 분기는 실행 전에 끈다.
+FIXED_CAMERA_BRIDGES = {
+    "/Graph/ROS_Camera_busbar": {
+        "camera": "/World/Camera_busbar",
+        "namespace": "busbar_cam",
+        "optical_frame": "busbar_cam_optical_frame",
+    },
+    "/Graph/ROS_Camera_bolt": {
+        "camera": "/World/Camera_bolt",
+        "namespace": "bolt_cam",
+        "optical_frame": "bolt_cam_optical_frame",
+    },
 }
 FIXED_CAMERA_OPTICAL_FRAMES = (
     "/World/Camera_busbar/busbar_cam_optical_frame",
     "/World/Camera_bolt/bolt_cam_optical_frame",
 )
 TF_PUBLISH_NODE = "/World/ActionGraph/ros2_publish_transform_tree"
-LEGACY_FIXED_CAMERA_GRAPHS = (
-    "/Graph/ROS_Camera_busbar",
-    "/Graph/ROS_Camera_bolt",
+INVALID_FIXED_CAMERA_BRANCHES = (
+    "/World/Graph/camera_graph/RenderProduct_busbar",
+    "/World/Graph/camera_graph/CameraInfoPublish_busbar",
+    "/World/Graph/camera_graph/RGBPublish_busbar",
+    "/World/Graph/camera_graph/DepthPublish_busbar",
+    "/World/Graph/camera_graph/RenderProduct_bolt",
+    "/World/Graph/camera_graph/CameraInfoPublish_bolt",
+    "/World/Graph/camera_graph/RGBPublish_bolt",
+    "/World/Graph/camera_graph/DepthPublish_bolt",
 )
 
 NOVA_CARTER_ROOT = "/World/Nova_Carter/chassis_link"
@@ -328,27 +346,75 @@ RMPFLOW_CFG_PATH = str(_THIS_DIR / "rmpflow/m0609_rmpflow_common.yaml")
 #  [B] 비전 브릿지 및 유틸리티 함수
 # ══════════════════════════════════════════════════════════════════════════
 def configure_fixed_camera_bridges(stage):
-    """고정캠 영상·TF를 전용 토픽으로만 내보내도록 현재 stage를 보정한다."""
-    for graph_path in LEGACY_FIXED_CAMERA_GRAPHS:
-        graph_prim = stage.GetPrimAtPath(graph_path)
-        if graph_prim.IsValid() and graph_prim.IsActive():
-            graph_prim.SetActive(False)
-            print(f"[camera] legacy 글로벌 카메라 graph 비활성화: {graph_path}")
+    """고정캠 영상·TF를 전용 토픽으로만 내보내도록 현재 stage를 보정한다.
 
-    for render_product_path, camera_path in FIXED_CAMERA_RENDER_PRODUCTS.items():
-        render_product = stage.GetPrimAtPath(render_product_path)
+    이 보정은 OmniGraph가 stage를 처음 보기 전에 runtime overlay에 authoring해야
+    한다. stage open 뒤 graph를 비활성화하면 이미 만들어진 synthetic-data
+    writer가 남아 계속 잘못된 카메라 영상을 발행할 수 있다.
+    """
+    for node_path in INVALID_FIXED_CAMERA_BRANCHES:
+        node = stage.GetPrimAtPath(node_path)
+        if not node.IsValid():
+            raise RuntimeError(f"비활성화할 카메라 graph node 누락: {node_path}")
+        enabled_attr = node.GetAttribute("inputs:enabled")
+        if not enabled_attr.IsValid():
+            raise RuntimeError(f"카메라 graph enabled 속성 누락: {node_path}")
+        enabled_attr.Set(False)
+
+    for graph_path, config in FIXED_CAMERA_BRIDGES.items():
+        graph = stage.GetPrimAtPath(graph_path)
+        camera_path = config["camera"]
         camera = stage.GetPrimAtPath(camera_path)
-        if not render_product.IsValid() or not camera.IsValid():
+        if not graph.IsValid() or not camera.IsValid():
             raise RuntimeError(
-                f"고정 카메라 prim 누락: render_product={render_product_path}, "
-                f"camera={camera_path}"
+                f"고정 카메라 prim 누락: graph={graph_path}, camera={camera_path}"
             )
+        graph.SetActive(True)
 
+        render_product_path = f"{graph_path}/RenderProduct"
+        render_product = stage.GetPrimAtPath(render_product_path)
+        if not render_product.IsValid():
+            raise RuntimeError(f"고정 카메라 RenderProduct 누락: {render_product_path}")
         camera_rel = render_product.GetRelationship("inputs:cameraPrim")
         expected = [Sdf.Path(camera_path)]
         if list(camera_rel.GetTargets()) != expected:
             camera_rel.SetTargets(expected)
-            print(f"[camera] {render_product_path} -> {camera_path} 보정")
+        render_product.GetAttribute("inputs:enabled").Set(True)
+
+        publishers = {
+            "CameraInfoPublish": "camera_info",
+            "RGBPublish": "/rgb",
+            "DepthPublish": "/depth",
+        }
+        for node_name, topic_name in publishers.items():
+            node_path = f"{graph_path}/{node_name}"
+            node = stage.GetPrimAtPath(node_path)
+            if not node.IsValid():
+                raise RuntimeError(f"고정 카메라 publisher 누락: {node_path}")
+            values = {
+                "inputs:enabled": True,
+                "inputs:nodeNamespace": config["namespace"],
+                "inputs:frameId": config["optical_frame"],
+                "inputs:topicName": topic_name,
+            }
+            for attribute_name, value in values.items():
+                attribute = node.GetAttribute(attribute_name)
+                if not attribute.IsValid():
+                    raise RuntimeError(
+                        f"고정 카메라 publisher 속성 누락: "
+                        f"{node_path}.{attribute_name}"
+                    )
+                attribute.Set(value)
+
+        depth_pcl_path = f"{graph_path}/DepthPclPublish"
+        depth_pcl = stage.GetPrimAtPath(depth_pcl_path)
+        if depth_pcl.IsValid():
+            depth_pcl.GetAttribute("inputs:enabled").Set(False)
+
+        print(
+            f"[camera] {graph_path} -> /{config['namespace']} "
+            f"(frame={config['optical_frame']}, camera={camera_path})"
+        )
 
     tf_node = stage.GetPrimAtPath(TF_PUBLISH_NODE)
     if not tf_node.IsValid():
@@ -360,7 +426,7 @@ def configure_fixed_camera_bridges(stage):
 
     target_rel = tf_node.GetRelationship("inputs:targetPrims")
     fixed_related = (
-        set(FIXED_CAMERA_RENDER_PRODUCTS.values())
+        {config["camera"] for config in FIXED_CAMERA_BRIDGES.values()}
         | set(FIXED_CAMERA_OPTICAL_FRAMES)
     )
     targets = [
@@ -372,6 +438,8 @@ def configure_fixed_camera_bridges(stage):
     if list(target_rel.GetTargets()) != targets:
         target_rel.SetTargets(targets)
         print("[camera] busbar/bolt optical TF target 보정")
+
+    print("[camera] 잘못된 /World 고정카메라 RenderProduct 분기 비활성화")
 
 
 def configure_ros_domain(stage):
@@ -402,6 +470,50 @@ def configure_ros_domain(stage):
     if found == 0:
         raise RuntimeError("USD에서 ROS2Context를 찾지 못했습니다")
     print(f"[ROS2] USD Context {found}개 domain={domain_id} 적용")
+
+
+def create_runtime_stage_overlay(source_path, output_directory):
+    """원본 USD를 저장하지 않고, 첫 graph 생성 전 적용할 wrapper USD를 만든다."""
+    source_stage = Usd.Stage.Open(str(Path(source_path).resolve()))
+    if source_stage is None:
+        raise RuntimeError(f"원본 USD stage 열기 실패: {source_path}")
+
+    overlay_path = Path(output_directory) / "runtime_stage.usda"
+    layer = Sdf.Layer.CreateNew(str(overlay_path))
+    if layer is None:
+        raise RuntimeError(f"runtime USD layer 생성 실패: {overlay_path}")
+    layer.subLayerPaths = [str(Path(source_path).resolve())]
+
+    stage = Usd.Stage.Open(layer)
+    if stage is None:
+        raise RuntimeError(f"runtime USD stage 생성 실패: {overlay_path}")
+    with Usd.EditContext(stage, layer):
+        # Stage 단위/축 같은 메타데이터는 sublayer에서 root layer로 상속되지 않고
+        # USD fallback(centimeter, Y-up)을 쓸 수 있으므로 원본 값을 명시 복사한다.
+        UsdGeom.SetStageMetersPerUnit(
+            stage,
+            UsdGeom.GetStageMetersPerUnit(source_stage),
+        )
+        UsdGeom.SetStageUpAxis(stage, UsdGeom.GetStageUpAxis(source_stage))
+        stage.SetTimeCodesPerSecond(source_stage.GetTimeCodesPerSecond())
+        stage.SetFramesPerSecond(source_stage.GetFramesPerSecond())
+        stage.SetStartTimeCode(source_stage.GetStartTimeCode())
+        stage.SetEndTimeCode(source_stage.GetEndTimeCode())
+        source_default_prim = source_stage.GetDefaultPrim()
+        if source_default_prim.IsValid():
+            runtime_default_prim = stage.GetPrimAtPath(
+                source_default_prim.GetPath(),
+            )
+            if runtime_default_prim.IsValid():
+                stage.SetDefaultPrim(runtime_default_prim)
+
+        configure_ros_domain(stage)
+        configure_fixed_camera_bridges(stage)
+    if not layer.Save():
+        raise RuntimeError(f"runtime USD layer 저장 실패: {overlay_path}")
+
+    print(f"[camera] 원본 비저장 runtime overlay 준비: {overlay_path}")
+    return overlay_path
 
 
 class Execute_Isaac_Busar(Node):
@@ -1110,11 +1222,20 @@ def validate_stage_contract(stage):
     if not any(prim.IsA(UsdPhysics.Scene) for prim in stage.Traverse()):
         failures.append("UsdPhysics.Scene prim 누락")
 
-    for render_product_path, camera_path in FIXED_CAMERA_RENDER_PRODUCTS.items():
+    for graph_path, config in FIXED_CAMERA_BRIDGES.items():
+        camera_path = config["camera"]
+        render_product_path = f"{graph_path}/RenderProduct"
+        graph = stage.GetPrimAtPath(graph_path)
         render_product = stage.GetPrimAtPath(render_product_path)
         camera = stage.GetPrimAtPath(camera_path)
+        if not graph.IsValid() or not graph.IsActive():
+            failures.append(f"고정 카메라 bridge 비활성/누락: {graph_path}")
         if not camera.IsValid() or not camera.IsA(UsdGeom.Camera):
             failures.append(f"Camera prim 누락/타입 오류: {camera_path}")
+        if render_product.GetAttribute("inputs:enabled").Get() is not True:
+            failures.append(
+                f"고정 카메라 RenderProduct 비활성: {render_product_path}"
+            )
         targets = list(
             render_product.GetRelationship("inputs:cameraPrim").GetTargets()
         )
@@ -1123,23 +1244,53 @@ def validate_stage_contract(stage):
                 f"{render_product_path} cameraPrim={targets}, "
                 f"expected={camera_path}"
             )
+        publishers = {
+            "CameraInfoPublish": "camera_info",
+            "RGBPublish": "/rgb",
+            "DepthPublish": "/depth",
+        }
+        for node_name, topic_name in publishers.items():
+            node_path = f"{graph_path}/{node_name}"
+            node = stage.GetPrimAtPath(node_path)
+            expected_attributes = {
+                "inputs:enabled": True,
+                "inputs:nodeNamespace": config["namespace"],
+                "inputs:frameId": config["optical_frame"],
+                "inputs:topicName": topic_name,
+            }
+            for attribute_name, expected_value in expected_attributes.items():
+                actual_value = node.GetAttribute(attribute_name).Get()
+                if actual_value != expected_value:
+                    failures.append(
+                        f"{node_path}.{attribute_name}={actual_value!r}, "
+                        f"expected={expected_value!r}"
+                    )
+        depth_pcl = stage.GetPrimAtPath(f"{graph_path}/DepthPclPublish")
+        if depth_pcl.IsValid() and (
+            depth_pcl.GetAttribute("inputs:enabled").Get() is not False
+        ):
+            failures.append(f"불필요한 depth_pcl publisher 활성: {graph_path}")
+
+    for node_path in INVALID_FIXED_CAMERA_BRANCHES:
+        node = stage.GetPrimAtPath(node_path)
+        if (
+            not node.IsValid()
+            or node.GetAttribute("inputs:enabled").Get() is not False
+        ):
+            failures.append(f"잘못된 고정카메라 분기 활성/누락: {node_path}")
 
     tf_node = stage.GetPrimAtPath(TF_PUBLISH_NODE)
     tf_targets = set(
         str(path)
         for path in tf_node.GetRelationship("inputs:targetPrims").GetTargets()
     )
-    for camera_path in FIXED_CAMERA_RENDER_PRODUCTS.values():
+    for config in FIXED_CAMERA_BRIDGES.values():
+        camera_path = config["camera"]
         if camera_path in tf_targets:
             failures.append(f"TF가 Camera prim까지 발행함: {camera_path}")
     for optical_path in FIXED_CAMERA_OPTICAL_FRAMES:
         if optical_path not in tf_targets:
             failures.append(f"optical TF target 누락: {optical_path}")
-
-    for graph_path in LEGACY_FIXED_CAMERA_GRAPHS:
-        prim = stage.GetPrimAtPath(graph_path)
-        if prim.IsValid() and prim.IsActive():
-            failures.append(f"legacy camera graph 활성 상태: {graph_path}")
 
     expected_domain = int(os.environ.get("ROS_DOMAIN_ID", "0"))
     context_count = 0
@@ -1248,7 +1399,7 @@ def validate_stage_contract(stage):
 
     print(
         "[PREFLIGHT] PASS: camera/render/optical TF/ROS domain/"
-        "legacy graph/station prim/wheel DriveAPI"
+        "single-publisher bridge/station prim/wheel DriveAPI"
     )
     for station, (position, orientation) in station_camera_poses.items():
         print(
@@ -1368,8 +1519,11 @@ def run_wheel_smoke_test(world, robot, wheel_indices, controller):
 
     command = None
     pose = after_turn
+    phase_counts = {}
+    tail_samples = []
     for _ in range(2400):
         command = controller.compute(pose, PHYSICS_DT)
+        phase_counts[command.phase] = phase_counts.get(command.phase, 0) + 1
         left, right = controller.to_wheel_speeds(
             command.linear,
             command.angular,
@@ -1385,13 +1539,33 @@ def run_wheel_smoke_test(world, robot, wheel_indices, controller):
                 "go-to-pose 중 AMR root pose 불연속 감지 "
                 f"({jump:.3f}m/tick)"
             )
+        tail_samples.append(
+            (
+                command.phase,
+                command.distance_error,
+                abs(command.yaw_error),
+                pose.linear_speed,
+                pose.angular_speed,
+                next_pose.linear_speed,
+                next_pose.angular_speed,
+            )
+        )
+        if len(tail_samples) > 12:
+            tail_samples.pop(0)
         pose = next_pose
         if command.arrived:
             break
     _apply_amr_wheel_speeds(robot, wheel_indices, 0.0, 0.0)
 
     if command is None or not command.arrived:
-        raise RuntimeError("wheel smoke-test go-to-pose가 2400틱 내 수렴하지 못했습니다")
+        raise RuntimeError(
+            "wheel smoke-test go-to-pose가 2400틱 내 수렴하지 못했습니다: "
+            f"phase={getattr(command, 'phase', 'none')}, "
+            f"distance={math.hypot(goal.x - pose.x, goal.y - pose.y):.4f}m, "
+            f"yaw={abs(normalize_angle(goal.yaw - pose.yaw)):.4f}rad, "
+            f"pose=({pose.x:.4f},{pose.y:.4f},{pose.yaw:.4f}), "
+            f"phase_counts={phase_counts}, tail={tail_samples}"
+        )
     distance_error = math.hypot(goal.x - pose.x, goal.y - pose.y)
     yaw_error = abs(
         math.atan2(
@@ -1427,22 +1601,33 @@ def main():
     if not usd_file_path.is_file():
         raise FileNotFoundError(f"[ERROR] USD 파일을 찾을 수 없습니다: {usd_file_path}")
 
+    # OmniGraph는 open_stage 중 graph를 구성할 수 있으므로, stage를 연 다음 session
+    # layer를 고치는 방식으로는 이미 생성된 카메라 writer를 확실히 제거할 수 없다.
+    # 원본 fin USD를 sublayer로 둔 임시 wrapper를 먼저 만들어 첫 open부터 보정된
+    # graph만 보이게 한다. TemporaryDirectory는 main 종료 뒤 자동 정리된다.
+    runtime_stage_directory = tempfile.TemporaryDirectory(
+        prefix="amr_runtime_usd_",
+    )
+    runtime_stage_path = create_runtime_stage_overlay(
+        usd_file_path,
+        runtime_stage_directory.name,
+    )
+
     ctx = omni.usd.get_context()
-    ctx.open_stage(str(usd_file_path))
+    opened = ctx.open_stage(str(runtime_stage_path))
+    if not opened:
+        raise RuntimeError(
+            f"[ERROR] runtime Stage open 실패: {runtime_stage_path}"
+        )
+    stage = ctx.get_stage()
+    if not stage:
+        raise RuntimeError(
+            f"[ERROR] runtime Stage를 로드하지 못했습니다: {runtime_stage_path}"
+        )
+
     for _ in range(15):
         simulation_app.update()
 
-    stage = ctx.get_stage()
-    if not stage:
-        raise RuntimeError(f"[ERROR] Stage를 로드하지 못했습니다: {usd_file_path}")
-
-    # Context를 먼저 순회해야 legacy graph를 비활성화해도 그 내부 Context까지
-    # 현재 domain으로 일관되게 맞출 수 있다.
-    # 카메라/ROS 보정은 root layer가 아니라 익명 session layer에만 authoring한다.
-    # 따라서 실수로 stage 저장이 호출돼도 원본 fin USD에는 변경이 남지 않는다.
-    with Usd.EditContext(stage, stage.GetSessionLayer()):
-        configure_ros_domain(stage)
-        configure_fixed_camera_bridges(stage)
     if _PREFLIGHT_ONLY:
         validate_stage_contract(stage)
         ctx.close_stage()
@@ -1678,6 +1863,33 @@ def main():
             robot_orientation=np.array([base_quat.GetReal(), *[float(x) for x in base_quat.GetImaginary()]]),
         )
 
+    def hold_current_arm_pose():
+        """현재 팔 6축을 hold하고 RMPFlow의 이전 EE target을 폐기한다."""
+        arm_joint_names = (
+            "joint_1",
+            "joint_2",
+            "joint_3",
+            "joint_4",
+            "joint_5",
+            "joint_6",
+        )
+        arm_dof_indices = [
+            robot.get_dof_index(name) for name in arm_joint_names
+        ]
+        current_positions = np.asarray(
+            robot.get_joint_positions()[arm_dof_indices],
+            dtype=float,
+        )
+        arm_controller.reset()
+        sync_rmpflow_base_pose()
+        robot.apply_action(
+            ArticulationAction(
+                joint_positions=current_positions,
+                joint_velocities=np.zeros_like(current_positions),
+                joint_indices=arm_dof_indices,
+            )
+        )
+
     sync_rmpflow_base_pose()
 
     print("\nIsaac Sim 준비 완료 - BehaviorNode 명령을 대기합니다.")
@@ -1748,6 +1960,9 @@ def main():
 
         # 1. Play / Stop 상태 보정
         if playing and not was_playing:
+            stale_busbar_camera_wait = (
+                phase == "WAIT_BUSBAR_CAMERA_LATCH"
+            )
             world.reset()
             prepare_amr_physics(stage)
             wheel_indices = _configure_runtime_wheel_drive(robot)
@@ -1823,6 +2038,20 @@ def main():
             amr_goal_stamp = ""
             amr_drive_publish_step = 0
             wheels_locked = True
+
+            if stale_busbar_camera_wait:
+                hold_current_arm_pose()
+                phase = "IDLE"
+                step_count = 0
+                isaac_node.latest_target_pose = None
+                isaac_node.pub_busbar_perception_reset.publish(Empty())
+                publish_status(
+                    "FAILURE:PLAYBACK_RESTART_DURING_BUSBAR_LATCH"
+                )
+                print(
+                    "\n[ARM] playback 재시작으로 fixed-camera latch 대기를 "
+                    "취소하고 팔을 현재 자세로 hold합니다"
+                )
 
         # battery4_main의 너트 AMR glue 추종. PICK된 너트는 nut_released=True가 되어
         # 여기서 제외되고 이후부터 정상 다이나믹 바디로 움직인다.
@@ -2057,8 +2286,25 @@ def main():
             task = isaac_node.requested_task
             isaac_node.requested_task = None
 
+            # 명시적 cancel은 wheel interlock보다 먼저 처리해야 한다. 그렇지 않으면
+            # 주행 중 task 거부 경로가 cancel 문자열을 지워 내부 WAIT phase가 남는다.
+            if task == "CANCEL_ARM_TASK":
+                hold_current_arm_pose()
+                phase = "IDLE"
+                step_count = 0
+                isaac_node.latest_target_pose = None
+                isaac_node.alignment_success = False
+                reset_cmd = String()
+                reset_cmd.data = "RESET_BOLT_DETECTION"
+                isaac_node.pub_errorfix_command.publish(reset_cmd)
+                print(
+                    "\n[ARM] 명시적 Action cancel 수신 -> 현재 관절 hold 및 "
+                    "진행 중 phase 중지"
+                )
+                task = ""
+
             # 안전장치: 팔 Task는 AMR이 도착해 바퀴가 잠긴 상태에서만 수행되어야 한다.
-            if not wheels_locked:
+            if task and not wheels_locked:
                 _apply_amr_wheel_speeds(
                     robot, wheel_indices, 0.0, 0.0
                 )
@@ -2081,22 +2327,16 @@ def main():
                 amr_goal_stamp = ""
                 sync_rmpflow_base_pose()
                 publish_status("FAILURE:AMR_STILL_DRIVING")
+                if (
+                    task == "CONTINUE_BUSBAR_WRIST_SCAN"
+                    and phase == "WAIT_BUSBAR_CAMERA_LATCH"
+                ):
+                    hold_current_arm_pose()
+                    phase = "IDLE"
+                    step_count = 0
                 task = ""
 
-            if task == "CANCEL_ARM_TASK":
-                # Action 취소는 ArmNode의 대기만 끝내서는 안 된다. 진행 중인 Isaac
-                # phase도 즉시 중지하고 error-fix loop를 비활성화한다. 파지 중인
-                # 물체는 갑자기 놓지 않고 현재 gripper/joint 상태로 안전하게 유지한다.
-                phase = "IDLE"
-                step_count = 0
-                isaac_node.latest_target_pose = None
-                isaac_node.alignment_success = False
-                reset_cmd = String()
-                reset_cmd.data = "RESET_BOLT_DETECTION"
-                isaac_node.pub_errorfix_command.publish(reset_cmd)
-                print("\n[ARM] 명시적 Action cancel 수신 -> 진행 중 phase 중지")
-
-            elif task == "SCAN_BATTERY":
+            if task == "SCAN_BATTERY":
                 # 최신 방식대로 실제 bolt_2 XY로 카메라만 평행 이동하고 기존 Z·자세는
                 # 유지한다. reset 뒤의 3-frame barrier는 perception 인스턴스가 맡는다.
                 bolt_paths = STATION_BOLT_PRIM_PATHS.get(current_station)
@@ -2171,6 +2411,35 @@ def main():
                     )
                     isaac_node.pub_busbar_perception_reset.publish(Empty())
 
+                    # b83 고정캠은 busbar 바로 위를 내려다보므로 wrist scan 자세로
+                    # 먼저 이동하면 팔이 시야를 가려 v3 confidence가 0.6 아래로
+                    # 떨어진다. 카메라 이동/reset 뒤 ArmNode가 fixed pose를 latch할
+                    # 때까지 여기서 멈추고, 내부 continue 명령을 받은 뒤에만 wrist
+                    # scan 자세로 이동한다. 외부 ExecuteArmTask API는 바뀌지 않는다.
+                    phase = "WAIT_BUSBAR_CAMERA_LATCH"
+                    step_count = 0
+                    publish_progress("BUSBAR_CAMERA_READY", 20.0)
+                    print(
+                        f"\n>>> [{task}] station {current_station} b83 상대 "
+                        "6DoF로 고정 버스바캠 이동/reset 완료 -> fixed pose "
+                        f"latch 대기 (camera=({busbar_camera_position[0]:.4f}, "
+                        f"{busbar_camera_position[1]:.4f}, "
+                        f"{busbar_camera_position[2]:.4f}))"
+                    )
+
+            elif task == "CONTINUE_BUSBAR_WRIST_SCAN":
+                if phase != "WAIT_BUSBAR_CAMERA_LATCH":
+                    print(
+                        f"\n[ERROR] [{task}] fixed pose latch 대기 상태가 "
+                        f"아닙니다 (phase={phase})"
+                    )
+                    publish_status(
+                        "FAILURE:INVALID_BUSBAR_SCAN_CONTINUE"
+                    )
+                    hold_current_arm_pose()
+                    phase = "IDLE"
+                    step_count = 0
+                else:
                     if current_station in STATION_BUSBAR_SCAN_XY:
                         scan_xy = STATION_BUSBAR_SCAN_XY[current_station]
                         BUSBAR_SCAN_POS = np.array(
@@ -2197,11 +2466,8 @@ def main():
                     phase = "SCAN_BUSBAR_LIFT"
                     step_count = 0
                     print(
-                        f"\n>>> [{task}] station {current_station} b83 상대 "
-                        "6DoF로 고정 버스바캠 이동/reset 완료 -> 최신 wrist "
-                        f"scan 자세 이동 (camera=({busbar_camera_position[0]:.4f}, "
-                        f"{busbar_camera_position[1]:.4f}, "
-                        f"{busbar_camera_position[2]:.4f}))"
+                        "\n>>> [SCAN_BUSBAR] fixed pose latch 확인 -> "
+                        "최신 station별 wrist scan 자세 이동 시작"
                     )
 
             elif task == "PICK_BUSBAR":
@@ -3285,7 +3551,11 @@ def main():
 
             # Phase 타임아웃 예외 처리
             if (
-                phase not in {"WAIT_BUSBAR_TARGET", "FINE_ALIGNMENT"}
+                phase not in {
+                    "WAIT_BUSBAR_CAMERA_LATCH",
+                    "WAIT_BUSBAR_TARGET",
+                    "FINE_ALIGNMENT",
+                }
                 and step_count > MAX_STUCK_STEPS
             ):
                 print(f"\n[ERROR] Phase '{phase}' 진행 시간 초과 - 실패 처리")

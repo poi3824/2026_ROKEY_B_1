@@ -267,6 +267,23 @@ def test_camera_clients_resets_and_cancel_contract(arm_module):
     )
 
 
+def test_overlapping_action_is_rejected_as_busy(arm_module):
+    node = arm_module.ArmNode()
+    goal = _Goal("SCAN_BUSBAR")
+    assert node._execution_lock.acquire(blocking=False)
+
+    try:
+        result = node.execute_callback(goal)
+    finally:
+        node._execution_lock.release()
+
+    assert not result.success
+    assert result.error_code == "BUSY"
+    assert goal.transition == "aborted"
+    assert not node.pub_task_command.published
+    assert not node.pub_target_pose.published
+
+
 def test_reset_waits_for_the_matching_perception_ack(
     arm_module,
     monkeypatch,
@@ -287,6 +304,50 @@ def test_reset_waits_for_the_matching_perception_ack(
     )
     assert len(node.pub_busbar_reset.published) == 1
     assert sleep_calls == [True]
+
+
+def test_phase_wait_forwards_feedback_until_camera_ready(
+    arm_module,
+    monkeypatch,
+):
+    node = arm_module.ArmNode()
+    node.isaac_phase = "SCAN_BUSBAR_NAV"
+    node.isaac_progress = 42.0
+    goal = _Goal("SCAN_BUSBAR")
+    sleeps = []
+
+    def advance_to_ready(_duration):
+        sleeps.append(True)
+        node.isaac_phase = "BUSBAR_CAMERA_READY"
+
+    monkeypatch.setattr(arm_module.time, "sleep", advance_to_ready)
+
+    assert node.wait_for_isaac_phase(
+        "BUSBAR_CAMERA_READY",
+        goal,
+        arm_module.ExecuteArmTask.Feedback(),
+    )
+    assert sleeps == [True]
+    assert len(goal.feedback) == 2
+    assert goal.feedback[-1].sub_phase == "BUSBAR_CAMERA_READY"
+    assert goal.feedback[-1].progress_pct == pytest.approx(42.0)
+
+
+def test_phase_wait_stops_on_isaac_failure(arm_module, monkeypatch):
+    node = arm_module.ArmNode()
+    node.isaac_status = "FAILURE: camera move failed"
+    goal = _Goal("SCAN_BUSBAR")
+    monkeypatch.setattr(
+        arm_module.time,
+        "sleep",
+        lambda _duration: pytest.fail("terminal failure must not sleep"),
+    )
+
+    assert not node.wait_for_isaac_phase(
+        "BUSBAR_CAMERA_READY",
+        goal,
+        arm_module.ExecuteArmTask.Feedback(),
+    )
 
 
 def test_wrist_confirmation_requires_fresh_increasing_samples(arm_module):
@@ -382,16 +443,35 @@ def test_scan_latches_fixed_pose_and_pick_reuses_exact_snapshot(
     reset_topics = []
     service_requests = []
     delays = []
+    scan_order = []
 
-    node.wait_for_isaac_completion = (
-        lambda _goal, _feedback: True
-    )
+    def wait_for_phase(expected, _goal, _feedback):
+        scan_order.append(f"phase:{expected}")
+        return True
+
+    def wait_for_completion(request_goal, _feedback):
+        if request_goal.request.task_type == "SCAN_BUSBAR":
+            scan_order.append("isaac:success")
+            assert [
+                message.data
+                for message in node.pub_task_command.published
+            ] == ["SCAN_BUSBAR", "CONTINUE_BUSBAR_WRIST_SCAN"]
+        return True
+
+    node.wait_for_isaac_phase = wait_for_phase
+    node.wait_for_isaac_completion = wait_for_completion
 
     def reset(publisher, _goal):
         reset_topics.append(publisher.topic)
-        return 100 if "busbar_cam" in publisher.topic else 200
+        scan_order.append(f"reset:{publisher.topic}")
+        return True
 
     def fixed_request(client, label, goal):
+        scan_order.append("fixed:latch")
+        assert [
+            message.data
+            for message in node.pub_task_command.published
+        ] == ["SCAN_BUSBAR"]
         service_requests.append(
             (
                 client.topic,
@@ -403,13 +483,17 @@ def test_scan_latches_fixed_pose_and_pick_reuses_exact_snapshot(
 
     node._reset_perception_cache = reset
     node.request_grasp_pose_until_found = fixed_request
-    node.wait_for_wrist_busbar_confirmation = (
-        lambda selected, _goal: (
+
+    def confirm_wrist(selected, _goal):
+        scan_order.append("wrist:confirm")
+        assert selected is fixed
+        return (
             True,
             wrist,
             f"selected={selected.pose.position.x}",
         )
-    )
+
+    node.wait_for_wrist_busbar_confirmation = confirm_wrist
     node._wait_while_active = (
         lambda duration, _goal: delays.append(duration) or True
     )
@@ -434,8 +518,16 @@ def test_scan_latches_fixed_pose_and_pick_reuses_exact_snapshot(
     assert [
         message.data
         for message in node.pub_task_command.published
-    ] == ["SCAN_BUSBAR"]
+    ] == ["SCAN_BUSBAR", "CONTINUE_BUSBAR_WRIST_SCAN"]
     assert not node.pub_target_pose.published
+    assert scan_order == [
+        "phase:BUSBAR_CAMERA_READY",
+        "reset:/busbar_cam/perception/reset_cache",
+        "fixed:latch",
+        "isaac:success",
+        "reset:/wrist/perception/reset_cache",
+        "wrist:confirm",
+    ]
 
     pick_goal = _Goal("PICK_BUSBAR")
     pick_result = node.execute_callback(pick_goal)
@@ -447,7 +539,11 @@ def test_scan_latches_fixed_pose_and_pick_reuses_exact_snapshot(
     assert [
         message.data
         for message in node.pub_task_command.published
-    ] == ["SCAN_BUSBAR", "PICK_BUSBAR"]
+    ] == [
+        "SCAN_BUSBAR",
+        "CONTINUE_BUSBAR_WRIST_SCAN",
+        "PICK_BUSBAR",
+    ]
     target_event = next(
         index
         for index, (topic, _message) in enumerate(node._events)
@@ -484,6 +580,8 @@ def test_pick_rejects_missing_fixed_snapshot_without_fallback(arm_module):
 
 def test_scan_cancel_is_reported_as_canceled_not_aborted(arm_module):
     node = arm_module.ArmNode()
+    previous_snapshot = _pose(arm_module, 0.4, 0.5, 0.6, 99)
+    node.scanned_busbar_pose = previous_snapshot
     goal = _Goal("SCAN_BUSBAR")
     goal.is_cancel_requested = True
 
@@ -492,8 +590,67 @@ def test_scan_cancel_is_reported_as_canceled_not_aborted(arm_module):
     assert not result.success
     assert result.error_code == "SCAN_BUSBAR_CANCELED"
     assert goal.transition == "canceled"
+    assert node.scanned_busbar_pose is previous_snapshot
     assert not node.pub_busbar_reset.published
     assert not node.pub_wrist_reset.published
+    assert [
+        message.data
+        for message in node.pub_task_command.published
+    ] == []
+
+
+def test_scan_cancel_fence_before_continue_releases_isaac_pause(arm_module):
+    node = arm_module.ArmNode()
+    goal = _Goal("SCAN_BUSBAR")
+    fixed = _pose(arm_module, 1.2, -0.4, 0.2, 201)
+    node.wait_for_isaac_phase = (
+        lambda _phase, _goal, _feedback: True
+    )
+    node._reset_perception_cache = (
+        lambda _publisher, _goal: True
+    )
+
+    def cancel_fixed_request(_client, _label, request_goal):
+        request_goal.is_cancel_requested = True
+        return True, fixed, "fixed before cancel"
+
+    node.request_grasp_pose_until_found = cancel_fixed_request
+    node.wait_for_isaac_completion = lambda *_args: pytest.fail(
+        "cancel fence must stop before waiting for wrist scan"
+    )
+
+    result = node.execute_callback(goal)
+
+    assert not result.success
+    assert result.error_code == "SCAN_BUSBAR_CANCELED"
+    assert goal.transition == "canceled"
+    assert [
+        message.data
+        for message in node.pub_task_command.published
+    ] == ["SCAN_BUSBAR", "CANCEL_ARM_TASK"]
+
+
+def test_scan_failure_before_continue_releases_isaac_pause(arm_module):
+    node = arm_module.ArmNode()
+    goal = _Goal("SCAN_BUSBAR")
+    node.wait_for_isaac_phase = (
+        lambda _phase, _goal, _feedback: True
+    )
+    node._reset_perception_cache = (
+        lambda _publisher, _goal: True
+    )
+
+    def fail_fixed_request(_client, _label, _goal):
+        node.isaac_status = "FAILURE: camera bridge stopped"
+        return False, None, "Isaac failure"
+
+    node.request_grasp_pose_until_found = fail_fixed_request
+
+    result = node.execute_callback(goal)
+
+    assert not result.success
+    assert result.error_code == "BUSBAR_VISION_INTERRUPTED"
+    assert goal.transition == "aborted"
     assert [
         message.data
         for message in node.pub_task_command.published

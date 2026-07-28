@@ -39,7 +39,10 @@ def test_approved_physical_defaults():
     assert config.max_linear == pytest.approx(0.35)
     assert config.max_angular == pytest.approx(0.75)
     assert config.position_tolerance == pytest.approx(0.02)
+    assert config.position_capture_tolerance == pytest.approx(0.015)
+    assert config.position_release_tolerance == pytest.approx(0.025)
     assert config.yaw_tolerance == pytest.approx(0.03)
+    assert config.yaw_capture_tolerance == pytest.approx(0.02)
     assert config.settle_steps == 12
     assert config.max_wheel_radps == pytest.approx(10.0)
 
@@ -107,6 +110,24 @@ def test_direction_is_selected_on_first_compute_when_pose_is_deferred():
     assert command.travel_direction == 'reverse'
 
 
+def test_near_goal_capture_is_identical_with_deferred_initial_pose():
+    goal = Goal2D(0.0, 0.0, 0.0)
+    pose = PoseState(0.018, 0.0, 0.025)
+
+    immediate = GoToPoseController(_fast_config())
+    immediate.set_goal(goal, current_pose=pose)
+    immediate_command = immediate.compute(pose, 0.1)
+
+    deferred = GoToPoseController(_fast_config())
+    deferred.set_goal(goal)
+    deferred_command = deferred.compute(pose, 0.1)
+
+    assert immediate_command == deferred_command
+    assert deferred_command.phase == 'settling'
+    assert deferred_command.linear == pytest.approx(0.0)
+    assert deferred_command.angular == pytest.approx(0.0)
+
+
 def test_selected_direction_is_held_for_the_whole_goal():
     controller = GoToPoseController(_fast_config())
     controller.set_goal(
@@ -169,19 +190,211 @@ def test_wheel_conversion_and_joint_scaling():
 
 
 def test_position_and_yaw_tolerances_gate_settling():
+    position_controller = GoToPoseController(_fast_config())
+    position_controller.set_goal(
+        Goal2D(0.0, 0.0, 0.0),
+        current_pose=PoseState(0.0, 0.0, 0.0),
+    )
+    position = position_controller.compute(
+        PoseState(0.0201, 0.0, 0.0),
+        0.1,
+    )
+
+    yaw_controller = GoToPoseController(_fast_config())
+    yaw_controller.set_goal(
+        Goal2D(0.0, 0.0, 0.0),
+        current_pose=PoseState(0.0, 0.0, 0.0),
+    )
+    yaw = yaw_controller.compute(PoseState(0.0, 0.0, 0.0301), 0.1)
+
+    inside_controller = GoToPoseController(_fast_config())
+    inside_pose = PoseState(0.02, 0.0, 0.03)
+    inside_controller.set_goal(
+        Goal2D(0.0, 0.0, 0.0),
+        current_pose=inside_pose,
+    )
+    inside = inside_controller.compute(inside_pose, 0.1)
+
+    assert position.phase in {'drive', 'turn_to_path'}
+    assert yaw.phase == 'final_align'
+    assert inside.phase == 'settling'
+
+
+def test_final_yaw_reacquires_inner_boundary_before_settling():
     controller = GoToPoseController(_fast_config())
     controller.set_goal(
         Goal2D(0.0, 0.0, 0.0),
         current_pose=PoseState(0.0, 0.0, 0.0),
     )
 
-    position = controller.compute(PoseState(0.0201, 0.0, 0.0), 0.1)
-    yaw = controller.compute(PoseState(0.0, 0.0, 0.0301), 0.1)
-    inside = controller.compute(PoseState(0.02, 0.0, 0.03), 0.1)
+    outside = controller.compute(PoseState(0.0, 0.0, 0.0301), 0.1)
+    barely_inside = controller.compute(
+        PoseState(0.0, 0.0, 0.0299),
+        0.1,
+    )
+    captured = controller.compute(PoseState(0.0, 0.0, 0.0199), 0.1)
+    drifted = controller.compute(PoseState(0.0, 0.0, 0.0299), 0.1)
 
-    assert position.phase in {'drive', 'turn_to_path'}
-    assert yaw.phase == 'final_align'
-    assert inside.phase == 'settling'
+    assert outside.phase == 'final_align'
+    assert barely_inside.phase == 'final_align'
+    assert captured.phase == 'settling'
+    assert drifted.phase == 'settling'
+
+
+def test_yaw_capture_margin_converges_with_small_boundary_drift():
+    controller = GoToPoseController(ControllerConfig())
+    goal = Goal2D(0.0, 0.0, 0.0)
+    yaw = -0.0301
+    controller.set_goal(
+        goal,
+        current_pose=PoseState(0.0199, 0.0, yaw),
+    )
+
+    command = None
+    dt = 1.0 / 60.0
+    drift_per_tick = -0.0001
+    for _ in range(240):
+        command = controller.compute(
+            PoseState(
+                0.0199,
+                0.0,
+                yaw,
+                angular_speed=abs(drift_per_tick / dt),
+            ),
+            dt,
+        )
+        yaw = normalize_angle(
+            yaw + command.angular * dt + drift_per_tick
+        )
+        if command.arrived:
+            break
+
+    assert command is not None
+    assert command.arrived
+    assert command.phase == 'arrived'
+    assert command.distance_error <= controller.config.position_tolerance
+    assert abs(command.yaw_error) <= controller.config.yaw_tolerance
+
+
+def test_active_position_trim_reacquires_inner_boundary_before_settling():
+    controller = GoToPoseController(ControllerConfig())
+    goal = Goal2D(0.0, 0.0, 0.0)
+    controller.set_goal(
+        goal,
+        current_pose=PoseState(-1.0, 0.0, 0.0),
+    )
+
+    # Capture the goal position, then reproduce the measured outward slip
+    # beyond 20mm that activates final position trim.
+    controller.compute(PoseState(-0.014, 0.0, 0.0), 1.0 / 60.0)
+    x = -0.0201
+    command = None
+    dt = 1.0 / 60.0
+    drift_per_tick = -0.0001
+    phases = []
+    for _ in range(240):
+        command = controller.compute(
+            PoseState(
+                x,
+                0.0,
+                0.0,
+                linear_speed=abs(drift_per_tick / dt),
+            ),
+            dt,
+        )
+        phases.append(command.phase)
+        x += command.linear * dt + drift_per_tick
+        if command.arrived:
+            break
+
+    assert command is not None
+    assert command.arrived
+    assert 'position_trim' in phases
+    first_settling = phases.index('settling')
+    assert all(
+        phase not in {'settling', 'arrived'}
+        for phase in phases[:first_settling]
+    )
+    assert command.distance_error <= controller.config.position_tolerance
+    assert abs(command.yaw_error) <= controller.config.yaw_tolerance
+
+
+def test_reverse_position_trim_prevents_boundary_phase_limit_cycle():
+    controller = GoToPoseController(_fast_config())
+    goal = Goal2D(
+        0.5867,
+        1.9078,
+        -math.pi / 2.0,
+    )
+    start = PoseState(0.665, -0.019, -math.pi / 2.0)
+    controller.set_goal(goal, current_pose=start)
+    controller.compute(start, 0.1)
+
+    # Capture inside 15mm, then inject the position drift measured during
+    # the final yaw correction.
+    entry = PoseState(0.5855, 1.8948, math.radians(-94.4))
+    first = controller.compute(entry, 0.1)
+    slipped = controller.compute(
+        PoseState(0.5840, 1.8859, math.radians(-91.5)),
+        0.1,
+    )
+
+    assert controller.travel_direction == 'reverse'
+    assert first.phase == 'final_align'
+    assert first.angular > 0.0
+    assert slipped.phase == 'position_trim'
+    assert slipped.linear < 0.0
+    assert slipped.angular > 0.0
+    assert slipped.angular < controller.config.min_angular
+    assert not slipped.arrived
+
+    # The measured limit cycle used to switch to turn_to_path here. Continue
+    # feeding a converging reverse correction and require the controller to
+    # retain the final-yaw trim phase until the strict 20mm boundary is met.
+    outside = controller.compute(
+        PoseState(0.5842, 1.88795, math.radians(-90.9)),
+        0.1,
+    )
+    inside = controller.compute(
+        PoseState(0.5845, 1.8882, math.radians(-90.5)),
+        0.1,
+    )
+
+    assert outside.distance_error > 0.02
+    assert outside.phase == 'position_trim'
+    assert outside.linear < 0.0
+    assert inside.distance_error < 0.02
+    assert inside.distance_error > controller.config.position_capture_tolerance
+    assert inside.phase == 'position_trim'
+    assert not inside.arrived
+
+    captured = controller.compute(
+        PoseState(0.5845, 1.8930, math.radians(-90.5)),
+        0.1,
+    )
+    assert captured.distance_error < controller.config.position_capture_tolerance
+    assert captured.phase == 'settling'
+
+
+def test_position_trim_falls_back_when_residual_is_not_reachable():
+    controller = GoToPoseController(_fast_config())
+    goal = Goal2D(0.0, 0.0, 0.0)
+    start = PoseState(-1.0, 0.0, 0.0)
+    controller.set_goal(goal, current_pose=start)
+
+    controller.compute(
+        PoseState(-0.010, -0.005, math.radians(-3.0)),
+        0.1,
+    )
+    lateral_residual = controller.compute(
+        PoseState(-0.010, -0.021, 0.0),
+        0.1,
+    )
+
+    assert lateral_residual.distance_error > 0.02
+    assert lateral_residual.phase in {'drive', 'turn_to_path'}
+    assert lateral_residual.phase != 'position_trim'
+    assert not lateral_residual.arrived
 
 
 def test_arrival_requires_twelve_consecutive_stationary_ticks():

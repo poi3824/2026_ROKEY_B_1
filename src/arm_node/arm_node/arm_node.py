@@ -17,6 +17,7 @@ Run the ROS 2 arm action server with camera-specific perception.
 """
 
 import math
+import threading
 import time
 import rclpy
 from rclpy.node import Node
@@ -50,6 +51,8 @@ class ArmNode(Node):
 
         # Reentrant Callback Group 적용 (교착 상태 방지)
         self.cb_group = ReentrantCallbackGroup()
+        # Reentrant executor에서도 arm task state는 한 goal만 소유해야 한다.
+        self._execution_lock = threading.Lock()
 
         # 1. Action Server 생성
         self._action_server = ActionServer(
@@ -176,7 +179,24 @@ class ArmNode(Node):
         return CancelResponse.ACCEPT
 
     def execute_callback(self, goal_handle):
-        """Execute one externally compatible ``ExecuteArmTask`` goal."""
+        """Serialize externally compatible ``ExecuteArmTask`` goals."""
+        if not self._execution_lock.acquire(blocking=False):
+            result_msg = ExecuteArmTask.Result()
+            result_msg.success = False
+            result_msg.error_code = "BUSY"
+            result_msg.message = (
+                "다른 ExecuteArmTask가 실행 중이므로 요청을 거부했습니다."
+            )
+            self._abort_or_cancel(goal_handle)
+            return result_msg
+
+        try:
+            return self._execute_task(goal_handle)
+        finally:
+            self._execution_lock.release()
+
+    def _execute_task(self, goal_handle):
+        """Execute one goal while holding the arm execution lock."""
         task_type = goal_handle.request.task_type
         self.get_logger().info(
             "\n================ "
@@ -258,16 +278,33 @@ class ArmNode(Node):
         elif task_type == "SCAN_BUSBAR":
             self.get_logger().info(" -> [SCAN_BUSBAR] Isaac Sim으로 버스바 스캔 이동 명령 전송")
 
+            # 이미 취소된 goal은 상태 변경이나 Isaac task를 시작하지 않는다.
+            if goal_handle.is_cancel_requested:
+                result_msg.success = False
+                result_msg.error_code = "SCAN_BUSBAR_CANCELED"
+                result_msg.message = "버스바 스캔이 취소됐습니다."
+                goal_handle.canceled()
+                return result_msg
+
             # 이전 cycle의 snapshot은 새 SCAN이 시작되는 즉시 무효화한다.
             self.scanned_busbar_pose = None
+            # 직전 task의 phase를 새 handshake의 READY로 오인하지 않는다.
+            self.isaac_phase = ""
+
             cmd_msg = String()
             cmd_msg.data = "SCAN_BUSBAR"
             self.pub_task_command.publish(cmd_msg)
 
-            # 1. Isaac Sim이 버스바 스캔 위치로 이동 완료할 때까지 대기
-            success = self.wait_for_isaac_completion(goal_handle, feedback_msg)
+            # 1. Isaac은 고정 카메라를 이동한 뒤 wrist 이동 전에 일시 정지한다.
+            ready = self.wait_for_isaac_phase(
+                "BUSBAR_CAMERA_READY",
+                goal_handle,
+                feedback_msg,
+            )
 
-            if not success:
+            if not ready:
+                # CONTINUE 전에 빠져나가면 Isaac의 pause를 반드시 해제한다.
+                self._publish_cancel_arm_task()
                 result_msg.success = False
                 if goal_handle.is_cancel_requested:
                     result_msg.error_code = "SCAN_BUSBAR_CANCELED"
@@ -275,15 +312,30 @@ class ArmNode(Node):
                 else:
                     result_msg.error_code = "SCAN_BUSBAR_FAILED"
                     result_msg.message = (
-                        "버스바 스캔 위치 이동 실패 "
+                        "고정 카메라 준비 대기 실패 "
                         f"(Status: {self.isaac_status})"
                     )
                 self._abort_or_cancel(goal_handle)
                 return result_msg
 
             # 2. 고정 카메라의 새 snapshot을 먼저 latch한다.
-            self._reset_perception_cache(
-                self.pub_busbar_reset, goal_handle)
+            if not self._reset_perception_cache(
+                self.pub_busbar_reset,
+                goal_handle,
+            ):
+                self._publish_cancel_arm_task()
+                result_msg.success = False
+                if goal_handle.is_cancel_requested:
+                    result_msg.error_code = "SCAN_BUSBAR_CANCELED"
+                    result_msg.message = "버스바 스캔이 취소됐습니다."
+                else:
+                    result_msg.error_code = "BUSBAR_RESET_INTERRUPTED"
+                    result_msg.message = (
+                        "고정 카메라 perception reset이 중단됐습니다."
+                    )
+                self._abort_or_cancel(goal_handle)
+                return result_msg
+
             found, fixed_pose, fixed_msg = (
                 self.request_grasp_pose_until_found(
                     self.client_get_busbar_pose,
@@ -292,6 +344,7 @@ class ArmNode(Node):
                 )
             )
             if not found or fixed_pose is None:
+                self._publish_cancel_arm_task()
                 result_msg.success = False
                 if goal_handle.is_cancel_requested:
                     result_msg.error_code = "SCAN_BUSBAR_CANCELED"
@@ -303,9 +356,60 @@ class ArmNode(Node):
                     self._abort_or_cancel(goal_handle)
                 return result_msg
 
-            # 3. 스캔 자세 도착 전에 생성된 wrist 표본은 사용하지 않는다.
-            self._reset_perception_cache(
-                self.pub_wrist_reset, goal_handle)
+            # 3. fixed_pose를 지역 snapshot으로 보존한 뒤에만 wrist 이동을 허용한다.
+            if goal_handle.is_cancel_requested or self._isaac_has_failed():
+                self._publish_cancel_arm_task()
+                result_msg.success = False
+                if goal_handle.is_cancel_requested:
+                    result_msg.error_code = "SCAN_BUSBAR_CANCELED"
+                    result_msg.message = "버스바 스캔이 취소됐습니다."
+                else:
+                    result_msg.error_code = "SCAN_BUSBAR_FAILED"
+                    result_msg.message = (
+                        "고정 카메라 latch 뒤 Isaac failure를 수신했습니다."
+                    )
+                self._abort_or_cancel(goal_handle)
+                return result_msg
+
+            continue_msg = String()
+            continue_msg.data = "CONTINUE_BUSBAR_WRIST_SCAN"
+            self.pub_task_command.publish(continue_msg)
+
+            success = self.wait_for_isaac_completion(
+                goal_handle,
+                feedback_msg,
+            )
+            if not success:
+                result_msg.success = False
+                if goal_handle.is_cancel_requested:
+                    result_msg.error_code = "SCAN_BUSBAR_CANCELED"
+                    result_msg.message = "버스바 스캔이 취소됐습니다."
+                else:
+                    result_msg.error_code = "SCAN_BUSBAR_FAILED"
+                    result_msg.message = (
+                        "손목 카메라 스캔 자세 이동 실패 "
+                        f"(Status: {self.isaac_status})"
+                    )
+                self._abort_or_cancel(goal_handle)
+                return result_msg
+
+            # 4. wrist 자세 도착 전에 생성된 표본은 사용하지 않는다.
+            if not self._reset_perception_cache(
+                self.pub_wrist_reset,
+                goal_handle,
+            ):
+                result_msg.success = False
+                if goal_handle.is_cancel_requested:
+                    result_msg.error_code = "SCAN_BUSBAR_CANCELED"
+                    result_msg.message = "버스바 스캔이 취소됐습니다."
+                else:
+                    result_msg.error_code = "WRIST_RESET_INTERRUPTED"
+                    result_msg.message = (
+                        "wrist perception reset이 중단됐습니다."
+                    )
+                self._abort_or_cancel(goal_handle)
+                return result_msg
+
             confirmed, wrist_pose, wrist_msg = (
                 self.wait_for_wrist_busbar_confirmation(
                     fixed_pose,
@@ -664,6 +768,19 @@ class ArmNode(Node):
         """Record that one camera instance processed its reset callback."""
         self._perception_reset_ack_counts[camera_name] += 1
 
+    def _isaac_has_failed(self):
+        """Return whether Isaac reported a terminal failure."""
+        return (
+            self.isaac_status is not None
+            and "FAILURE" in self.isaac_status
+        )
+
+    def _publish_cancel_arm_task(self):
+        """Release an Isaac task that may be paused at an internal phase."""
+        cancel_msg = String()
+        cancel_msg.data = "CANCEL_ARM_TASK"
+        self.pub_task_command.publish(cancel_msg)
+
     def _reset_perception_cache(self, publisher, goal_handle):
         """Reset one cache and wait for its causal acknowledgement."""
         if publisher is self.pub_wrist_reset:
@@ -677,7 +794,11 @@ class ArmNode(Node):
 
         previous_ack_count = self._perception_reset_ack_counts[camera_name]
         publisher.publish(Empty())
-        while rclpy.ok() and not goal_handle.is_cancel_requested:
+        while (
+            rclpy.ok()
+            and not goal_handle.is_cancel_requested
+            and not self._isaac_has_failed()
+        ):
             if (
                 self._perception_reset_ack_counts[camera_name]
                 > previous_ack_count
@@ -703,9 +824,7 @@ class ArmNode(Node):
         """성공·실패·cancel·shutdown까지 타임아웃 없이 대기한다."""
         while rclpy.ok():
             if goal_handle.is_cancel_requested:
-                cancel_msg = String()
-                cancel_msg.data = "CANCEL_ARM_TASK"
-                self.pub_task_command.publish(cancel_msg)
+                self._publish_cancel_arm_task()
                 return False
 
             feedback_msg.sub_phase = self.isaac_phase
@@ -722,9 +841,42 @@ class ArmNode(Node):
 
         return False
 
+    def wait_for_isaac_phase(
+        self,
+        expected_phase,
+        goal_handle,
+        feedback_msg,
+    ) -> bool:
+        """Wait indefinitely and cancelably for an Isaac handshake phase."""
+        while rclpy.ok():
+            if goal_handle.is_cancel_requested:
+                return False
+
+            feedback_msg.sub_phase = self.isaac_phase
+            feedback_msg.progress_pct = float(self.isaac_progress)
+            goal_handle.publish_feedback(feedback_msg)
+
+            if self._isaac_has_failed():
+                return False
+            if self.isaac_status == "SUCCESS":
+                self.get_logger().error(
+                    f"'{expected_phase}' 전에 Isaac SUCCESS를 수신했습니다."
+                )
+                return False
+            if self.isaac_phase == expected_phase:
+                return True
+
+            time.sleep(0.05)
+
+        return False
+
     def _call_grasp_pose(self, client, target_label, goal_handle):
         """한 번의 GetGraspPose 응답을 cancel 가능한 방식으로 기다린다."""
-        while rclpy.ok() and not goal_handle.is_cancel_requested:
+        while (
+            rclpy.ok()
+            and not goal_handle.is_cancel_requested
+            and not self._isaac_has_failed()
+        ):
             if client.wait_for_service(timeout_sec=1.0):
                 break
             self.get_logger().warn(
@@ -740,7 +892,11 @@ class ArmNode(Node):
             future = client.call_async(req)
         except Exception as exc:
             return False, None, f"GetGraspPose 호출 시작 실패: {exc}"
-        while rclpy.ok() and not goal_handle.is_cancel_requested:
+        while (
+            rclpy.ok()
+            and not goal_handle.is_cancel_requested
+            and not self._isaac_has_failed()
+        ):
             if future.done():
                 try:
                     response = future.result()
@@ -764,7 +920,11 @@ class ArmNode(Node):
     ):
         """perception의 post-reset barrier가 준비될 때까지 무제한 재시도한다."""
         last_message = f"'{target_label}' 검출 대기"
-        while rclpy.ok() and not goal_handle.is_cancel_requested:
+        while (
+            rclpy.ok()
+            and not goal_handle.is_cancel_requested
+            and not self._isaac_has_failed()
+        ):
             found, pose, message = self._call_grasp_pose(
                 client, target_label, goal_handle
             )

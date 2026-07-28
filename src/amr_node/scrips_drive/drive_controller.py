@@ -78,7 +78,10 @@ class ControllerConfig:
     """Physical and control limits for the differential-drive chassis."""
 
     position_tolerance: float = 0.02
+    position_capture_tolerance: float = 0.015
+    position_release_tolerance: float = 0.025
     yaw_tolerance: float = 0.03
+    yaw_capture_tolerance: float = 0.02
     final_approach_distance: float = 0.08
     turn_in_place_threshold: float = math.radians(5.0)
     max_linear: float = 0.35
@@ -119,6 +122,24 @@ class GoToPoseController:
     def __init__(self, config: Optional[ControllerConfig] = None):
         """Create a controller with the approved physical defaults."""
         self.config = config or ControllerConfig()
+        if not (
+            0.0
+            <= self.config.position_capture_tolerance
+            <= self.config.position_tolerance
+            <= self.config.position_release_tolerance
+        ):
+            raise ValueError(
+                'position tolerances must satisfy '
+                '0 <= capture <= arrival <= release'
+            )
+        if not (
+            0.0
+            <= self.config.yaw_capture_tolerance
+            <= self.config.yaw_tolerance
+        ):
+            raise ValueError(
+                'yaw tolerances must satisfy 0 <= capture <= arrival'
+            )
         self._goal: Optional[Goal2D] = None
         self._last_linear = 0.0
         self._last_angular = 0.0
@@ -126,6 +147,9 @@ class GoToPoseController:
         self._drive_sign = 1.0
         self._direction_selected = False
         self._initial_alignment_complete = True
+        self._position_captured = False
+        self._position_trim_active = False
+        self._yaw_captured = False
 
     @property
     def goal(self) -> Optional[Goal2D]:
@@ -189,14 +213,36 @@ class GoToPoseController:
         self._initial_alignment_complete = (
             not self._goal.align_yaw_before_drive
         )
+        self._position_captured = False
+        self._position_trim_active = False
+        self._yaw_captured = not self._goal.yaw_required
         if current_pose is not None:
             self._select_direction(current_pose)
+            self._position_captured = (
+                math.hypot(
+                    self._goal.x - current_pose.x,
+                    self._goal.y - current_pose.y,
+                )
+                <= self.config.position_tolerance
+            )
+            self._yaw_captured = (
+                not self._goal.yaw_required
+                or (
+                    self._position_captured
+                    and abs(normalize_angle(
+                        self._goal.yaw - current_pose.yaw
+                    )) <= self.config.yaw_tolerance
+                )
+            )
 
     def stop(self) -> None:
         """Reset velocity history and the arrival stability counter."""
         self._last_linear = 0.0
         self._last_angular = 0.0
         self._settled_steps = 0
+        self._position_captured = False
+        self._position_trim_active = False
+        self._yaw_captured = False
 
     def clear_goal(self) -> None:
         """Clear the active goal and stop the controller."""
@@ -242,6 +288,7 @@ class GoToPoseController:
         )):
             raise ValueError('pose contains NaN or infinity')
 
+        first_pose_for_goal = not self._direction_selected
         self._select_direction(pose)
         goal = self._goal
         dx = goal.x - pose.x
@@ -264,6 +311,7 @@ class GoToPoseController:
                 _, angular = self._limited(0.0, raw_angular, dt)
                 self._last_linear = 0.0
                 self._settled_steps = 0
+                self._position_trim_active = False
                 return DriveCommand(
                     phase='initial_align',
                     linear=0.0,
@@ -276,7 +324,160 @@ class GoToPoseController:
             self._initial_alignment_complete = True
             self._last_angular = 0.0
 
-        if distance > self.config.position_tolerance:
+        # 위치 허용오차(20mm) 경계에서 path yaw와 final yaw가 번갈아
+        # 선택되면 회전 명령 부호가 뒤집혀 limit cycle이 생긴다. 주행
+        # 중에는 15mm 안쪽까지 들어와야 위치를 capture하고, yaw 정렬 중
+        # 생기는 미끄러짐은 25mm까지 허용한다. 최종 yaw가 맞은 뒤 위치만
+        # 20mm 밖이면 아래 position_trim에서 최종 자세를 유지한 채
+        # 종방향 잔여 오차를 없앤다. ARRIVED 판정은 여전히 엄격한
+        # 20mm/0.03rad와 12틱 정지를 모두 요구한다.
+        if (
+            self._position_captured
+            and distance > self.config.position_release_tolerance
+        ):
+            self._position_captured = False
+            self._position_trim_active = False
+            self._yaw_captured = not goal.yaw_required
+        elif (
+            distance <= self.config.position_capture_tolerance
+            or (
+                first_pose_for_goal
+                and distance <= self.config.position_tolerance
+            )
+        ):
+            self._position_captured = True
+
+        # A minimum turn command near the 0.03rad arrival boundary can move
+        # the chassis just inside the tolerance, then a small PhysX drift can
+        # push it outside again before 12 stationary ticks accumulate. Once
+        # final alignment has been requested, keep aligning to an inner
+        # 0.02rad capture boundary. The captured yaw may drift within the
+        # strict 0.03rad arrival tolerance, but is released immediately if it
+        # exceeds that approved limit.
+        if (
+            self._yaw_captured
+            and goal.yaw_required
+            and abs(yaw_error) > self.config.yaw_tolerance
+        ):
+            self._yaw_captured = False
+        elif (
+            not self._yaw_captured
+            and self._position_captured
+            and (
+                not goal.yaw_required
+                or abs(yaw_error) <= self.config.yaw_capture_tolerance
+                or (
+                    first_pose_for_goal
+                    and abs(yaw_error) <= self.config.yaw_tolerance
+                )
+            )
+        ):
+            self._yaw_captured = True
+
+        if (
+            self._position_captured
+            and goal.yaw_required
+            and not self._yaw_captured
+            and not (
+                self._position_trim_active
+                and distance > self.config.position_capture_tolerance
+            )
+            and (
+                distance <= self.config.position_tolerance
+                or abs(yaw_error) > self.config.yaw_tolerance
+            )
+        ):
+            raw_angular = _clamp(
+                self.config.final_yaw_gain * yaw_error,
+                -self.config.max_angular,
+                self.config.max_angular,
+            )
+            if abs(raw_angular) < self.config.min_angular:
+                raw_angular = math.copysign(
+                    self.config.min_angular,
+                    yaw_error,
+                )
+            _, angular = self._limited(0.0, raw_angular, dt)
+            self._last_linear = 0.0
+            self._settled_steps = 0
+            self._position_trim_active = False
+            return DriveCommand(
+                phase='final_align',
+                linear=0.0,
+                angular=angular,
+                distance_error=distance,
+                heading_error=0.0,
+                yaw_error=yaw_error,
+                travel_direction=self.travel_direction,
+            )
+
+        if (
+            self._position_captured
+            and (
+                distance > self.config.position_tolerance
+                or (
+                    self._position_trim_active
+                    and distance > self.config.position_capture_tolerance
+                )
+            )
+        ):
+            goal_cos = math.cos(goal.yaw)
+            goal_sin = math.sin(goal.yaw)
+            longitudinal_error = goal_cos * dx + goal_sin * dy
+            lateral_error = -goal_sin * dx + goal_cos * dy
+            travel_error = self._drive_sign * longitudinal_error
+            can_trim = (
+                goal.yaw_required
+                and travel_error > 0.0
+                and abs(lateral_error) < self.config.position_tolerance
+            )
+            if can_trim:
+                # Drop the minimum-speed final-align command before beginning
+                # the coupled translation. Otherwise angular acceleration
+                # limiting carries that large command into the trim phase.
+                if not self._position_trim_active:
+                    self._last_linear = 0.0
+                    self._last_angular = 0.0
+                self._position_trim_active = True
+                magnitude = min(
+                    self.config.max_linear,
+                    max(
+                        self.config.min_linear,
+                        self.config.linear_gain * travel_error,
+                    ),
+                )
+                raw_linear = self._drive_sign * magnitude
+                raw_angular = _clamp(
+                    self.config.final_yaw_gain * yaw_error,
+                    -self.config.max_angular,
+                    self.config.max_angular,
+                )
+                linear, angular = self._limited(
+                    raw_linear,
+                    raw_angular,
+                    dt,
+                )
+                self._settled_steps = 0
+                return DriveCommand(
+                    phase='position_trim',
+                    linear=linear,
+                    angular=angular,
+                    distance_error=distance,
+                    heading_error=yaw_error,
+                    yaw_error=yaw_error,
+                    travel_direction=self.travel_direction,
+                )
+
+            # The latched travel direction and final yaw cannot reduce this
+            # residual (for example, it is mostly lateral). Let the regular
+            # path controller make a wider correction without changing the
+            # goal's selected forward/reverse direction.
+            self._position_captured = False
+            self._position_trim_active = False
+            self._yaw_captured = not goal.yaw_required
+
+        if not self._position_captured:
+            self._position_trim_active = False
             bearing = math.atan2(dy, dx)
             if (
                 goal.yaw_required
@@ -332,32 +533,9 @@ class GoToPoseController:
                 travel_direction=self.travel_direction,
             )
 
-        if goal.yaw_required and abs(yaw_error) > self.config.yaw_tolerance:
-            raw_angular = _clamp(
-                self.config.final_yaw_gain * yaw_error,
-                -self.config.max_angular,
-                self.config.max_angular,
-            )
-            if abs(raw_angular) < self.config.min_angular:
-                raw_angular = math.copysign(
-                    self.config.min_angular,
-                    yaw_error,
-                )
-            _, angular = self._limited(0.0, raw_angular, dt)
-            self._last_linear = 0.0
-            self._settled_steps = 0
-            return DriveCommand(
-                phase='final_align',
-                linear=0.0,
-                angular=angular,
-                distance_error=distance,
-                heading_error=0.0,
-                yaw_error=yaw_error,
-                travel_direction=self.travel_direction,
-            )
-
         self._last_linear = 0.0
         self._last_angular = 0.0
+        self._position_trim_active = False
         stationary = (
             abs(pose.linear_speed) <= self.config.settle_linear_speed
             and abs(pose.angular_speed) <= self.config.settle_angular_speed
