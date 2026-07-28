@@ -57,7 +57,11 @@ from std_msgs.msg import String, Float32, Empty
 _THIS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(_THIS_DIR / "rmpflow"))
 from m0609_rmpflow_controller import RMPFlowController
-from nut_grasp_planner import plan_flat_grasp
+from nut_grasp_planner import (
+    plan_flat_grasp,
+    rg2_gap_for_joint,
+    rg2_joint_for_width,
+)
 from nut_insertion_controller import (
     ForceGuidedNutInsertion,
     InsertionConfig,
@@ -176,6 +180,8 @@ NUT_PEG_CLEARANCE_Z = 0.08                                   # 파지 직후 XY 
 NUT_PEG_CLEAR_TOLERANCE = 0.003                              # 수직 이탈 완료 허용오차(3mm)
 NUT_PEG_CLEAR_HOLD_STEPS = 15                                # 이탈 높이 도착 후 파지 안정화
                                                               # 대기(60Hz 기준 0.25초)
+NUT_GRASP_PRELOAD_M = 0.0003                                 # 면간 폭보다 0.3mm 좁게 명령해
+                                                              # 접촉 파지력을 만든다
 BOLT_APPROACH_Z    = 0.6                                     # 너트 체결 상공 고도
 
 # ★ 스테이션별 볼트 1/2번 실측 월드 좌표 (test_isaac 씬 고정 배치 기준) ★
@@ -1066,6 +1072,7 @@ def main():
     nut_pick_pos   = None     # 현재 너트의 물리 파지 좌표
     nut_approach_pos = None   # 현재 너트 파지 상공 접근 좌표
     nut_grasp_quat = quat_nut.copy()  # 육각 너트 평면에 맞춘 현재 파지 자세
+    nut_grip_target = GRIPPER_CLOSE_NUT.copy()  # 면간 폭에 맞춘 RG2 관절 목표
     nut_peg_clear_pos = None  # 파지 직후 peg에서 수직으로 빠져나올 중간 목표
     nut_peg_clear_hold = 0    # 중간 목표 도착 후 안정화 카운터
     bolt_target_pos  = None   # 체결 목표 좌표
@@ -1165,6 +1172,7 @@ def main():
             nut_pick_pos = None
             nut_approach_pos = None
             nut_grasp_quat = quat_nut.copy()
+            nut_grip_target = GRIPPER_CLOSE_NUT.copy()
             nut_peg_clear_pos = None
             nut_peg_clear_hold = 0
             bolt_target_pos = None
@@ -1490,14 +1498,24 @@ def main():
                             nut_grasp_quat = yaw_rotated_quat(
                                 quat_nut, flat_plan.yaw_delta_deg
                             )
+                            grip_joint = rg2_joint_for_width(
+                                flat_plan.grasp_width,
+                                NUT_GRASP_PRELOAD_M,
+                            )
+                            nut_grip_target = np.array([
+                                grip_joint, grip_joint
+                            ])
                             print(
                                 f"[NUT FLAT GRASP] {nut_label} Mesh 면 인식 -> "
                                 f"손목 {flat_plan.yaw_delta_deg:+.1f}° 정렬 | "
                                 f"면 법선={flat_plan.face_normal_yaw_deg:+.1f}° | "
-                                f"외곽점={flat_plan.hull_vertex_count}"
+                                f"면간 폭={flat_plan.grasp_width*1000:.2f}mm | "
+                                f"RG2={grip_joint:.4f}rad/"
+                                f"{rg2_gap_for_joint(grip_joint)*1000:.2f}mm"
                             )
                         except (TypeError, ValueError, RuntimeError) as exc:
                             nut_grasp_quat = quat_nut.copy()
+                            nut_grip_target = GRIPPER_CLOSE_NUT.copy()
                             print(
                                 f"[NUT FLAT GRASP][WARN] {exc} -> "
                                 "기본 파지 자세 사용"
@@ -1964,7 +1982,7 @@ def main():
 
                 grasp_timer += 1
                 ramp_frac = min(grasp_timer / GRIP_CLOSE_RAMP_STEPS, 1.0)
-                grip_target = ramp_frac * GRIPPER_CLOSE_NUT
+                grip_target = ramp_frac * nut_grip_target
                 robot.gripper.apply_action(ArticulationAction(joint_positions=grip_target))
 
                 if grasp_timer >= GRIP_CLOSE_RAMP_STEPS:
@@ -1991,7 +2009,7 @@ def main():
                     target_end_effector_orientation=nut_grasp_quat,
                 )
                 robot.apply_action(actions)
-                robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_CLOSE_NUT))
+                robot.gripper.apply_action(ArticulationAction(joint_positions=nut_grip_target))
 
                 cur_pos = np.asarray(
                     world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation(),
@@ -2017,7 +2035,7 @@ def main():
                 publish_progress("NUT_LIFTING", 80.0)
                 actions = arm_controller.forward(target_end_effector_position=nut_approach_pos, target_end_effector_orientation=nut_grasp_quat)
                 robot.apply_action(actions)
-                robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_CLOSE_NUT))
+                robot.gripper.apply_action(ArticulationAction(joint_positions=nut_grip_target))
 
                 cur_pos = world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation()
                 current_err = math.dist(cur_pos, tuple(nut_approach_pos))
@@ -2043,7 +2061,7 @@ def main():
                 bolt_approach_pos = np.array([bolt_target_pos[0], bolt_target_pos[1], BOLT_APPROACH_Z])
                 actions = arm_controller.forward(target_end_effector_position=bolt_approach_pos, target_end_effector_orientation=nut_grasp_quat)
                 robot.apply_action(actions)
-                robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_CLOSE_NUT))
+                robot.gripper.apply_action(ArticulationAction(joint_positions=nut_grip_target))
 
                 cur_pos = world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation()
                 current_err = math.dist(cur_pos, tuple(bolt_approach_pos))
@@ -2063,7 +2081,7 @@ def main():
 
                 actions = arm_controller.forward(target_end_effector_position=step_target_pos, target_end_effector_orientation=nut_grasp_quat)
                 robot.apply_action(actions)
-                robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_CLOSE_NUT))
+                robot.gripper.apply_action(ArticulationAction(joint_positions=nut_grip_target))
 
                 cur_pos = world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation()
 
@@ -2135,7 +2153,7 @@ def main():
                 )
                 robot.apply_action(actions)
                 robot.gripper.apply_action(
-                    ArticulationAction(joint_positions=GRIPPER_CLOSE_NUT)
+                    ArticulationAction(joint_positions=nut_grip_target)
                 )
 
                 if (
@@ -2257,7 +2275,7 @@ def main():
 
                     actions = arm_controller.forward(target_end_effector_position=target_pos, target_end_effector_orientation=target_quat)
                     robot.apply_action(actions)
-                    robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_CLOSE_NUT))
+                    robot.gripper.apply_action(ArticulationAction(joint_positions=nut_grip_target))
 
                     # 실제 joint_6 반력과 TCP 진행량으로 사선 물림/완착을 구분한다.
                     cur_ee_pos, _ = robot.end_effector.get_world_pose()
@@ -2380,7 +2398,7 @@ def main():
                     )
                     robot.apply_action(actions)
                     robot.gripper.apply_action(
-                        ArticulationAction(joint_positions=GRIPPER_CLOSE_NUT)
+                        ArticulationAction(joint_positions=nut_grip_target)
                     )
                     if screw_unwind_deg >= NUT_CROSS_THREAD_UNWIND_DEG:
                         screw_sub = "cross_lift"
@@ -2400,7 +2418,7 @@ def main():
                     )
                     robot.apply_action(actions)
                     robot.gripper.apply_action(
-                        ArticulationAction(joint_positions=GRIPPER_CLOSE_NUT)
+                        ArticulationAction(joint_positions=nut_grip_target)
                     )
                     cur_pos = np.asarray(
                         world_xf(
@@ -2424,7 +2442,7 @@ def main():
                 elif screw_sub == "release":
                     screw_release_step += 1
                     rf = min(screw_release_step / GRIP_CLOSE_RAMP_STEPS, 1.0)
-                    release_target = (1.0 - rf) * GRIPPER_CLOSE_NUT[0]
+                    release_target = (1.0 - rf) * nut_grip_target[0]
                     robot.gripper.apply_action(ArticulationAction(joint_positions=np.array([release_target, release_target])))
 
                     hold_quat = yaw_rotated_quat(screw_start_quat, screw_pass_theta)
@@ -2477,7 +2495,7 @@ def main():
                 elif screw_sub == "regrasp":
                     screw_regrasp_step += 1
                     rf = min(screw_regrasp_step / GRIP_CLOSE_RAMP_STEPS, 1.0)
-                    grip_target = rf * GRIPPER_CLOSE_NUT[0]
+                    grip_target = rf * nut_grip_target[0]
                     robot.gripper.apply_action(ArticulationAction(joint_positions=np.array([grip_target, grip_target])))
 
                     regrasp_target_pos = screw_pass_end_pos + np.array([0.0, 0.0, REGRASP_Z_OFFSET])

@@ -2,7 +2,12 @@ import math
 
 import pytest
 
-from nut_grasp_planner import convex_hull_2d, plan_flat_grasp
+from nut_grasp_planner import (
+    convex_hull_2d,
+    plan_flat_grasp,
+    rg2_gap_for_joint,
+    rg2_joint_for_width,
+)
 
 
 def _hexagon(radius=1.0, rotation_deg=0.0):
@@ -61,3 +66,22 @@ def test_collinear_mesh_vertices_do_not_change_flat_selection():
 def test_invalid_mesh_points_are_rejected():
     with pytest.raises(ValueError):
         plan_flat_grasp([(0.0, 0.0), (1.0, 0.0)], 0.0)
+
+
+def test_hex_grasp_width_is_across_flats_not_across_corners():
+    plan = plan_flat_grasp(_hexagon(radius=0.013, rotation_deg=11.0), 0.0)
+
+    assert plan.grasp_width == pytest.approx(
+        2.0 * 0.013 * math.cos(math.pi / 6.0)
+    )
+    assert plan.grasp_width < 2.0 * 0.013
+
+
+def test_rg2_joint_target_matches_nut_width_with_preload():
+    nut_width = 0.022606
+    preload = 0.0003
+    joint = rg2_joint_for_width(nut_width, preload)
+
+    assert joint == pytest.approx(0.98398, abs=1.0e-4)
+    assert rg2_gap_for_joint(joint) == pytest.approx(nut_width - preload)
+    assert rg2_gap_for_joint(0.961) > nut_width
