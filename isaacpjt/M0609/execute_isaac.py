@@ -227,18 +227,19 @@ NUT_SENSOR_FILTER_ALPHA = 0.2
 NUT_GRIP_SLIP_RATIO = 0.25
 NUT_GRIP_SLIP_HOLD_STEPS = 15
 NUT_SCREW_FORCE_CORRECTION_LIMIT_M = 0.001
-NUT_SCREW_FORCE_COMPLIANCE_M_PER_N = 0.00002
+NUT_SCREW_FORCE_COMPLIANCE_M_PER_N = 0.00003
 NUT_CROSS_THREAD_HOLD_STEPS = 8
 NUT_CROSS_THREAD_UNWIND_DEG = 60.0
 NUT_CROSS_THREAD_RETRACT_M = 0.03
 NUT_INSERT_CONFIG = InsertionConfig(
     contact_force_n=6.0,
-    target_axial_force_n=10.0,
+    target_axial_force_n=15.0,
     max_axial_force_n=55.0,
     max_lateral_force_n=20.0,
     seek_rotation_speed_deg_s=20.0,
     contact_position_error_m=0.0006,
     contact_position_hold_steps=6,
+    force_compliance_m_per_n_s=0.00005,
     cross_thread_torque_nm=25.0,
     max_attempts=3,
 )
@@ -2119,7 +2120,8 @@ def main():
                     )
                     print(
                         f"  [NUT{nut_index} INSERT] {insert_cmd.state.value} | "
-                        f"Fz={sensor.axial_force:.1f}N | "
+                        f"Fz={sensor.axial_force:.1f}/"
+                        f"{NUT_INSERT_CONFIG.target_axial_force_n:.1f}N | "
                         f"Fxy={sensor.lateral_force:.1f}N | "
                         f"T={sensor.torque:.1f}Nm | "
                         f"Grip={sensor.gripper_force:.1f} | "
