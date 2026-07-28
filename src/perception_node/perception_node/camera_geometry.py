@@ -1,4 +1,5 @@
-"""픽셀 좌표 + depth -> 카메라 좌표계 3D 좌표 역투영, 그리고 world 좌표계로의 tf 변환.
+"""
+픽셀 좌표와 depth를 카메라 3D 좌표로 역투영한 뒤 world tf로 변환한다.
 
 sensor_msgs/CameraInfo에서 얻은 실제 intrinsic(K, D)을 사용한다
 (perception 브랜치 프로토타입의 D455 스펙 추정치 대신).
@@ -32,7 +33,12 @@ def make_camera_model(camera_info: CameraInfo) -> PinholeCameraModel:
     return model
 
 
-def pixel_to_camera_point(model: PinholeCameraModel, u: float, v: float, depth: float) -> tuple[float, float, float]:
+def pixel_to_camera_point(
+    model: PinholeCameraModel,
+    u: float,
+    v: float,
+    depth: float,
+) -> tuple[float, float, float]:
     """(u, v) 픽셀 + depth(광학축 방향 거리, m) -> 카메라 프레임 3D 좌표 (x, y, z)."""
     rect_u, rect_v = model.rectifyPoint((u, v))
     ray_x, ray_y, ray_z = model.projectPixelTo3dRay((rect_u, rect_v))
@@ -51,10 +57,19 @@ def sample_depth(depth_image: np.ndarray, u: float, v: float):
     return depth_value
 
 
-def transform_pixel_to_world(model: PinholeCameraModel, depth_image: np.ndarray, pixel_uv,
-                              tf_buffer: Buffer, world_frame: str, camera_frame_id: str, stamp,
-                              timeout_sec: float = 0.2, on_tf_error=None):
-    """픽셀 -> (카메라 좌표, world 좌표, 실패 사유) 로 변환.
+def transform_pixel_to_world(
+    model: PinholeCameraModel,
+    depth_image: np.ndarray,
+    pixel_uv,
+    tf_buffer: Buffer,
+    world_frame: str,
+    camera_frame_id: str,
+    stamp,
+    timeout_sec: float = 0.2,
+    on_tf_error=None,
+):
+    """
+    픽셀을 카메라 좌표, world 좌표, 실패 사유로 변환한다.
 
     camera_point / world_point: (x, y, z) 튜플, 실패 시 None.
     status: "" (성공) / "no depth" (depth 범위 밖 또는 무효) / "tf fail" (tf 조회 실패).

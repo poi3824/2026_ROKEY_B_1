@@ -13,10 +13,13 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
-        # (os.path.join('share', package_name, 'models'), ['models/keypoints_best.pt']),
-        # (os.path.join('share', package_name, 'models'), ['models/seg_v2.pt']),
-        (os.path.join('share', package_name, 'models'), ['models/keypoints_busbar6pt_v1.pt']),
-        # (os.path.join('share', package_name, 'models'), ['models/best.pt']),
+        (
+            os.path.join('share', package_name, 'models'),
+            [
+                'models/keypoints_busbar6pt_v1.pt',
+                'models/keypoints_busbar6pt_v3.pt',
+            ],
+        ),
         (os.path.join('share', package_name, 'launch'), glob('launch/*.launch.py')),
     ],
     install_requires=['setuptools'],

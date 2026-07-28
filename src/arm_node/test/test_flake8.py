@@ -19,7 +19,9 @@ import pytest
 @pytest.mark.flake8
 @pytest.mark.linter
 def test_flake8():
-    rc, errors = main_with_errors(argv=[])
+    # Legacy/manual utilities are not part of the production ExecuteArmTask node.
+    rc, errors = main_with_errors(
+        argv=['.', '--exclude', 'arm_node_scan_test.py', 'scripts'])
     assert rc == 0, \
         'Found %d code style errors / warnings:\n' % len(errors) + \
         '\n'.join(errors)

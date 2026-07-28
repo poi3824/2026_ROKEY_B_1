@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+"""Coordinate the AMR and arm through the complete assembly process."""
+
 import sys
 import time
 from enum import Enum, auto
@@ -8,6 +10,11 @@ from rclpy.action import ActionClient
 
 from fms_interfaces.action import ExecuteArmTask
 from fms_interfaces.msg import AmrGoal, AmrStatus, FleetJob, FleetReport
+from .amr_timeout import (
+    DEFAULT_AMR_MOVE_TIMEOUT_SEC,
+    amr_move_deadline,
+    amr_move_timed_out,
+)
 
 
 X_BATTERY = 0.6667
@@ -31,6 +38,8 @@ AMR_STATION_POSES = {
 
 
 class ProcessState(Enum):
+    """States in one station's busbar-and-nut assembly process."""
+
     IDLE = auto()                   # 대기 상태
     MOVE_AMR_BATTERY_SCAN = auto()  # AMR을 배터리 스캔 접근 지점으로 이동
     SCAN_BATTERY = auto()           # 배터리 스캔 지점으로 이동
@@ -53,14 +62,21 @@ class ProcessState(Enum):
 
 
 class BehaviorNode(Node):
+    """Run the station-level AMR and arm state machine."""
+
     def __init__(self):
+        """Create action, fleet, AMR, and timer interfaces."""
         super().__init__('behavior_node')
         self.get_logger().info("===========================================")
-        self.get_logger().info(" Behavior 노드 활성화 (스캔 -> 파지 -> 중점 이동 -> 미세 보정 -> 버스바 체결 -> 너트1/2 체결 시퀀스)")
+        self.get_logger().info(
+            " Behavior 노드 활성화 (스캔 -> 파지 -> 중점 이동 -> "
+            "미세 보정 -> 버스바 체결 -> 너트1/2 체결 시퀀스)"
+        )
         self.get_logger().info("===========================================")
 
         # Arm Node 액션 클라이언트 생성
-        self._action_client = ActionClient(self, ExecuteArmTask, '/execute_arm_task')
+        self._action_client = ActionClient(
+            self, ExecuteArmTask, '/execute_arm_task')
 
         # amr_node 연동
         self._amr_goal_pub = self.create_publisher(AmrGoal, '/amr/goal', 10)
@@ -74,7 +90,10 @@ class BehaviorNode(Node):
             FleetReport, '/fleet/report', 10)
 
         self.declare_parameter('work_station', 'station_3')
-        self.declare_parameter('amr_move_timeout_sec', 120.0)
+        self.declare_parameter(
+            'amr_move_timeout_sec',
+            DEFAULT_AMR_MOVE_TIMEOUT_SEC,
+        )
         self.declare_parameter('auto_start', False)
         self._work_station = self.get_parameter('work_station').value
         self._amr_move_timeout_sec = float(
@@ -83,11 +102,12 @@ class BehaviorNode(Node):
         if self._work_station not in AMR_STATION_POSES:
             raise ValueError(
                 f"work_station must be one of {sorted(AMR_STATION_POSES)}")
-        if self._amr_move_timeout_sec <= 0.0:
-            raise ValueError("amr_move_timeout_sec must be positive")
+        if self._amr_move_timeout_sec < 0.0:
+            raise ValueError(
+                "amr_move_timeout_sec must be zero or greater")
         self._amr_goal_sent = False
         self._waiting_amr_station = None
-        self._amr_deadline = 0.0
+        self._amr_deadline = None
         self._active_job = None
 
         # FSM 상태 변수
@@ -103,7 +123,7 @@ class BehaviorNode(Node):
         self.has_started = False
 
     def auto_start_trigger(self):
-        """테스트용 트리거: 타이머 취소 후 배터리 스캔 이동부터 시퀀스 시작"""
+        """타이머 취소 후 배터리 스캔 이동부터 테스트 시퀀스를 시작한다."""
         self.start_timer.cancel()
         if self._auto_start and not self.has_started:
             self.has_started = True
@@ -159,7 +179,7 @@ class BehaviorNode(Node):
             self._active_job = None
 
     def fsm_loop(self):
-        """FSM 상태 관리 루프"""
+        """FSM 상태를 한 번 진행한다."""
         if self.is_waiting_action or self.state == ProcessState.IDLE:
             return
 
@@ -175,11 +195,15 @@ class BehaviorNode(Node):
                     else "battery"
                 )
                 self._send_amr_goal(target_kind)
-            elif time.monotonic() > self._amr_deadline:
+            elif amr_move_timed_out(
+                self._amr_deadline,
+                time.monotonic(),
+            ):
                 self.get_logger().error(
                     f"AMR 이동 Timeout: {self._waiting_amr_station}")
                 self._amr_goal_sent = False
                 self._waiting_amr_station = None
+                self._amr_deadline = None
                 self.state = ProcessState.FAILURE
             return
 
@@ -319,8 +343,10 @@ class BehaviorNode(Node):
         goal.theta = theta
         self._waiting_amr_station = station_id
         self._amr_goal_sent = True
-        self._amr_deadline = (
-            time.monotonic() + self._amr_move_timeout_sec)
+        self._amr_deadline = amr_move_deadline(
+            time.monotonic(),
+            self._amr_move_timeout_sec,
+        )
         self._amr_goal_pub.publish(goal)
         self.get_logger().info(
             f"PUB /amr/goal -> {station_id} ({x:.4f}, {y:.4f})")
@@ -340,6 +366,7 @@ class BehaviorNode(Node):
                 f"AMR 이동 실패: {msg.station_id}: {msg.message}")
             self._amr_goal_sent = False
             self._waiting_amr_station = None
+            self._amr_deadline = None
             self.state = ProcessState.FAILURE
             return
         if msg.state != AmrStatus.STATE_ARRIVED:
@@ -349,6 +376,7 @@ class BehaviorNode(Node):
             f"AMR 도착 확인: {msg.station_id}: {msg.message}")
         self._amr_goal_sent = False
         self._waiting_amr_station = None
+        self._amr_deadline = None
         if self.state == ProcessState.MOVE_AMR_BATTERY_SCAN:
             self.state = ProcessState.SCAN_BATTERY
         elif self.state == ProcessState.MOVE_AMR_BUSBAR:
@@ -357,7 +385,7 @@ class BehaviorNode(Node):
             self.state = ProcessState.MOVE_BATTERY_CENTER
 
     def send_arm_goal(self, task_type: str, next_state: ProcessState):
-        """Arm 노드로 Action Goal 전송"""
+        """Arm 노드로 Action Goal을 전송한다."""
         if not self._action_client.wait_for_server(timeout_sec=2.0):
             self.get_logger().error("Arm Action Server가 응답하지 않습니다! (Timeout)")
             self.state = ProcessState.FAILURE
@@ -376,7 +404,7 @@ class BehaviorNode(Node):
         send_goal_future.add_done_callback(self.goal_response_callback)
 
     def goal_response_callback(self, future):
-        """Goal 수락 여부 확인"""
+        """Goal 수락 여부를 확인한다."""
         goal_handle = future.result()
         if not goal_handle.accepted:
             self.get_logger().error(" -> Arm Node가 Goal 수락을 거부했습니다.")
@@ -389,15 +417,16 @@ class BehaviorNode(Node):
         result_future.add_done_callback(self.get_result_callback)
 
     def feedback_callback(self, feedback_msg):
-        """피드백 모니터링"""
+        """Arm action 피드백을 출력한다."""
         fb = feedback_msg.feedback
         sys.stdout.write(
-            f"\r    [Feedback] Phase: {fb.sub_phase:<20} | Progress: {fb.progress_pct:5.1f}%"
+            f"\r    [Feedback] Phase: {fb.sub_phase:<20} | "
+            f"Progress: {fb.progress_pct:5.1f}%"
         )
         sys.stdout.flush()
 
     def get_result_callback(self, future):
-        """최종 결과 처리"""
+        """Arm action의 최종 결과를 처리한다."""
         result = future.result().result
         self.is_waiting_action = False
 
@@ -414,6 +443,7 @@ class BehaviorNode(Node):
 
 
 def main(args=None):
+    """Run the behavior node until shutdown."""
     rclpy.init(args=args)
     node = BehaviorNode()
     try:

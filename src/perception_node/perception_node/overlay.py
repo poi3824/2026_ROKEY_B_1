@@ -1,4 +1,5 @@
-"""디버그용 검출 오버레이 그리기.
+"""
+디버그용 검출 오버레이를 그린다.
 
 rqt_image_view 등으로 확인할 수 있도록, 검출된 물체의 keypoints(cuboid 9점)/bbox와
 좌표 변환 전(카메라 프레임)/후(world 프레임) 값을 이미지 위에 그린다. 물체가 이미지 가장자리에
@@ -19,9 +20,16 @@ TEXT_COLOR = (255, 255, 255)
 TEXT_BG_COLOR = (0, 0, 0)
 
 
-def draw_label(image: np.ndarray, lines: list[str], anchor_xy: tuple[float, float]) -> None:
-    """lines를 anchor_xy 근처에 그리되, 텍스트 블록 전체가 이미지 안에 들어오도록
-    top-left 좌표를 이미지 경계 안쪽으로 clamp한다."""
+def draw_label(
+    image: np.ndarray,
+    lines: list[str],
+    anchor_xy: tuple[float, float],
+) -> None:
+    """
+    텍스트 블록 전체가 보이도록 anchor 근처에 라벨을 그린다.
+
+    계산된 top-left 좌표는 이미지 경계 안쪽으로 제한한다.
+    """
     h_img, w_img = image.shape[:2]
 
     line_sizes = [cv2.getTextSize(line, FONT, FONT_SCALE, FONT_THICKNESS)[0] for line in lines]
@@ -46,8 +54,15 @@ def _format_point(point, status: str, label: str) -> str:
     return f'{label} {status or "n/a"}'
 
 
-def draw_detection(image: np.ndarray, det: dict, camera_point, world_point, status: str) -> None:
-    """det(YoloPoseDetector.detect()의 항목 하나) + 좌표 변환 결과를 image에 그린다.
+def draw_detection(
+    image: np.ndarray,
+    det: dict,
+    camera_point,
+    world_point,
+    status: str,
+) -> None:
+    """
+    YOLO 검출 항목과 좌표 변환 결과를 이미지에 그린다.
 
     camera_point / world_point: (x, y, z) 튜플 또는 None (해당 단계 실패 시).
     status: world_point가 None일 때의 실패 사유 (예: "no depth", "tf fail").

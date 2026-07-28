@@ -6,6 +6,12 @@ import numpy as np
 
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import (
+    DurabilityPolicy,
+    HistoryPolicy,
+    QoSProfile,
+    ReliabilityPolicy,
+)
 from sensor_msgs.msg import Image
 from geometry_msgs.msg import PoseStamped
 from std_msgs.msg import String
@@ -15,17 +21,23 @@ from cv_bridge import CvBridge
 class BatteryAssemblyVisionNode(Node):
     def __init__(self):
         super().__init__('battery_assembly_vision_node')
-        
+
         self.bridge = CvBridge()
 
         # ----------------------------------------------------------------------
         # ROS 2 Subscribers & Publishers
         # ----------------------------------------------------------------------
+        image_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+        )
         self.rgb_sub = self.create_subscription(
-            Image, '/camera_bolt/rgb', self.rgb_callback, 10
+            Image, '/bolt_cam/rgb', self.rgb_callback, image_qos
         )
         self.depth_sub = self.create_subscription(
-            Image, '/camera_bolt/depth', self.depth_callback, 10
+            Image, '/bolt_cam/depth', self.depth_callback, image_qos
         )
 
         # 트리거 명령 수신 (Isaac Sim으로부터 오차 보정 시작 신호 구독)
@@ -50,7 +62,7 @@ class BatteryAssemblyVisionNode(Node):
         self.busbar_hole_depths = []
         self.battery_angle = 0.0
         self.busbar_angle = 0.0
-        
+
         self.battery_line_data = None
         self.busbar_line_data = None
         self.roi_rect = None
@@ -72,32 +84,54 @@ class BatteryAssemblyVisionNode(Node):
         # 10Hz 오차 보정 제어 루프
         self.create_timer(0.1, self.control_loop)
 
-        self.get_logger().info("🚀 [Vision Node] 실행 완료. 고정 볼트 탐색을 시작합니다 (트리거 대기 중...)")
+        self.get_logger().info(
+            "🚀 [Vision Node] 실행 완료. "
+            "고정 볼트 탐색을 시작합니다 (트리거 대기 중...)")
 
     def task_command_callback(self, msg: String):
-        """외부(Behavior / Isaac Sim)로부터 오차 보정 시작 명령 수신"""
+        """외부 Behavior 또는 Isaac Sim에서 오차 보정 시작 명령을 수신한다."""
         cmd = msg.data
-        if cmd in ["START_ERRORFIX_CORRECTION", "START_VISION_CORRECTION", "MOVE_BATTERY_CENTER_SUCCESS"]:
-            self.get_logger().info(f"\n>>> [Vision Correction] 오차 보정 시작 신호 수신 ({cmd})!")
+        if cmd in [
+            "START_ERRORFIX_CORRECTION",
+            "START_VISION_CORRECTION",
+            "MOVE_BATTERY_CENTER_SUCCESS",
+        ]:
+            self.get_logger().info(
+                f"\n>>> [Vision Correction] 오차 보정 시작 신호 수신 ({cmd})!")
             self.is_active = True
             self.hold_count = 0  # 새로 시작 시 연속 카운터 초기화
         elif cmd == "RESET_BOLT_DETECTION":
-            # bolt_camera가 다른 스테이션 좌표로 순간이동한 직후 호출된다. bolts_detected는
-            # 노드 켜진 뒤 딱 한 번만 True가 되고 그 뒤로는 절대 다시 검출을 안 하므로(다음
-            # rgb_callback의 [STEP 1]이 건너뛰어짐), 카메라를 옮겨도 예전 스테이션에서 잡은
-            # 픽셀좌표를 계속 재사용하는 버그가 있었다 - 여기서 강제로 재검출시킨다.
-            self.is_active = False
-            self.bolts_detected = False
-            self.fixed_bolt_coords = []
-            self.has_valid_tracking = False
-            self.hold_count = 0
-            self._roi_logged = False
-            self.get_logger().info(">>> [Vision Node] 카메라 이동 감지 -> 고정 볼트 위치 재탐색 시작")
+            self._reset_bolt_detection()
+
+    def _reset_bolt_detection(self):
+        """Discard observations captured before the bolt camera was repositioned."""
+        self.is_active = False
+        self.bolts_detected = False
+        self.current_depth_frame = None
+        self.fixed_bolt_coords = []
+        self.busbar_hole_coords = []
+        self.busbar_hole_depths = []
+        self.battery_line_data = None
+        self.busbar_line_data = None
+        self.roi_rect = None
+        self.has_valid_tracking = False
+        self.last_valid_dx_px = 0
+        self.last_valid_dy_px = 0
+        self.last_valid_dtheta = 0.0
+        self.hold_count = 0
+        self._roi_logged = False
+        self.get_logger().info(
+            ">>> [Vision Node] 카메라 이동 감지 -> 고정 볼트 위치 재탐색 시작")
 
     def depth_callback(self, msg):
         try:
             depth_img = self.bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
-            self.current_depth_frame = np.nan_to_num(depth_img, nan=0.0, posinf=0.0, neginf=0.0)
+            self.current_depth_frame = np.nan_to_num(
+                depth_img,
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            )
         except Exception as e:
             self.get_logger().error(f"Failed to convert depth image: {e}")
 
@@ -117,7 +151,10 @@ class BatteryAssemblyVisionNode(Node):
             self.detect_static_bolts_hough(frame)
             if len(self.fixed_bolt_coords) > 0:
                 self.bolts_detected = True
-                self.get_logger().info(f"✅ [초기화 완료] 고정 볼트 위치 선점 완료: X={self.fixed_bolt_coords[0][0]}, Y={self.fixed_bolt_coords[0][1]}")
+                bolt_x, bolt_y = self.fixed_bolt_coords[0]
+                self.get_logger().info(
+                    "✅ [초기화 완료] 고정 볼트 위치 선점 완료: "
+                    f"X={bolt_x}, Y={bolt_y}")
             else:
                 cv2.putText(display_img, "Searching Static Bolts...", (30, 40),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
@@ -127,8 +164,15 @@ class BatteryAssemblyVisionNode(Node):
         # ----------------------------------------------------------------------
         if not self.is_active:
             if self.bolts_detected:
-                cv2.putText(display_img, "Static Bolt Ready. Waiting for Trigger...", (30, 40),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                cv2.putText(
+                    display_img,
+                    "Static Bolt Ready. Waiting for Trigger...",
+                    (30, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (0, 255, 0),
+                    2,
+                )
                 for bx, by in self.fixed_bolt_coords:
                     cv2.circle(display_img, (bx, by), 4, (0, 255, 0), -1)
 
@@ -140,15 +184,35 @@ class BatteryAssemblyVisionNode(Node):
         # [STEP 3] 버스바 구멍 추적 및 오차 연산 (트리거 수신 후에만 작동)
         # ----------------------------------------------------------------------
         if self.bolts_detected and self.current_depth_frame is not None:
-            self.detect_yellow_busbar_holes_depth(frame, self.current_depth_frame, min_busbar_area=2000)
+            self.detect_yellow_busbar_holes_depth(
+                frame,
+                self.current_depth_frame,
+                min_busbar_area=2000,
+            )
 
             # ROI 박스 및 에지 라인 오버레이
             if self.roi_rect is not None:
                 rx, ry, rw, rh = self.roi_rect
-                cv2.rectangle(display_img, (rx, ry), (rx + rw, ry + rh), (0, 255, 128), 2)
+                cv2.rectangle(
+                    display_img,
+                    (rx, ry),
+                    (rx + rw, ry + rh),
+                    (0, 255, 128),
+                    2,
+                )
 
-            self.draw_extended_line(display_img, self.battery_line_data, color=(0, 255, 0), label=f"Battery Edge ({self.battery_angle:.1f}deg)")
-            self.draw_extended_line(display_img, self.busbar_line_data, color=(0, 255, 255), label=f"Busbar Edge ({self.busbar_angle:.1f}deg)")
+            self.draw_extended_line(
+                display_img,
+                self.battery_line_data,
+                color=(0, 255, 0),
+                label=f"Battery Edge ({self.battery_angle:.1f}deg)",
+            )
+            self.draw_extended_line(
+                display_img,
+                self.busbar_line_data,
+                color=(0, 255, 255),
+                label=f"Busbar Edge ({self.busbar_angle:.1f}deg)",
+            )
 
             for bx, by in self.fixed_bolt_coords:
                 cv2.circle(display_img, (bx, by), 3, (0, 255, 0), -1)
@@ -156,15 +220,24 @@ class BatteryAssemblyVisionNode(Node):
             if len(self.busbar_hole_coords) > 0:
                 bx, by = self.fixed_bolt_coords[0]
                 hx, hy = self.busbar_hole_coords[0]
-                hole_depth = self.busbar_hole_depths[0] if len(self.busbar_hole_depths) > 0 else 0.0
+                hole_depth = (
+                    self.busbar_hole_depths[0]
+                    if len(self.busbar_hole_depths) > 0
+                    else 0.0
+                )
 
                 dx_px = hx - bx  # 영상 기준 X차이 (양수: 구멍이 오른쪽, 음수: 구멍이 왼쪽)
                 dy_px = hy - by  # 영상 기준 Y차이 (양수: 구멍이 아래쪽, 음수: 구멍이 위쪽)
                 angle_error = self.battery_angle - self.busbar_angle
 
                 # 이상치 픽셀 오차 스킵 가드
-                if abs(dx_px) > self.MAX_VALID_PIXEL_ERR or abs(dy_px) > self.MAX_VALID_PIXEL_ERR:
-                    self.get_logger().warn(f"⚠️ [비전 노이즈 차단] 비정상적 픽셀 오차 감지! dx:{dx_px}, dy:{dy_px} -> 프레임 스킵")
+                if (
+                    abs(dx_px) > self.MAX_VALID_PIXEL_ERR
+                    or abs(dy_px) > self.MAX_VALID_PIXEL_ERR
+                ):
+                    self.get_logger().warn(
+                        "⚠️ [비전 노이즈 차단] 비정상적 픽셀 오차 감지! "
+                        f"dx:{dx_px}, dy:{dy_px} -> 프레임 스킵")
                     self.has_valid_tracking = False
                 else:
                     self.last_valid_dx_px = dx_px
@@ -173,11 +246,28 @@ class BatteryAssemblyVisionNode(Node):
                     self.has_valid_tracking = True
 
                     cv2.circle(display_img, (hx, hy), 5, (0, 0, 255), -1)
-                    cv2.line(display_img, (bx, by), (hx, hy), (255, 0, 255), 1, cv2.LINE_AA)
-                    cv2.putText(display_img, f"E:({dx_px},{dy_px}) Z:{hole_depth:.2f}", (hx + 8, hy - 8),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 255), 1)
+                    cv2.line(
+                        display_img,
+                        (bx, by),
+                        (hx, hy),
+                        (255, 0, 255),
+                        1,
+                        cv2.LINE_AA,
+                    )
+                    cv2.putText(
+                        display_img,
+                        f"E:({dx_px},{dy_px}) Z:{hole_depth:.2f}",
+                        (hx + 8, hy - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.4,
+                        (255, 0, 255),
+                        1,
+                    )
 
-                    status_line = f"dx:{dx_px:+2d}px, dy:{dy_px:+2d}px, dTheta:{angle_error:+.2f}deg [{self.hold_count}/30]"
+                    status_line = (
+                        f"dx:{dx_px:+2d}px, dy:{dy_px:+2d}px, "
+                        f"dTheta:{angle_error:+.2f}deg "
+                        f"[{self.hold_count}/30]")
                     sys.stdout.write(f"\r\033[K[Tracking Status] {status_line}")
                     sys.stdout.flush()
 
@@ -185,24 +275,32 @@ class BatteryAssemblyVisionNode(Node):
         cv2.waitKey(1)
 
     def control_loop(self):
-        """픽셀 좌표(hx, hy)와 볼트 좌표(bx, by)가 완벽히 일치할 때까지 보정하는 제어 루프"""
+        """픽셀 좌표와 볼트 좌표가 완전히 일치할 때까지 보정한다."""
         if not self.is_active or not self.bolts_detected or not self.has_valid_tracking:
             return
 
         bx, by = self.fixed_bolt_coords[0]
-        hx, hy = self.busbar_hole_coords[0] if len(self.busbar_hole_coords) > 0 else (bx, by)
+        hx, hy = (
+            self.busbar_hole_coords[0]
+            if len(self.busbar_hole_coords) > 0
+            else (bx, by)
+        )
         dtheta = self.last_valid_dtheta
 
         # 🎯 [수렴 조건] 픽셀 오차가 0 (hx == bx, hy == by) & 각도 0.5도 이하
         if hx == bx and hy == by and abs(dtheta) <= self.TOLERANCE_DEG:
             self.hold_count += 1
-            
+
             # 연속 30 Step(약 3초) 달성 시 완수 신호 퍼블리시 및 종료
             if self.hold_count >= 30:
-                self.get_logger().info(f"\n==========================================")
-                self.get_logger().info(f" ★ [정밀 정렬 완료] 픽셀 완전 일치(0px 오차) 30 Step 유지 달성")
-                self.get_logger().info(f"==========================================")
-                
+                self.get_logger().info(
+                    "\n==========================================")
+                self.get_logger().info(
+                    " ★ [정밀 정렬 완료] "
+                    "픽셀 완전 일치(0px 오차) 30 Step 유지 달성")
+                self.get_logger().info(
+                    "==========================================")
+
                 msg = String()
                 msg.data = "ALIGNMENT_SUCCESS"
                 self.pub_task_cmd.publish(msg)
@@ -242,7 +340,7 @@ class BatteryAssemblyVisionNode(Node):
         target_msg = PoseStamped()
         target_msg.header.stamp = self.get_clock().now().to_msg()
         target_msg.header.frame_id = "world"
-        
+
         target_msg.pose.position.x = step_x
         target_msg.pose.position.y = step_y
         target_msg.pose.position.z = 0.0
@@ -275,7 +373,6 @@ class BatteryAssemblyVisionNode(Node):
             )
             self._roi_logged = True
 
-
         # 1. 고정 볼트 ROI 추출
         roi = frame[y_start:y_start + roi_h, x_start:x_start + roi_w]
 
@@ -289,7 +386,7 @@ class BatteryAssemblyVisionNode(Node):
 
         # 4. Hough Circles 원 검출
         circles = cv2.HoughCircles(
-            blurred_bolt, cv2.HOUGH_GRADIENT, dp=1.0, 
+            blurred_bolt, cv2.HOUGH_GRADIENT, dp=1.0,
             minDist=15, param1=50, param2=12, minRadius=2, maxRadius=4
         )
 
@@ -297,20 +394,27 @@ class BatteryAssemblyVisionNode(Node):
         if circles is not None:
             circles = np.uint16(np.around(circles))
             detected_candidates = []
-            
+
             for i in circles[0, :]:
                 cx, cy, r = int(i[0]), int(i[1]), int(i[2])
                 detected_candidates.append((cx + x_start, cy + y_start, cx, cy, r))
-            
+
             # X 좌표 기준 오름차순 정렬 (가장 왼쪽 원 선택)
             detected_candidates.sort(key=lambda c: c[0])
-            
+
             best_candidate = detected_candidates[0]
             self.fixed_bolt_coords = [(best_candidate[0], best_candidate[1])]
 
         # 5. Canny Edge 및 라인 검출
         edges = cv2.Canny(clahe, 50, 150)
-        lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=40, minLineLength=40, maxLineGap=10)
+        lines = cv2.HoughLinesP(
+            edges,
+            1,
+            np.pi / 180,
+            threshold=40,
+            minLineLength=40,
+            maxLineGap=10,
+        )
 
         best_line = None
         max_length = 0
@@ -322,7 +426,11 @@ class BatteryAssemblyVisionNode(Node):
                 length = math.hypot(dx, dy)
                 angle_deg = math.degrees(math.atan2(dy, dx))
 
-                if -20.0 <= angle_deg <= 20.0 or angle_deg >= 160.0 or angle_deg <= -160.0:
+                if (
+                    -20.0 <= angle_deg <= 20.0
+                    or angle_deg >= 160.0
+                    or angle_deg <= -160.0
+                ):
                     if length > max_length:
                         max_length = length
                         best_line = (x1, y1, x2, y2)
@@ -338,7 +446,7 @@ class BatteryAssemblyVisionNode(Node):
 
             norm = math.hypot(dx_g, dy_g)
             vx, vy = dx_g / norm, dy_g / norm
-            
+
             self.battery_angle = math.degrees(math.atan2(vy, vx))
             self.battery_line_data = (vx, vy, float(gx1), float(gy1))
         elif self.fixed_bolt_coords:
@@ -348,17 +456,21 @@ class BatteryAssemblyVisionNode(Node):
 
     def detect_yellow_busbar_holes_depth(self, frame, depth_img, min_busbar_area=2000):
         h, w = frame.shape[:2]
-        
+
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         lower_yellow = np.array([15, 80, 80])
         upper_yellow = np.array([35, 255, 255])
-        
+
         raw_mask = cv2.inRange(hsv, lower_yellow, upper_yellow)
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
         raw_mask = cv2.morphologyEx(raw_mask, cv2.MORPH_OPEN, kernel)
         raw_mask = cv2.morphologyEx(raw_mask, cv2.MORPH_CLOSE, kernel)
 
-        contours, _ = cv2.findContours(raw_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours, _ = cv2.findContours(
+            raw_mask,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE,
+        )
         filtered_mask = np.zeros_like(raw_mask)
         main_busbar_cnt = None
         max_area = 0
@@ -372,7 +484,14 @@ class BatteryAssemblyVisionNode(Node):
                     main_busbar_cnt = cnt
 
         mask_edges = cv2.Canny(filtered_mask, 50, 150)
-        mask_lines = cv2.HoughLinesP(mask_edges, 1, np.pi / 180, threshold=30, minLineLength=20, maxLineGap=10)
+        mask_lines = cv2.HoughLinesP(
+            mask_edges,
+            1,
+            np.pi / 180,
+            threshold=30,
+            minLineLength=20,
+            maxLineGap=10,
+        )
 
         bottommost_line = None
         max_y = -1
@@ -383,7 +502,11 @@ class BatteryAssemblyVisionNode(Node):
                 dx, dy = x2 - x1, y2 - y1
                 angle_deg = math.degrees(math.atan2(dy, dx))
 
-                if -20.0 <= angle_deg <= 20.0 or angle_deg >= 160.0 or angle_deg <= -160.0:
+                if (
+                    -20.0 <= angle_deg <= 20.0
+                    or angle_deg >= 160.0
+                    or angle_deg <= -160.0
+                ):
                     mid_y = (y1 + y2) / 2.0
                     if mid_y > max_y:
                         max_y = mid_y
@@ -400,7 +523,13 @@ class BatteryAssemblyVisionNode(Node):
             cx, cy = (mx1 + mx2) / 2.0, (my1 + my2) / 2.0
             self.busbar_line_data = (vx, vy, float(cx), float(cy))
         elif main_busbar_cnt is not None:
-            [vx, vy, cx, cy] = cv2.fitLine(main_busbar_cnt, cv2.DIST_L2, 0, 0.01, 0.01)
+            [vx, vy, cx, cy] = cv2.fitLine(
+                main_busbar_cnt,
+                cv2.DIST_L2,
+                0,
+                0.01,
+                0.01,
+            )
             vx_val, vy_val = vx[0], vy[0]
             if vx_val < 0:
                 vx_val, vy_val = -vx_val, -vy_val
@@ -408,9 +537,24 @@ class BatteryAssemblyVisionNode(Node):
             self.busbar_line_data = (vx_val, vy_val, cx[0], cy[0])
 
         depth_h, depth_w = depth_img.shape[:2]
-        depth_img_resized = cv2.resize(depth_img, (w, h), interpolation=cv2.INTER_NEAREST) if (depth_h, depth_w) != (h, w) else depth_img
+        depth_img_resized = (
+            cv2.resize(
+                depth_img,
+                (w, h),
+                interpolation=cv2.INTER_NEAREST,
+            )
+            if (depth_h, depth_w) != (h, w)
+            else depth_img
+        )
 
-        depth_norm = cv2.normalize(depth_img_resized, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+        depth_norm = cv2.normalize(
+            depth_img_resized,
+            None,
+            0,
+            255,
+            cv2.NORM_MINMAX,
+            dtype=cv2.CV_8U,
+        )
         depth_blur = cv2.GaussianBlur(depth_norm, (5, 5), 0)
 
         laplacian = cv2.Laplacian(depth_blur, cv2.CV_8U, ksize=3)
@@ -439,11 +583,11 @@ class BatteryAssemblyVisionNode(Node):
             return
         vx, vy, x0, y0 = line_data
         h, w = img.shape[:2]
-        
+
         scale = max(w, h) * 2
         p1 = (int(x0 - vx * scale), int(y0 - vy * scale))
         p2 = (int(x0 + vx * scale), int(y0 + vy * scale))
-        
+
         cv2.line(img, p1, p2, color, thickness, cv2.LINE_AA)
         if label:
             cv2.putText(img, label, (int(x0) - 100, int(y0) - 15),
@@ -453,7 +597,7 @@ class BatteryAssemblyVisionNode(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = BatteryAssemblyVisionNode()
-    
+
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:

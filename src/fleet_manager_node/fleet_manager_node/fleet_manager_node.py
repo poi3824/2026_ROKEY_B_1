@@ -1,4 +1,6 @@
-"""fleet_manager_node
+"""
+Fleet job dispatcher for the busbar assembly workflow.
+
 FMS 계층 · 전체 작업을 보고 다음 job을 결정하는 관리자.
 
 PUB /fleet/job      (fms_interfaces/FleetJob)
@@ -35,7 +37,8 @@ class FleetManagerNode(Node):
 
     # --- 남은 작업 판단 --------------------------------------------------
     def _refresh_pending_jobs(self):
-        """어느 단자(스테이션)가 비어 있는지 확인.
+        """
+        어느 단자(스테이션)가 비어 있는지 확인.
 
         TODO: 비전 스캔 결과(전체 스테이션 상태)를 받아 실제 빈 단자를 판단.
         지금은 데모용으로 station_1~3에 순차적으로 ASSEMBLE job을 채워 넣는다.

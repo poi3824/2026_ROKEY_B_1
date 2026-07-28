@@ -15,6 +15,7 @@
   <exec_depend>amr_node</exec_depend>
   <exec_depend>arm_node</exec_depend>
   <exec_depend>perception_node</exec_depend>
+  <exec_depend>error_fix</exec_depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

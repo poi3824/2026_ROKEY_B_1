@@ -1,4 +1,5 @@
-"""FMS의 AMR 명령과 Isaac Sim AMR 브리지를 연결한다.
+"""
+FMS의 AMR 명령과 Isaac Sim AMR 브리지를 연결한다.
 
 다른 ``src`` 노드는 커스텀 메시지인 ``/amr/goal``과 ``/amr/status``만 사용한다.
 Isaac Sim 프로세스는 커스텀 인터페이스를 import하지 않고 표준 메시지 토픽만
@@ -11,9 +12,8 @@ SUB /amr/sim_pose    (geometry_msgs/Pose2D)       <- Isaac Sim
 SUB /amr/drive_state (std_msgs/String, optional)  <- physics bridge
 PUB /amr/cancel      (std_msgs/Empty)              -> physics bridge
 
-``scripts/execute_isaac.py``처럼 ``/amr/sim_pose``만 발행하는 단순 브리지에서는
-위치 허용 오차로 도착을 판단한다. ``/amr/drive_state``를 지원하는 물리 브리지에서는
-위치뿐 아니라 최종 자세 정렬과 실패 여부까지 브리지가 판정한 결과를 사용한다.
+``/amr/sim_pose``는 실제 pose 피드백용이다. 도착 여부는 위치·yaw·정지 상태를
+12틱 동안 함께 검사한 물리 브리지의 ``/amr/drive_state``만 신뢰한다.
 """
 import json
 import math
@@ -26,9 +26,12 @@ from rclpy.node import Node
 from std_msgs.msg import Empty, String
 
 from fms_interfaces.msg import AmrGoal, AmrStatus
+from .timeout_policy import (
+    DEFAULT_BRIDGE_TIMEOUT_SEC,
+    bridge_timeout_expired,
+)
 
 DEFAULT_ARRIVAL_TOLERANCE_M = 0.05
-DEFAULT_BRIDGE_TIMEOUT_SEC = 10.0
 GOAL_FRAME_ID = 'amr_baseline'
 ACTIVE_DRIVE_STATES = {'ACTIVE', 'DRIVING'}
 TERMINAL_DRIVE_STATES = {'ARRIVED', 'FAILED', 'CANCELED'}
@@ -111,9 +114,8 @@ class AmrNode(Node):
         if self._moving:
             old_station = self._goal_station_id
             self._moving = False
-            self._cancel_pub.publish(Empty())
             self.get_logger().warn(
-                f'새 목표 {station_id} 수신: 기존 목표 {old_station} 취소')
+                f'새 목표 {station_id} 수신: 기존 목표 {old_station} 교체')
 
         goal_pose = PoseStamped()
         goal_pose.header.stamp = self.get_clock().now().to_msg()
@@ -147,17 +149,10 @@ class AmrNode(Node):
             return
         self._last_bridge_activity = time.monotonic()
 
-        # drive_state가 온 물리 브리지는 최종 yaw와 안정화 프레임까지 검사한다.
-        if self._drive_state_seen:
-            return
-
-        dx = self._goal_xy[0] - msg.x
-        dy = self._goal_xy[1] - msg.y
-        distance = math.hypot(dx, dy)
-        if distance <= self._arrival_tolerance:
-            self._finish(
-                AmrStatus.STATE_ARRIVED,
-                f'도착 (위치 오차 {distance:.3f} m)')
+        # sim_pose만으로는 yaw/정지 12틱 조건을 증명할 수 없다. 특히 새 목표 직후
+        # 이전 목표의 마지막 pose가 먼저 도착해도 조기 ARRIVED가 되지 않아야 한다.
+        # 물리 브리지가 동일 goal_stamp로 발행하는 drive_state가 유일한 terminal
+        # source다.
 
     def _on_drive_state(self, msg: String):
         try:
@@ -189,12 +184,16 @@ class AmrNode(Node):
                 message or f'Isaac Sim 주행 {state.lower()}')
 
     def _on_watchdog(self):
-        if not self._moving or self._bridge_timeout == 0.0:
-            return
-        silence = time.monotonic() - self._last_bridge_activity
-        if silence <= self._bridge_timeout:
+        now = time.monotonic()
+        if not bridge_timeout_expired(
+            moving=self._moving,
+            timeout_sec=self._bridge_timeout,
+            last_activity=self._last_bridge_activity,
+            now=now,
+        ):
             return
 
+        silence = now - self._last_bridge_activity
         self._cancel_pub.publish(Empty())
         self._finish(
             AmrStatus.STATE_ERROR,

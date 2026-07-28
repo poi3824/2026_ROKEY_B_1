@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""rosbag2에서 프레임 딱 하나만 오프라인으로 읽어 YOLO 검출 -> 좌표 변환 -> 오버레이
-PNG로 저장하는 디버그 도구.
+"""
+Rosbag2 프레임 하나를 오프라인 검출해 좌표 오버레이 PNG로 저장한다.
 
 이 노트북은 CPU-only라 YOLO 세그멘테이션 추론에 프레임당 8~10초가 걸린다.
 `ros2 bag play`로 실시간 재생하면서 perception_node의 0.5초 주기 타이머로 검출하면,
@@ -30,19 +30,22 @@ import sys
 # egg-link가 가리키는 곳과 동일해서 동작 차이 없음.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import cv2
-from ament_index_python.packages import get_package_share_directory
-from cv_bridge import CvBridge
-from rclpy.duration import Duration
-from rclpy.serialization import deserialize_message
-from rosbag2_py import ConverterOptions, SequentialReader, StorageOptions
-from sensor_msgs.msg import CameraInfo, Image
-from tf2_msgs.msg import TFMessage
-from tf2_ros.buffer import Buffer
+import cv2  # noqa: E402
+from ament_index_python.packages import get_package_share_directory  # noqa: E402
+from cv_bridge import CvBridge  # noqa: E402
+from rclpy.duration import Duration  # noqa: E402
+from rclpy.serialization import deserialize_message  # noqa: E402
+from rosbag2_py import ConverterOptions, SequentialReader, StorageOptions  # noqa: E402
+from sensor_msgs.msg import CameraInfo, Image  # noqa: E402
+from tf2_msgs.msg import TFMessage  # noqa: E402
+from tf2_ros.buffer import Buffer  # noqa: E402
 
-from perception_node import overlay
-from perception_node.camera_geometry import make_camera_model, transform_pixel_to_world
-from perception_node.detector import YoloSegDetector
+from perception_node import overlay  # noqa: E402
+from perception_node.camera_geometry import (  # noqa: E402
+    make_camera_model,
+    transform_pixel_to_world,
+)
+from perception_node.detector import YoloPoseDetector  # noqa: E402
 
 DEFAULT_MODEL_PATH = None  # 아래 main()에서 패키지 share 경로로 채움
 
@@ -51,17 +54,19 @@ def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('bag_dir', help='rosbag2 디렉터리 (metadata.yaml이 있는 곳)')
     parser.add_argument('--index', type=int, default=0,
-                         help='몇 번째 rgb/depth/camera_info 프레임을 볼지 (0-based)')
+                        help='몇 번째 rgb/depth/camera_info 프레임을 볼지 (0-based)')
     parser.add_argument('--rgb-topic', default='/rgb')
     parser.add_argument('--depth-topic', default='/depth')
     parser.add_argument('--camera-info-topic', default='/camera_info')
     parser.add_argument('--tf-topic', default='/tf')
     parser.add_argument('--world-frame', default='world')
     parser.add_argument('--camera-frame-override', default='camera_color_optical_frame',
-                         help='tf 조회에 쓸 프레임 이름 (이미지 헤더 frame_id와 다를 수 있음)')
+                        help='tf 조회에 쓸 프레임 이름 (이미지 헤더 frame_id와 다를 수 있음)')
     parser.add_argument('--conf-threshold', type=float, default=0.5)
     parser.add_argument('--model-path', default=None,
-                         help='기본값: perception_node 패키지의 share/models/best.pt')
+                        help=(
+                            '기본값: perception_node 패키지의 '
+                            'share/models/keypoints_busbar6pt_v3.pt'))
     parser.add_argument('--out', default=None, help='기본값: <bag_dir>_frame<index>.png')
     return parser.parse_args()
 
@@ -105,12 +110,18 @@ def main():
     model_path = args.model_path
     if model_path is None:
         try:
-            model_path = f'{get_package_share_directory("perception_node")}/models/best.pt'
+            model_path = (
+                f'{get_package_share_directory("perception_node")}/models/'
+                'keypoints_busbar6pt_v3.pt')
         except Exception:
             # install/setup.bash를 source 안 했으면 ament index에 없음 -> 소스 트리
-            # 경로(src/perception_node/models/best.pt)로 대체.
+            # 경로(src/perception_node/models/keypoints_busbar6pt_v3.pt)로 대체.
             model_path = os.path.join(
-                os.path.dirname(os.path.abspath(__file__)), '..', 'models', 'best.pt')
+                os.path.dirname(os.path.abspath(__file__)),
+                '..',
+                'models',
+                'keypoints_busbar6pt_v3.pt',
+            )
 
     rgb_msg, depth_msg, camera_info_msg, tf_buffer = read_frame(
         args.bag_dir, args.index, args.rgb_topic, args.depth_topic,
@@ -123,7 +134,7 @@ def main():
     camera_model = make_camera_model(camera_info_msg)
     camera_frame_id = args.camera_frame_override or camera_info_msg.header.frame_id
 
-    detector = YoloSegDetector(model_path)
+    detector = YoloPoseDetector(model_path)
     print(f'추론 중... (index={args.index}, stamp={rgb_msg.header.stamp.sec}.'
           f'{rgb_msg.header.stamp.nanosec:09d})', file=sys.stderr)
     detections = detector.detect(rgb, args.conf_threshold)

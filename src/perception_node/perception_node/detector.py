@@ -1,4 +1,5 @@
-"""YOLO 세그멘테이션(레거시) / keypoints(pose)로 물체(bolt/nut/busbar)를 검출.
+"""
+YOLO segmentation 또는 keypoints 모델로 bolt, nut, busbar를 검출한다.
 
 perception 브랜치 프로토타입(perception_prototype/detection.py)의 마스크 중심 계산
 로직을 그대로 재사용한다. 마스크 중심은 박스 중심이 아니라 "실제 채워진 모양의
@@ -32,9 +33,17 @@ class YoloSegDetector:
         self._model = YOLO(model_path)
         self.names = self._model.names
 
-    def detect(self, image: np.ndarray, conf_threshold: float, iou_threshold: float = 0.7) -> list[dict]:
-        """반환: [{"label", "score", "pixel": (u, v), "bbox_px": (x0,y0,x1,y1),
-        "mask_xy": np.ndarray}, ...]"""
+    def detect(
+        self,
+        image: np.ndarray,
+        conf_threshold: float,
+        iou_threshold: float = 0.7,
+    ) -> list[dict]:
+        """
+        검출 라벨, 점수, 픽셀, 경계 상자와 segmentation mask를 반환한다.
+
+        반환 항목은 label, score, pixel, bbox_px, mask_xy 필드를 갖는다.
+        """
         results = self._model(image, conf=conf_threshold, iou=iou_threshold, verbose=False)[0]
         detections = []
         if results.masks is None:
@@ -67,7 +76,10 @@ CENTER_KEYPOINT_INDEX = KEYPOINT_ORDER.index("Center")
 #         self._model = YOLO(model_path)
 #         self.names = self._model.names
 
-#     def detect(self, image: np.ndarray, conf_threshold: float, iou_threshold: float = 0.7) -> list[dict]:
+#     def detect(
+#         self, image: np.ndarray, conf_threshold: float,
+#         iou_threshold: float = 0.7,
+#     ) -> list[dict]:
 #         """반환: [{"label", "score", "pixel": (u, v), "bbox_px": (x0,y0,x1,y1),
 #         "keypoints_px": np.ndarray shape (9,2)}, ...]"""
 #         results = self._model(image, conf=conf_threshold, iou=iou_threshold, verbose=False)[0]
@@ -96,7 +108,12 @@ class YoloPoseDetector:
         self._model = YOLO(model_path)
         self.names = self._model.names
 
-    def detect(self, image: np.ndarray, conf_threshold: float, iou_threshold: float = 0.7) -> list[dict]:
+    def detect(
+        self,
+        image: np.ndarray,
+        conf_threshold: float,
+        iou_threshold: float = 0.7,
+    ) -> list[dict]:
         results = self._model(image, conf=conf_threshold, iou=iou_threshold, verbose=False)[0]
         detections = []
         if results.keypoints is None:
@@ -114,7 +131,7 @@ class YoloPoseDetector:
             detections.append({
                 "label": self.names[int(cls)],
                 "score": float(conf),
-                "pixel": (float(u), float(v)), # Bounding Box 중심 사용
+                "pixel": (float(u), float(v)),  # Bounding Box 중심 사용
                 "bbox_px": tuple(box_list),
                 "keypoints_px": kpts,
             })

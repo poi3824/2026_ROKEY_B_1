@@ -1,4 +1,5 @@
-"""perception_node를 rosbag 재생만으로 단독 테스트하기 위한 launch.
+"""
+Perception node를 rosbag 재생만으로 단독 테스트한다.
 
 bag에 따라 tf 유무가 다르다:
 - rosbag2_2026_07_22-12_27_13, rosbag2_bolt: tf 없음. 이미지 frame_id도 sim_camera.
@@ -24,7 +25,7 @@ bag에 따라 tf 유무가 다르다:
 쓸 수 있다 — 이 씬의 카메라도 rosbag2_busbar와 동일하게 이미지 frame_id는 sim_camera,
 tf는 camera_color_optical_frame이라 기본값이 그대로 맞는다(실측 확인됨: /rgb, /depth,
 /camera_info 토픽명도 perception_node 기본값과 일치). Isaac Sim을 띄우기 전에는
-`export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$HOME/dev_ws/isaac_sim/isaacsim/_build/linux-x86_64/release/exts/isaacsim.ros2.bridge/humble/lib`
+Isaac Sim ROS 2 bridge의 Humble library 경로도 LD_LIBRARY_PATH에 추가해야 한다
 (alias: isaac_ros2)가 필요하다.
 """
 from launch import LaunchDescription
