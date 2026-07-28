@@ -180,7 +180,7 @@ NUT_PEG_CLEARANCE_Z = 0.08                                   # 파지 직후 XY 
 NUT_PEG_CLEAR_TOLERANCE = 0.003                              # 수직 이탈 완료 허용오차(3mm)
 NUT_PEG_CLEAR_HOLD_STEPS = 15                                # 이탈 높이 도착 후 파지 안정화
                                                               # 대기(60Hz 기준 0.25초)
-NUT_GRASP_PRELOAD_M = 0.0003                                 # 면간 폭보다 0.3mm 좁게 명령해
+NUT_GRASP_PRELOAD_M = 0.0010                                 # 면간 폭보다 1.0mm 좁게 명령해
                                                               # 접촉 파지력을 만든다
 BOLT_APPROACH_Z    = 0.6                                     # 너트 체결 상공 고도
 
@@ -1985,7 +1985,16 @@ def main():
                 grip_target = ramp_frac * nut_grip_target
                 robot.gripper.apply_action(ArticulationAction(joint_positions=grip_target))
 
-                if grasp_timer >= GRIP_CLOSE_RAMP_STEPS:
+                if grasp_timer == GRIP_CLOSE_RAMP_STEPS:
+                    # 목표각에 도달한 뒤 런타임 드라이브 강성을 올리고 잠깐 기다려
+                    # 양쪽 면에 접촉력이 안정적으로 형성된 다음 상승한다.
+                    stiffen_gripper_grip(robot)
+                    print(
+                        f"[NUT GRIP] 목표 {nut_grip_target[0]:.4f}rad 도달 -> "
+                        f"{GRIP_SETTLE_STEPS}틱 접촉력 안정화"
+                    )
+
+                if grasp_timer >= GRIP_CLOSE_RAMP_STEPS + GRIP_SETTLE_STEPS:
                     nut_label = resolve_nut_assets(nut_index, nut1_xform, nut2_xform)[1]
                     # 바로 다음 태스크로 넘기지 않고, 현재 XY를 고정한 채 peg 길이보다
                     # 충분히 위로 먼저 수직 이탈한다. 이 구간에서도 그리퍼는 계속 닫는다.
