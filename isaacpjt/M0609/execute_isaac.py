@@ -57,6 +57,7 @@ from std_msgs.msg import String, Float32, Empty
 _THIS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(_THIS_DIR / "rmpflow"))
 from m0609_rmpflow_controller import RMPFlowController
+from nut_grasp_planner import plan_flat_grasp
 from nut_insertion_controller import (
     ForceGuidedNutInsertion,
     InsertionConfig,
@@ -388,6 +389,31 @@ def compose_world_pose(parent_pos, parent_quat, local_pos, local_quat):
         parent_pos + _quat_rotate_vec(parent_quat, np.asarray(local_pos, dtype=float)),
         _quat_mul(parent_quat, np.asarray(local_quat, dtype=float)),
     )
+
+
+def detect_nut_flat_grasp(stage, nut_mesh_path, base_grasp_quat):
+    """너트 Mesh의 월드 XY 외곽 면을 읽어 평행 그리퍼 회전량을 계산한다."""
+    prim = stage.GetPrimAtPath(nut_mesh_path)
+    if not prim.IsValid() or not prim.IsA(UsdGeom.Mesh):
+        raise ValueError(f"너트 Mesh Prim이 유효하지 않습니다: {nut_mesh_path}")
+
+    points = UsdGeom.Mesh(prim).GetPointsAttr().Get()
+    if not points:
+        raise ValueError(f"너트 Mesh 점이 없습니다: {nut_mesh_path}")
+    transform = UsdGeom.Xformable(prim).ComputeLocalToWorldTransform(0)
+    world_xy = []
+    for point in points:
+        world_point = transform.Transform(
+            Gf.Vec3d(float(point[0]), float(point[1]), float(point[2]))
+        )
+        world_xy.append((float(world_point[0]), float(world_point[1])))
+
+    # RG2 손가락은 EE 로컬 X의 양쪽에 있으므로 닫힘축은 로컬 X이다.
+    closing_axis = _quat_rotate_vec(
+        np.asarray(base_grasp_quat, dtype=float), np.array([1.0, 0.0, 0.0])
+    )
+    closing_yaw = math.atan2(float(closing_axis[1]), float(closing_axis[0]))
+    return plan_flat_grasp(world_xy, closing_yaw)
 
 
 def disable_rigidbody_sleep(stage, prim_path):
@@ -1039,6 +1065,7 @@ def main():
     BUSBAR_SCAN_LIFT_POS = None  # 버스바 스캔용 방향 정렬 중간 경유 위치 (현재 XY, 스캔 고도)
     nut_pick_pos   = None     # 현재 너트의 물리 파지 좌표
     nut_approach_pos = None   # 현재 너트 파지 상공 접근 좌표
+    nut_grasp_quat = quat_nut.copy()  # 육각 너트 평면에 맞춘 현재 파지 자세
     nut_peg_clear_pos = None  # 파지 직후 peg에서 수직으로 빠져나올 중간 목표
     nut_peg_clear_hold = 0    # 중간 목표 도착 후 안정화 카운터
     bolt_target_pos  = None   # 체결 목표 좌표
@@ -1137,6 +1164,7 @@ def main():
             NUT_SCAN_POS = None
             nut_pick_pos = None
             nut_approach_pos = None
+            nut_grasp_quat = quat_nut.copy()
             nut_peg_clear_pos = None
             nut_peg_clear_hold = 0
             bolt_target_pos = None
@@ -1453,6 +1481,27 @@ def main():
                         print(f"\n[ERROR] [{task}] 너트 {nut_index}번 Xform을 찾을 수 없습니다.")
                         publish_status("FAILURE:NUT_XFORM_NOT_FOUND")
                     else:
+                        try:
+                            flat_plan = detect_nut_flat_grasp(
+                                stage,
+                                nut_polys_all[nut_array_index],
+                                quat_nut,
+                            )
+                            nut_grasp_quat = yaw_rotated_quat(
+                                quat_nut, flat_plan.yaw_delta_deg
+                            )
+                            print(
+                                f"[NUT FLAT GRASP] {nut_label} Mesh 면 인식 -> "
+                                f"손목 {flat_plan.yaw_delta_deg:+.1f}° 정렬 | "
+                                f"면 법선={flat_plan.face_normal_yaw_deg:+.1f}° | "
+                                f"외곽점={flat_plan.hull_vertex_count}"
+                            )
+                        except (TypeError, ValueError, RuntimeError) as exc:
+                            nut_grasp_quat = quat_nut.copy()
+                            print(
+                                f"[NUT FLAT GRASP][WARN] {exc} -> "
+                                "기본 파지 자세 사용"
+                            )
                         nut_live_pos, _ = nut_xf.get_world_pose()
                         pick_x, pick_y = float(nut_live_pos[0]), float(nut_live_pos[1])
                         nut_pick_pos = np.array([pick_x, pick_y, NUT_PICK_Z])
@@ -1875,7 +1924,7 @@ def main():
             # [11단계] 너트 상공 접근
             elif phase == "NUT_APPROACH":
                 publish_progress("NUT_APPROACH", 20.0)
-                actions = arm_controller.forward(target_end_effector_position=nut_approach_pos, target_end_effector_orientation=quat_nut)
+                actions = arm_controller.forward(target_end_effector_position=nut_approach_pos, target_end_effector_orientation=nut_grasp_quat)
                 robot.apply_action(actions)
                 robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_OPEN))
 
@@ -1891,7 +1940,7 @@ def main():
             # [12단계] 너트 파지점 하강
             elif phase == "NUT_DESCEND":
                 publish_progress("NUT_DESCEND", 40.0)
-                actions = arm_controller.forward(target_end_effector_position=nut_pick_pos, target_end_effector_orientation=quat_nut)
+                actions = arm_controller.forward(target_end_effector_position=nut_pick_pos, target_end_effector_orientation=nut_grasp_quat)
                 robot.apply_action(actions)
                 robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_OPEN))
 
@@ -1910,7 +1959,7 @@ def main():
             # [13단계] battery4_main과 동일한 순수 접촉/마찰 기반 너트 파지.
             elif phase == "NUT_GRASP":
                 publish_progress("NUT_GRASPING", 60.0)
-                actions = arm_controller.forward(target_end_effector_position=nut_pick_pos, target_end_effector_orientation=quat_nut)
+                actions = arm_controller.forward(target_end_effector_position=nut_pick_pos, target_end_effector_orientation=nut_grasp_quat)
                 robot.apply_action(actions)
 
                 grasp_timer += 1
@@ -1939,7 +1988,7 @@ def main():
                 publish_progress("NUT_LIFT_CLEAR_PEG", 75.0)
                 actions = arm_controller.forward(
                     target_end_effector_position=nut_peg_clear_pos,
-                    target_end_effector_orientation=quat_nut,
+                    target_end_effector_orientation=nut_grasp_quat,
                 )
                 robot.apply_action(actions)
                 robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_CLOSE_NUT))
@@ -1966,7 +2015,7 @@ def main():
             # [14단계] peg 이탈 완료 후 안전 상공 상승
             elif phase == "NUT_LIFT":
                 publish_progress("NUT_LIFTING", 80.0)
-                actions = arm_controller.forward(target_end_effector_position=nut_approach_pos, target_end_effector_orientation=quat_nut)
+                actions = arm_controller.forward(target_end_effector_position=nut_approach_pos, target_end_effector_orientation=nut_grasp_quat)
                 robot.apply_action(actions)
                 robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_CLOSE_NUT))
 
@@ -1992,7 +2041,7 @@ def main():
             elif phase == "MOVE_TO_BOLT_NUT":
                 publish_progress("MOVE_TO_BOLT", 20.0)
                 bolt_approach_pos = np.array([bolt_target_pos[0], bolt_target_pos[1], BOLT_APPROACH_Z])
-                actions = arm_controller.forward(target_end_effector_position=bolt_approach_pos, target_end_effector_orientation=quat_nut)
+                actions = arm_controller.forward(target_end_effector_position=bolt_approach_pos, target_end_effector_orientation=nut_grasp_quat)
                 robot.apply_action(actions)
                 robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_CLOSE_NUT))
 
@@ -2012,7 +2061,7 @@ def main():
                 descend_target_z = max(descend_target_z - INSERT_SPEED, bolt_touch_pos[2])
                 step_target_pos = np.array([bolt_touch_pos[0], bolt_touch_pos[1], descend_target_z])
 
-                actions = arm_controller.forward(target_end_effector_position=step_target_pos, target_end_effector_orientation=quat_nut)
+                actions = arm_controller.forward(target_end_effector_position=step_target_pos, target_end_effector_orientation=nut_grasp_quat)
                 robot.apply_action(actions)
                 robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_CLOSE_NUT))
 
