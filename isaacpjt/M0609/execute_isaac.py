@@ -186,13 +186,6 @@ STATION_NUT_INDICES = {
     5: (5, 6),
 }
 
-# 스테이션 4/5는 버스바 스캔 위치도 실측 절대좌표로 고정 (station 3은 기존처럼 현재
-# EE 위치 기준 상대 오프셋 계산을 그대로 쓴다).
-STATION_BUSBAR_SCAN_XY = {
-    4: np.array([-0.2271, 1.8945]),
-    5: np.array([-0.9586, 1.8945]),
-}
-
 # behavior_node.py의 AMR_STATION_POSES와 동일한 좌표 - /amr/goal_pose로 어느 스테이션에
 # 와있는지 자동 판별하는 데 쓴다(battery/busbar 두 지점 다 등록해서 어느 태스크
 # 시점이든 매칭되게 함).
@@ -487,7 +480,49 @@ def _quat_rotate_vec(q, v):
     return _quat_mul(_quat_mul(q, qv), _quat_conj(q))[1:]
 
 
-def attach_busbar_to_gripper(stage, gripper_link_path, robot, busbar_xform):
+def find_busbar_body_near(stage, target_xy):
+    """검출된 XY에 가장 가까운 버스바 rigid-body Prim을 찾는다.
+
+    스테이션이 바뀌어도 Z_busbar3 하나만 계속 조인트 대상으로 쓰던 문제를 피하기
+    위해 /World 아래의 이름에 busbar가 포함된 rigid body를 런타임에 선택한다.
+    """
+    candidates = []
+    world_prim = stage.GetPrimAtPath("/World")
+    if world_prim.IsValid():
+        for prim in Usd.PrimRange(world_prim):
+            path = str(prim.GetPath())
+            if "busbar" not in path.lower() or not prim.HasAPI(UsdPhysics.RigidBodyAPI):
+                continue
+            xf = UsdGeom.Xformable(prim).ComputeLocalToWorldTransform(0)
+            pos = xf.ExtractTranslation()
+            dist = math.hypot(float(pos[0]) - target_xy[0], float(pos[1]) - target_xy[1])
+            candidates.append((dist, path))
+
+    if not candidates:
+        return BUSBAR_POLYSHAPE_PATH if stage.GetPrimAtPath(BUSBAR_POLYSHAPE_PATH).IsValid() else None
+    candidates.sort(key=lambda item: item[0])
+    print(f"[BUSBAR SELECT] target=({target_xy[0]:.4f},{target_xy[1]:.4f}) "
+          f"-> {candidates[0][1]} (distance={candidates[0][0]*1000:.1f}mm)")
+    return candidates[0][1]
+
+
+def remove_all_busbar_grip_joints(stage):
+    """이전 사이클에서 남은 버스바 그립 조인트를 전부 제거한다."""
+    paths = []
+    world_prim = stage.GetPrimAtPath("/World")
+    if world_prim.IsValid():
+        for prim in Usd.PrimRange(world_prim):
+            if prim.GetName() == BUSBAR_GRIP_JOINT_NAME:
+                paths.append(str(prim.GetPath()))
+    for path in paths:
+        joint_prim = stage.GetPrimAtPath(path)
+        if joint_prim.IsValid():
+            UsdPhysics.FixedJoint(joint_prim).GetJointEnabledAttr().Set(False)
+            stage.RemovePrim(path)
+            print(f"[BUSBAR JOINT REMOVE] {path}")
+
+
+def attach_busbar_to_gripper(stage, gripper_link_path, robot, busbar_body_path):
     """버스바를 그리퍼(EE 링크)에 FixedJoint로 고정한다.
 
     find_rigidbody_path로 찾은 부모 프림(/World/Z_busbar3)과, 위치를 실제로 측정한
@@ -498,12 +533,15 @@ def attach_busbar_to_gripper(stage, gripper_link_path, robot, busbar_xform):
     통일한다 - busbar_xform.get_world_pose()로 잰 것과 동일한 BUSBAR_POLYSHAPE_PATH
     (Mesh)를 Body1로 직접 지정한다."""
     gripper_prim = stage.GetPrimAtPath(gripper_link_path)
-    busbar_prim = stage.GetPrimAtPath(BUSBAR_POLYSHAPE_PATH)
+    busbar_prim = stage.GetPrimAtPath(busbar_body_path)
     if not gripper_prim.IsValid() or not busbar_prim.IsValid():
         return None
 
     ee_pos, ee_quat = robot.end_effector.get_world_pose()
-    real_pos, real_quat = busbar_xform.get_world_pose()
+    busbar_world_xf = UsdGeom.Xformable(busbar_prim).ComputeLocalToWorldTransform(0)
+    real_pos = np.asarray(busbar_world_xf.ExtractTranslation(), dtype=float)
+    busbar_quat = busbar_world_xf.ExtractRotationQuat()
+    real_quat = np.array([busbar_quat.GetReal(), *busbar_quat.GetImaginary()], dtype=float)
     ee_pos = np.asarray(ee_pos, dtype=float)
     ee_quat = np.asarray(ee_quat, dtype=float)
     real_pos = np.asarray(real_pos, dtype=float)
@@ -513,12 +551,15 @@ def attach_busbar_to_gripper(stage, gripper_link_path, robot, busbar_xform):
     rel_pos = _quat_rotate_vec(ee_quat_conj, real_pos - ee_pos)
     rel_quat = _quat_mul(ee_quat_conj, real_quat)
 
-    joint_path = f"{BUSBAR_POLYSHAPE_PATH}/{BUSBAR_GRIP_JOINT_NAME}"
+    joint_path = f"{busbar_body_path}/{BUSBAR_GRIP_JOINT_NAME}"
     joint_prim = stage.GetPrimAtPath(joint_path)
-    joint = UsdPhysics.FixedJoint(joint_prim) if joint_prim.IsValid() else UsdPhysics.FixedJoint.Define(stage, joint_path)
+    if joint_prim.IsValid():
+        UsdPhysics.FixedJoint(joint_prim).GetJointEnabledAttr().Set(False)
+        stage.RemovePrim(joint_path)
+    joint = UsdPhysics.FixedJoint.Define(stage, joint_path)
 
     joint.CreateBody0Rel().SetTargets([gripper_link_path])
-    joint.CreateBody1Rel().SetTargets([BUSBAR_POLYSHAPE_PATH])
+    joint.CreateBody1Rel().SetTargets([busbar_body_path])
 
     joint.CreateLocalPos0Attr().Set(Gf.Vec3f(*[float(v) for v in rel_pos]))
     joint.CreateLocalRot0Attr().Set(Gf.Quatf(float(rel_quat[0]), Gf.Vec3f(*[float(v) for v in rel_quat[1:]])))
@@ -531,10 +572,13 @@ def attach_busbar_to_gripper(stage, gripper_link_path, robot, busbar_xform):
     return joint
 
 
-def detach_busbar_from_gripper(stage):
-    joint_prim = stage.GetPrimAtPath(f"{BUSBAR_POLYSHAPE_PATH}/{BUSBAR_GRIP_JOINT_NAME}")
+def detach_busbar_from_gripper(stage, busbar_body_path):
+    joint_path = f"{busbar_body_path}/{BUSBAR_GRIP_JOINT_NAME}"
+    joint_prim = stage.GetPrimAtPath(joint_path)
     if joint_prim.IsValid():
         UsdPhysics.FixedJoint(joint_prim).GetJointEnabledAttr().Set(False)
+        stage.RemovePrim(joint_path)
+        print(f"[BUSBAR JOINT DETACH+REMOVE] {joint_path}")
 
 
 
@@ -893,6 +937,7 @@ def main():
     phase = "IDLE"
     init_pose_only = False  # True면 INIT_POSE 완료 후 SCAN_APPROACH로 안 이어지고 바로 종료
     busbar_grasped = False  # 그리퍼-버스바 FixedJoint가 걸려있는 상태인지
+    active_busbar_body_path = BUSBAR_POLYSHAPE_PATH  # 현재 스테이션에서 집을 버스바
     descend_target_z = None
     target_mid_pos = None
     scan_hold_quat = None  # INIT_POSE 완료 시점의 실제 EE 자세 (SCAN_APPROACH가 그대로 유지)
@@ -951,8 +996,9 @@ def main():
         if playing and not was_playing:
             world.reset()
             enable_physics_recursively(stage, BUSBAR_ROOT_PATH)
-            detach_busbar_from_gripper(stage)
+            remove_all_busbar_grip_joints(stage)
             busbar_grasped = False
+            active_busbar_body_path = BUSBAR_POLYSHAPE_PATH
             if bolt_camera_xform and bolt_camera_init_pos is not None:
                 bolt_camera_xform.set_world_pose(position=bolt_camera_init_pos, orientation=bolt_camera_init_quat)
             if busbar_xform and init_busbar_pos is not None:
@@ -1170,19 +1216,21 @@ def main():
                 print(f"\n>>> [{task}] 초기 관절 자세 복귀 시작")
 
             elif task == "SCAN_BUSBAR":
-                if current_station in STATION_BUSBAR_SCAN_XY:
-                    # 스테이션 4/5는 실측 절대좌표 고정값을 그대로 쓴다.
-                    sxy = STATION_BUSBAR_SCAN_XY[current_station]
-                    BUSBAR_SCAN_POS = np.array([sxy[0], sxy[1], BUSBAR_SCAN_Z])
-                else:
-                    cur_pos = world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation()
-                    BUSBAR_SCAN_POS = np.array([cur_pos[0] - 0.5, cur_pos[1] + 0.5, BUSBAR_SCAN_Z])
+                # battery4_main의 검증된 방식과 동일하게, 모든 스테이션에서 현재 EE
+                # 위치 기준 상대 오프셋으로 스캔 목표를 만든다. 기존 station 4/5 값은
+                # behavior_node의 AMR 차체 정차 좌표를 EE 목표로 잘못 사용한 것이어서
+                # 팔이 버스바가 아닌 엉뚱한 월드 좌표를 가리켰다.
+                cur_pos = world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation()
+                BUSBAR_SCAN_POS = np.array([
+                    cur_pos[0] - 0.5,
+                    cur_pos[1] + 0.5,
+                    BUSBAR_SCAN_Z,
+                ])
                 # 너트1 때와 같은 문제 - XY 이동과 orientation 변경(quat_busbar)을 동시에
                 # 크게 시키면 RMPFlow가 팔꿈치/손목을 꼬아서 돌아가는 경로를 잡는다(스테이션4
                 # 버스바 스캔에서 실측 확인됨). 제자리에서 방향+고도만 먼저 맞추고
                 # (SCAN_BUSBAR_LIFT), 그 다음 같은 높이/방향을 유지한 채 옆으로만 이동
                 # (SCAN_BUSBAR_APPROACH)시켜서 회전과 이동을 분리한다.
-                cur_pos = world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation()
                 BUSBAR_SCAN_LIFT_POS = np.array([cur_pos[0], cur_pos[1], BUSBAR_SCAN_Z])
                 phase = "SCAN_BUSBAR_LIFT"
                 step_count = 0
@@ -1191,9 +1239,21 @@ def main():
             elif task == "PICK_BUSBAR":
                 if isaac_node.latest_target_pose is not None:
                     update_target_positions(isaac_node.latest_target_pose)
+                # 비전이 가리키는 공급 위치에 실제로 놓인 버스바를 선택한다. 이전에는
+                # 모든 스테이션에서 Z_busbar3만 선택해 두 번째 버스바를 잡아도 첫 번째
+                # 버스바에 조인트가 다시 걸렸다.
+                active_busbar_body_path = find_busbar_body_near(
+                    stage, BUSBAR_PICK_POS[:2]
+                )
+                if active_busbar_body_path is None:
+                    print("\n[ERROR] 버스바 rigid-body Prim을 찾지 못했습니다.")
+                    publish_status("FAILURE:BUSBAR_PRIM_NOT_FOUND")
+                    phase = "IDLE"
+                    continue
                 phase = "BUSBAR_APPROACH"
                 step_count = 0
-                print(f"\n>>> [{task}] 버스바 상공 접근(Z=0.6m) 시작")
+                print(f"\n>>> [{task}] 버스바 상공 접근(Z=0.6m) 시작 "
+                      f"(Prim: {active_busbar_body_path})")
 
             elif task == "MOVE_BATTERY_CENTER":
                 if isaac_node.latest_target_pose is not None:
@@ -1505,9 +1565,12 @@ def main():
                     stiffen_gripper_grip(robot)
 
                 if grasp_timer >= GRIP_CLOSE_RAMP_STEPS + GRIP_SETTLE_STEPS:
-                    joint = attach_busbar_to_gripper(stage, ee_path, robot, busbar_xform)
+                    joint = attach_busbar_to_gripper(
+                        stage, ee_path, robot, active_busbar_body_path
+                    )
                     if joint is None:
-                        print(f"\n[ERROR] 버스바 파지 실패 (prim 경로 확인 필요: {BUSBAR_POLYSHAPE_PATH})")
+                        print(f"\n[ERROR] 버스바 파지 실패 "
+                              f"(prim 경로 확인 필요: {active_busbar_body_path})")
                         publish_status("FAILURE:BUSBAR_ATTACH_FAILED")
                         phase = "IDLE"
                     else:
@@ -1627,7 +1690,7 @@ def main():
                 if busbar_grasped:
                     # 그리퍼를 열기 전에 FixedJoint부터 풀어야 한다 - 안 그러면 조인트가
                     # 버스바를 계속 붙잡고 있어서 그리퍼가 열려도 안 떨어진다.
-                    detach_busbar_from_gripper(stage)
+                    detach_busbar_from_gripper(stage, active_busbar_body_path)
                     busbar_grasped = False
 
                 retract_pos = np.array([target_mid_pos[0], target_mid_pos[1], BATTERY_CENTER_Z])
