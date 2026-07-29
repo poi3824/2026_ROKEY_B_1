@@ -1474,9 +1474,15 @@ def main():
                 amr_target_xy_theta = (g_pos.x, g_pos.y, g_theta)
                 amr_moving = True
                 amr_move_step = 0
-                if wheels_locked:
+                if wheels_locked and PHYSICAL_AMR_DRIVE:
                     unlock_amr_base(stage, NOVA_CARTER_ROOT, robot=robot)
                     wheels_locked = False
+                elif not PHYSICAL_AMR_DRIVE:
+                    # kinematic 모드는 바퀴 구동이 아니라 chassis root pose를 직접
+                    # 갱신한다. USD drive 값을 풀어도 런타임 gain은 바뀌지 않으므로
+                    # 실제 바퀴는 잠긴 채인데 논리 상태만 False가 되는 불일치를
+                    # 만들지 않는다. 팔 작업용 베이스 잠금은 계속 유지한다.
+                    wheels_locked = True
                 resolved_station = resolve_station_from_amr_xy(g_pos.x, g_pos.y)
                 if resolved_station is not None:
                     current_station = resolved_station
@@ -1546,8 +1552,11 @@ def main():
                     print(
                         f"\n[AMR] kinematic 목표 도착 "
                         f"(X={new_x:.4f}, Y={new_y:.4f})")
-                    wheels_locked = lock_amr_base(
-                        stage, NOVA_CARTER_ROOT, robot=robot)
+                    if PHYSICAL_AMR_DRIVE:
+                        wheels_locked = lock_amr_base(
+                            stage, NOVA_CARTER_ROOT, robot=robot)
+                    else:
+                        wheels_locked = True
                     sync_rmpflow_base_pose()
 
             sim_pose_msg = Pose2D()
