@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-import sys
 import time
 from enum import Enum, auto
 import rclpy
@@ -426,10 +425,10 @@ class BehaviorNode(Node):
     def feedback_callback(self, feedback_msg):
         """피드백 모니터링"""
         fb = feedback_msg.feedback
-        sys.stdout.write(
-            f"\r    [Feedback] Phase: {fb.sub_phase:<20} | Progress: {fb.progress_pct:5.1f}%"
+        self.get_logger().info(
+            f"[PROGRESS] {fb.sub_phase} | {fb.progress_pct:.1f}%",
+            throttle_duration_sec=1.0,
         )
-        sys.stdout.flush()
 
     def get_result_callback(self, future, generation):
         """최종 결과 처리"""
@@ -438,8 +437,6 @@ class BehaviorNode(Node):
         self._active_goal_handle = None
         result = future.result().result
         self.is_waiting_action = False
-
-        print()
 
         if self._emergency_stopped:
             return

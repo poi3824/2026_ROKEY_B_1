@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-import sys
 import math
 import json
 from collections import deque
@@ -265,8 +264,10 @@ class BatteryAssemblyVisionNode(Node):
                         f"{self.last_valid_dtheta:+.2f}) "
                         f"[{self.hold_count}/30]"
                     )
-                    sys.stdout.write(f"\r\033[K[Tracking Status] {status_line}")
-                    sys.stdout.flush()
+                    self.get_logger().info(
+                        f"[ALIGN] {status_line}",
+                        throttle_duration_sec=1.0,
+                    )
             else:
                 self.has_valid_tracking = False
                 self.hold_count = 0

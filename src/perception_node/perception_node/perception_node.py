@@ -301,12 +301,14 @@ class PerceptionNode(Node):
         self.get_logger().info(
             f"[{label}] raw=({world_point[0]:.4f},{world_point[1]:.4f},{world_point[2]:.4f}) "
             f"mean=({mean[0]:.4f},{mean[1]:.4f},{mean[2]:.4f}) "
-            f"std=({std_mm[0]:.1f},{std_mm[1]:.1f},{std_mm[2]:.1f})mm n={n}"
+            f"std=({std_mm[0]:.1f},{std_mm[1]:.1f},{std_mm[2]:.1f})mm n={n}",
+            throttle_duration_sec=2.0,
         )
         if std_mm.max() > SMOOTHING_STD_WARN_MM:
             self.get_logger().warn(
                 f"[{label}] 검출 흔들림 큼 (표준편차 최대 {std_mm.max():.1f}mm > "
-                f"{SMOOTHING_STD_WARN_MM:.0f}mm) — 조명/거리/각도 또는 conf_threshold 확인 필요"
+                f"{SMOOTHING_STD_WARN_MM:.0f}mm) — 조명/거리/각도 또는 conf_threshold 확인 필요",
+                throttle_duration_sec=2.0,
             )
         return tuple(mean), n
 
