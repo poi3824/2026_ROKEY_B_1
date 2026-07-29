@@ -127,6 +127,8 @@ _camera_last_frame = 0.0
 _camera_frame_count = 0
 _camera_fps_started = time.monotonic()
 _camera_last_state_push = 0.0
+_amr_pose_last_state_push = 0.0
+_isaac_progress_last_state_push = 0.0
 
 
 def _push_update():
@@ -221,9 +223,13 @@ class HmiBridgeNode(Node):
         _push_update()
 
     def _on_isaac_progress(self, msg: Float32):
+        global _isaac_progress_last_state_push
         with _state_lock:
             _state["isaac_progress"] = float(msg.data)
-        _push_update()
+        now = time.monotonic()
+        if now - _isaac_progress_last_state_push >= 0.1:
+            _isaac_progress_last_state_push = now
+            _push_update()
 
     def _on_isaac_status(self, msg: String):
         with _state_lock:
@@ -240,9 +246,13 @@ class HmiBridgeNode(Node):
         _push_update()
 
     def _on_amr_sim_pose(self, msg: Pose2D):
+        global _amr_pose_last_state_push
         with _state_lock:
             _state["amr_pose"] = {"x": msg.x, "y": msg.y, "theta": msg.theta}
-        _push_update()
+        now = time.monotonic()
+        if now - _amr_pose_last_state_push >= 0.1:
+            _amr_pose_last_state_push = now
+            _push_update()
 
     def _on_fleet_job(self, msg: FleetJob):
         with _state_lock:
@@ -535,6 +545,17 @@ def get_state():
 def post_job():
     if _ros_node is None:
         return jsonify({"error": "ROS 노드가 아직 준비되지 않았습니다"}), 503
+    behavior_subscribers = _ros_node.count_subscribers("/fleet/job")
+    if behavior_subscribers < 1:
+        _ros_node.get_logger().error(
+            "[HMI] Job 발행 차단: /fleet/job 구독자가 없습니다 "
+            "(fms_bringup/behavior_node 실행 확인)")
+        return jsonify({
+            "error": (
+                "Behavior 노드가 연결되지 않았습니다. "
+                "fms_bringup launch 실행 상태를 확인하세요"
+            )
+        }), 503
     body = request.get_json(silent=True) or {}
     with _state_lock:
         if _state["emergency_stop"]:
