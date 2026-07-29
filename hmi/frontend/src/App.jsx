@@ -223,14 +223,14 @@ function App() {
 
   const resetSystem = async () => {
     if (!window.confirm('진행 중인 작업을 모두 폐기하고 Isaac 월드, AMR, 로봇 팔과 부품을 초기 상태로 되돌리시겠습니까?')) return
-    pushLog('시스템 완전 초기화 요청')
+    pushLog('시스템 제어 상태 초기화 요청')
     try {
       const res = await fetch('/api/system-reset', { method: 'POST' })
       const data = await res.json()
-      if (res.ok) pushLog('완전 초기화 명령 전송됨')
-      else pushLog(`완전 초기화 실패: ${data.error ?? res.status}`)
+      if (res.ok) pushLog('제어 상태 초기화 명령 전송됨')
+      else pushLog(`초기화 실패: ${data.error ?? res.status}`)
     } catch {
-      pushLog('완전 초기화 실패 (네트워크 오류)')
+      pushLog('초기화 실패 (네트워크 오류)')
     }
   }
 
@@ -453,7 +453,7 @@ function App() {
               작업 재개
             </button>
             <button className="btn btn-reset" onClick={resetSystem}>
-              완전 초기화
+              안전 초기화
             </button>
           </div>
           <div className="operation-summary">

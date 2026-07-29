@@ -399,10 +399,10 @@ class HmiBridgeNode(Node):
             _state["manual_task"] = {
                 "task_type": None,
                 "status": "IDLE",
-                "message": "시스템 완전 초기화 요청",
+                "message": "시스템 제어 상태 초기화 요청",
             }
         _push_update()
-        self.get_logger().warning("[HMI] PUB /system/reset")
+        self.get_logger().warning("[HMI] PUB /system/reset (soft reset)")
 
     def publish_emergency_stop(self, enabled: bool):
         msg = Bool()

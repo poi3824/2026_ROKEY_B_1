@@ -1354,73 +1354,15 @@ def main():
             resume_waiting = False
             active_task = None
             current_station = 1
-            # RTX 카메라와 ROS OmniGraph가 실행 중인 상태에서 world.stop() 뒤
-            # world.reset()을 호출하면 SyntheticData 그래프가 종료/재초기화되는
-            # 과정에서 네이티브 플러그인이 충돌할 수 있다. 타임라인은 유지한 채
-            # 물리 진행만 잠시 멈추고, 아래의 시작 스냅샷을 직접 복원한다.
-            world.pause()
-
-            # 작업 도중 직접 이동시킨 articulation/부품 pose와 FixedJoint를
-            # 시작 스냅샷으로 명시적으로 복원한다.
-            detach_busbar_from_gripper(stage)
-            detach_nut_from_gripper(stage, NUT1_POLYSHAPE_PATH)
-            detach_nut_from_gripper(stage, NUT2_POLYSHAPE_PATH)
-            for extra_poly in EXTRA_NUT_POLYSHAPE_PATHS:
-                detach_nut_from_gripper(stage, extra_poly)
-
-            unlock_amr_base(stage, NOVA_CARTER_ROOT, robot=robot)
-            amr_xform.set_world_pose(
-                position=init_robot_pos, orientation=init_robot_quat)
-            robot.set_joint_positions(init_robot_joints)
-            robot.gripper.apply_action(
-                ArticulationAction(joint_positions=GRIPPER_OPEN))
-
-            if bolt_camera_xform and bolt_camera_init_pos is not None:
-                bolt_camera_xform.set_world_pose(
-                    position=bolt_camera_init_pos,
-                    orientation=bolt_camera_init_quat)
-            if busbar_xform and init_busbar_pos is not None:
-                busbar_xform.set_world_pose(
-                    position=init_busbar_pos, orientation=init_busbar_quat)
-            if nut1_xform and init_nut1_pos is not None:
-                nut1_xform.set_world_pose(
-                    position=init_nut1_pos, orientation=init_nut1_quat)
-            if nut2_xform and init_nut2_pos is not None:
-                nut2_xform.set_world_pose(
-                    position=init_nut2_pos, orientation=init_nut2_quat)
-            for extra_xf, (extra_pos, extra_quat), extra_root, extra_poly in zip(
-                extra_nut_xforms, extra_nut_inits,
-                EXTRA_NUT_ROOT_PATHS, EXTRA_NUT_POLYSHAPE_PATHS
-            ):
-                if extra_xf and extra_pos is not None:
-                    extra_xf.set_world_pose(
-                        position=extra_pos, orientation=extra_quat)
-
-            # 최신 너트 파지 로직과 동일하게 초기화 후 모든 너트를 AMR 기준
-            # kinematic glue 상태로 재구성한다. FixedJoint 방식과 섞으면 파지 시
-            # 이중 구속이 생기므로 사용하지 않는다.
-            amr_glue_pos, amr_glue_quat = robot.get_world_pose()
-            nut_released = [False] * len(nut_xforms_all)
-            for i, (nut_xf, nut_root) in enumerate(
-                zip(nut_xforms_all, nut_roots_all)
-            ):
-                if nut_xf is None:
-                    nut_local_offsets[i] = None
-                    continue
-                remove_nut_amr_joint(stage, nut_root)
-                disable_physics_recursively(stage, nut_root)
-                nut_pos, nut_quat = nut_xf.get_world_pose()
-                nut_local_offsets[i] = compute_local_offset(
-                    amr_glue_pos, amr_glue_quat, nut_pos, nut_quat)
-
-            lock_amr_base(stage, NOVA_CARTER_ROOT, robot=robot)
-            wheels_locked = True
-            sync_rmpflow_base_pose()
-            world.play()
+            # RTX 카메라/SyntheticData 그래프가 평가되는 도중 stage prim 삭제,
+            # rigid-body API 변경, articulation 순간이동을 한 프레임에서 수행하면
+            # Isaac Sim 5.1의 네이티브 OmniGraph 플러그인이 충돌한다. HMI reset은
+            # ROS/FSM 명령 상태만 비우는 안전한 소프트 초기화로 제한한다. 월드의
+            # 물리 상태까지 시작 스냅샷으로 돌려야 할 때는 Isaac 프로세스를 재시작한다.
             was_playing = False
             publish_progress("IDLE", 0.0)
             publish_status("IDLE")
-            print("\n[SYSTEM RESET] 월드·AMR·팔·부품 초기 상태 복원")
+            print("\n[SYSTEM RESET] 명령·FSM 상태 소프트 초기화 (월드 상태 유지)")
             continue
 
         # 비상정지 시 물리 동작만 멈추고 현재 phase와 세부 상태 변수는 보존한다.
