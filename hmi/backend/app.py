@@ -396,13 +396,24 @@ class HmiBridgeNode(Node):
             self._manual_goal_handle = None
         with _state_lock:
             _state["emergency_stop"] = False
+            _state["task_command"] = None
+            _state["alignment"] = None
+            _state["isaac_phase"] = "IDLE"
+            _state["isaac_progress"] = 0.0
+            _state["isaac_status"] = "RESETTING"
+            _state["amr_status"] = {
+                "state": "IDLE",
+                "station_id": "",
+                "message": "시스템 제어 상태 초기화 요청",
+            }
             _state["manual_task"] = {
                 "task_type": None,
                 "status": "IDLE",
                 "message": "시스템 제어 상태 초기화 요청",
             }
         _push_update()
-        self.get_logger().warning("[HMI] PUB /system/reset (soft reset)")
+        self.get_logger().warning(
+            "[HMI] 안전 초기화 발행: AMR 취소 + 비상정지 해제 + /system/reset")
 
     def publish_emergency_stop(self, enabled: bool):
         msg = Bool()

@@ -142,10 +142,12 @@ class BatteryAssemblyVisionNode(Node):
 
     def system_reset_callback(self, _msg: Empty):
         """제어 상태 초기화 후 이전 정렬 보정 명령이 계속 발행되지 않게 한다."""
+        self.emergency_stopped = False
         self.is_active = False
         self.reset_alignment_tracking()
         self.publish_alignment_error()
-        self.get_logger().warning("시스템 제어 상태 초기화: 정렬 추적 중단")
+        self.get_logger().warning(
+            "시스템 제어 상태 초기화: 비상정지 해제 및 정렬 추적 중단")
 
     def publish_alignment_error(self):
         """최근 유효 정렬 오차와 추적 상태를 운영 HMI에 공개한다."""

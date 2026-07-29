@@ -346,8 +346,14 @@ class Execute_Isaac_Busar(Node):
                 f"[HMI] 세부 작업 스테이션 지정: {msg.data}")
 
     def _on_system_reset(self, _msg: Empty):
+        # /emergency_stop=False와 /system/reset은 서로 다른 토픽이라 수신 순서가
+        # 보장되지 않는다. reset 자체가 비상정지 래치도 반드시 해제해야 한다.
+        self.emergency_stopped = False
         self.system_reset_requested = True
         self.requested_task = None
+        self.alignment_success = False
+        self.amr_cancel_requested = True
+        self.amr_goal_pose = None
         self.get_logger().warning("[HMI] 완전 초기화 요청 수신")
 
 
