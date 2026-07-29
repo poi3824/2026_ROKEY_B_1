@@ -680,6 +680,13 @@ def lock_amr_base(stage, amr_root_path, robot=None):
 
     dof_names = list(robot.dof_names) if robot is not None else None
     joint_positions = robot.get_joint_positions() if robot is not None else None
+    if robot is not None and joint_positions is None:
+        # Timeline 재생 직후 또는 Physics Simulation View가 재생성되는 동안 Core API는
+        # None을 반환할 수 있다. 이 상태에서 현재 관절값을 인덱싱하면 Python 예외로
+        # 메인 루프가 종료되고, 이어지는 Kit 플러그인 shutdown 중 SyntheticData까지
+        # 세그멘테이션 오류가 난다. USD 드라이브도 건드리지 말고 호출자가 다음
+        # 시뮬레이션 프레임에 안전하게 재시도하도록 알린다.
+        return False
     locked_joint_names = []
 
     for prim in Usd.PrimRange(amr_prim):
@@ -721,6 +728,7 @@ def lock_amr_base(stage, amr_root_path, robot=None):
             )
         )
         _set_runtime_gains(robot, locked_joint_names, 1.0e9, 1.0e6, 1.0e9)
+    return True
 
 
 def unlock_amr_base(stage, amr_root_path, robot=None):
@@ -1373,14 +1381,19 @@ def main():
                 amr_moving = False
                 amr_target_xy_theta = None
                 if not wheels_locked:
-                    lock_amr_base(stage, NOVA_CARTER_ROOT, robot=robot)
-                    wheels_locked = True
+                    wheels_locked = lock_amr_base(
+                        stage, NOVA_CARTER_ROOT, robot=robot)
                 publish_progress("EMERGENCY_STOP", 0.0)
                 publish_status("FAILURE_EMERGENCY_STOP")
                 print(
                     f"\n[E-STOP] Isaac phase 일시정지: {interrupted_phase}")
                 emergency_applied = True
                 resume_waiting = phase not in ("IDLE", "DONE")
+            elif not wheels_locked:
+                # 비상정지는 유지하되 Physics View가 돌아오는 프레임에 잠금을
+                # 재시도한다. 준비 전에는 잠금 완료로 표시하지 않는다.
+                wheels_locked = lock_amr_base(
+                    stage, NOVA_CARTER_ROOT, robot=robot)
             continue
         if emergency_applied:
             if resume_waiting:
@@ -1449,8 +1462,8 @@ def main():
                 amr_moving = False
                 amr_target_xy_theta = None
                 if not wheels_locked:
-                    lock_amr_base(stage, NOVA_CARTER_ROOT, robot=robot)
-                    wheels_locked = True
+                    wheels_locked = lock_amr_base(
+                        stage, NOVA_CARTER_ROOT, robot=robot)
 
             if isaac_node.amr_goal_pose is not None:
                 goal_msg = isaac_node.amr_goal_pose
@@ -1533,8 +1546,8 @@ def main():
                     print(
                         f"\n[AMR] kinematic 목표 도착 "
                         f"(X={new_x:.4f}, Y={new_y:.4f})")
-                    lock_amr_base(stage, NOVA_CARTER_ROOT, robot=robot)
-                    wheels_locked = True
+                    wheels_locked = lock_amr_base(
+                        stage, NOVA_CARTER_ROOT, robot=robot)
                     sync_rmpflow_base_pose()
 
             sim_pose_msg = Pose2D()
@@ -1557,16 +1570,22 @@ def main():
             task = isaac_node.requested_task
             isaac_node.requested_task = None
 
-            active_task = task
-
             # 안전장치: 팔 Task는 AMR이 도착해 바퀴가 잠긴 상태에서만 수행되어야 한다.
             if not wheels_locked:
                 print(f"\n[WARN] [{task}] 바퀴가 아직 안 잠긴 상태 -> 강제 잠금 후 진행")
-                lock_amr_base(stage, NOVA_CARTER_ROOT, robot=robot)
+                if not lock_amr_base(
+                    stage, NOVA_CARTER_ROOT, robot=robot
+                ):
+                    # Physics View가 아직 준비되지 않았다. 명령을 잃거나 예외로
+                    # Isaac을 종료하지 말고 동일 작업을 다음 렌더 프레임에 재시도한다.
+                    isaac_node.requested_task = task
+                    continue
                 wheels_locked = True
                 amr_moving = False
                 amr_target_xy_theta = None
                 sync_rmpflow_base_pose()
+
+            active_task = task
 
             if task == "SCAN_BATTERY":
                 # 볼트쌍 인식 카메라는 씬에 고정돼 있어서 스테이션마다 다른 볼트 위치를
