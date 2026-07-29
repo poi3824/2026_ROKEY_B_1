@@ -23,7 +23,7 @@ import rclpy
 from geometry_msgs.msg import Pose2D, PoseStamped
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
-from std_msgs.msg import Empty, String
+from std_msgs.msg import Bool, Empty, String
 
 from fms_interfaces.msg import AmrGoal, AmrStatus
 
@@ -80,6 +80,10 @@ class AmrNode(Node):
             Pose2D, '/amr/sim_pose', self._on_sim_pose, 10)
         self._drive_state_sub = self.create_subscription(
             String, '/amr/drive_state', self._on_drive_state, 10)
+        self._emergency_stop_sub = self.create_subscription(
+            Bool, '/emergency_stop', self._on_emergency_stop, 10)
+        self._system_reset_sub = self.create_subscription(
+            Empty, '/system/reset', self._on_system_reset, 10)
 
         self._current_pose = (0.0, 0.0, 0.0)
         self._goal_station_id = ''
@@ -199,6 +203,25 @@ class AmrNode(Node):
         self._finish(
             AmrStatus.STATE_ERROR,
             f'Isaac Sim 브리지 응답이 {silence:.1f}초 동안 없습니다')
+
+    def _clear_active_goal(self, reason: str):
+        """Forget a canceled goal so the next HMI request starts cleanly."""
+        if not self._moving:
+            return
+        station_id = self._goal_station_id
+        self._moving = False
+        self._goal_xy = None
+        self._goal_stamp = ''
+        self._drive_state_seen = False
+        self.get_logger().warn(
+            f'AMR 활성 목표 해제: {station_id} ({reason})')
+
+    def _on_emergency_stop(self, msg: Bool):
+        if msg.data:
+            self._clear_active_goal('비상정지')
+
+    def _on_system_reset(self, _msg: Empty):
+        self._clear_active_goal('시스템 완전 초기화')
 
     def _finish(self, state: int, message: str):
         if not self._moving:

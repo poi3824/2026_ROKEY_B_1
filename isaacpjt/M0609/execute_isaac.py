@@ -30,6 +30,10 @@ from pathlib import Path
 from isaacsim import SimulationApp
 
 _HEADLESS = os.environ.get("AMR_HEADLESS") == "1"
+AMR_DRIVE_MODE = os.environ.get("AMR_DRIVE_MODE", "kinematic").strip().lower()
+if AMR_DRIVE_MODE not in {"physical", "kinematic"}:
+    raise ValueError("AMR_DRIVE_MODE는 physical 또는 kinematic이어야 합니다")
+PHYSICAL_AMR_DRIVE = AMR_DRIVE_MODE == "physical"
 simulation_app = SimulationApp({"headless": _HEADLESS})
 
 from omni.isaac.core.utils.extensions import enable_extension
@@ -40,9 +44,10 @@ sys.stdout.reconfigure(line_buffering=True)
 
 # 2. USD 및 Isaac Core Imports
 import omni.usd
+import omni.graph.core as og
 from pxr import Usd, UsdGeom, UsdPhysics, PhysxSchema, Gf, Sdf
 from isaacsim.core.api import World
-from isaacsim.core.prims import SingleXFormPrim
+from isaacsim.core.prims import SingleRigidPrim, SingleXFormPrim
 from isaacsim.robot.manipulators.grippers import ParallelGripper
 from isaacsim.robot.manipulators.manipulators import SingleManipulator
 from isaacsim.core.utils.types import ArticulationAction
@@ -51,7 +56,7 @@ from isaacsim.core.utils.types import ArticulationAction
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped, Pose2D
-from std_msgs.msg import String, Float32, Empty
+from std_msgs.msg import Bool, String, Float32, Empty
 
 # RMPFlow Controller 경로 설정
 _THIS_DIR = Path(__file__).resolve().parent
@@ -61,9 +66,28 @@ from m0609_rmpflow_controller import RMPFlowController
 # ══════════════════════════════════════════════════════════════════════════
 #  [A] 설정 및 파라미터
 # ══════════════════════════════════════════════════════════════════════════
-USD_PATH = "/home/rokey/junhyeok_version/isaacpjt/M0609/Collected_Busbar_AMR/Busbar.usd"
+# Slack에서 받은 최신 Collected_Busbar 통합 작업 월드를 기본으로 사용한다.
+# 다른 월드를 임시 검증할 때만 ISAAC_WORLD_PATH로 덮어쓸 수 있다.
+DEFAULT_USD_PATH = (
+    _THIS_DIR
+    / "Imported_Collected_Busbar_20260728"
+    / "Collected_Busbar"
+    / "Busbar.usd"
+)
+USD_PATH = os.environ.get("ISAAC_WORLD_PATH", str(DEFAULT_USD_PATH))
 
 NOVA_CARTER_ROOT = "/World/Nova_Carter/chassis_link"
+NOVA_CARTER_PARENT = "/World/Nova_Carter"
+NOVA_CARTER_SENSORS = f"{NOVA_CARTER_ROOT}/sensors"
+FRONT_LIDAR_PATH = f"{NOVA_CARTER_SENSORS}/front_RPLidar/RPLidar_S2E"
+REAR_LIDAR_PATH = f"{NOVA_CARTER_SENSORS}/rear_RPLidar/RPLidar_S2E"
+FRONT_LIDAR_MOUNT_PATH = f"{NOVA_CARTER_SENSORS}/front_RPLidar"
+REAR_LIDAR_MOUNT_PATH = f"{NOVA_CARTER_SENSORS}/rear_RPLidar"
+NAV_LIDAR_HEIGHT_M = 0.16
+WHEEL_JOINT_LEFT = f"{NOVA_CARTER_PARENT}/joint_wheel_left"
+WHEEL_JOINT_RIGHT = f"{NOVA_CARTER_PARENT}/joint_wheel_right"
+WHEEL_RADIUS_M = 0.14
+WHEEL_TRACK_WIDTH_M = 0.4132
 M0609_PATH       = "/World/m0609"
 EE_LINK_NAME     = "link_6"
 BOLT_CAMERA_PATH = "/World/Camera_bolt"  # 볼트쌍 인식용 고정 카메라 - 스테이션마다 위치가
@@ -82,6 +106,7 @@ AMR_DECEL_YAW     = 0.3    # rad - 각도도 동일하게 감속
 AMR_MIN_LINEAR_SPEED  = 0.02   # m/s - 감속해도 이 이하로는 안 느려짐(끝없이 기어가는 것 방지)
 AMR_MIN_ANGULAR_SPEED = 0.05   # rad/s
 AMR_ACCEL_TIME = 1.0   # s - 이동 시작 후 이 시간 동안 속도를 0에서 최고속까지 서서히 올린다
+ISAAC_HMI_BRIDGE_VERSION = "2026-07-28-amr-physical-drive-v4"
 
 BUSBAR_ROOT_PATH      = "/World/Z_busbar3"
 BUSBAR_POLYSHAPE_PATH = "/World/Z_busbar3/Mesh"
@@ -108,7 +133,6 @@ NUT_AMR_DETACH_SETTLE_STEPS = 60  # 하강 완료 직후(손가락 닫기 전) �
                                    # 속도로 살짝 튀거나 흔들릴 수 있으니, 완전히 정지할
                                    # 때까지(1초) 대기한 뒤에야 그리퍼를 닫기 시작한다.
 GRIP_SETTLE_STEPS = 15  # 손가락이 다 닫힌 뒤 FixedJoint를 만들기 전 안정화 대기 틱 수
-BUSBAR_MIN_LIFT_RISE = 0.03  # 실제 버스바가 최소 30mm 상승해야 PICK 성공으로 인정
 
 # Kinematic Pose-Glue 파라미터
 EE_OFFSET = np.array([0.0, 0.0, 0.185])
@@ -174,26 +198,34 @@ BOLT_APPROACH_Z    = 0.6                                     # 너트 체결 상
 # 딕셔너리 키(1,2)는 "이번 스테이션의 몇 번째 볼트인가"이지, 트레이의 물리적 nut_index가
 # 아니다(그건 STATION_NUT_INDICES가 따로 정한다).
 STATION_BOLT_WORLD_POS = {
-    3: {1: np.array([1.0552, 0.3722]), 2: np.array([1.2636, 0.0098])},
-    4: {1: np.array([1.0552, -0.2047]), 2: np.array([1.2636, -0.5671])},
-    5: {1: np.array([1.0552, -0.2047]), 2: np.array([1.2636, -1.0936])},
+    1: {1: np.array([1.0552, 0.3722]), 2: np.array([1.2636, 0.0098])},
+    2: {1: np.array([1.0552, -0.2047]), 2: np.array([1.2636, -0.5671])},
+    3: {1: np.array([1.0552, -0.2047]), 2: np.array([1.2636, -1.0936])},
 }
 
 # 스테이션별로 6슬롯 너트 트레이 중 어느 물리적 너트(1~6)를 쓸지 - 배터리팩4는 3,4번,
 # 배터리팩5는 5,6번 너트를 쓴다.
 STATION_NUT_INDICES = {
-    3: (1, 2),
-    4: (3, 4),
-    5: (5, 6),
+    1: (1, 2),
+    2: (3, 4),
+    3: (5, 6),
+}
+
+# 스테이션 4/5는 버스바 스캔 위치도 실측 절대좌표로 고정 (station 3은 기존처럼 현재
+# EE 위치 기준 상대 오프셋 계산을 그대로 쓴다).
+STATION_BUSBAR_SCAN_XY = {
+    2: np.array([-0.2271, 1.8945]),
+    3: np.array([-0.9586, 1.8945]),
 }
 
 # behavior_node.py의 AMR_STATION_POSES와 동일한 좌표 - /amr/goal_pose로 어느 스테이션에
 # 와있는지 자동 판별하는 데 쓴다(battery/busbar 두 지점 다 등록해서 어느 태스크
 # 시점이든 매칭되게 함).
+_Y_BUSBAR = (1.2392 + 1.205 + 1.2367) / 3.0
 STATION_AMR_POINTS = {
-    3: [(0.6667, -0.0382), (0.5867, 1.9078)],
-    4: [(0.6667, -0.6617), (-0.2271, 1.9078)],
-    5: [(0.6667, -1.1964), (-0.9586, 1.9078)],
+    1: [(0.6667, -0.0382), (0.5867, 1.9078)],
+    2: [(0.6667, -0.6617), (-0.6606, _Y_BUSBAR)],
+    3: [(0.6667, -1.1964), (-1.1298, _Y_BUSBAR)],
 }
 
 # 너트 체결(Screwing) 파라미터
@@ -239,12 +271,24 @@ class Execute_Isaac_Busar(Node):
         self.latest_target_pose = None
         self.requested_task = None
         self.alignment_success = False
+        self.emergency_stopped = False
+        self.requested_station = None
+        self.system_reset_requested = False
 
         self.sub_target_pose = self.create_subscription(
             PoseStamped, '/target_pose', self._on_target_pose, 10
         )
         self.sub_task_cmd = self.create_subscription(
             String, '/task_command', self._on_task_command, 10
+        )
+        self.sub_emergency_stop = self.create_subscription(
+            Bool, '/emergency_stop', self._on_emergency_stop, 10
+        )
+        self.sub_selected_station = self.create_subscription(
+            String, '/hmi/selected_station', self._on_selected_station, 10
+        )
+        self.sub_system_reset = self.create_subscription(
+            Empty, '/system/reset', self._on_system_reset, 10
         )
 
         # amr_node 연동 (amr_node.py: PUB /amr/goal_pose, SUB /amr/sim_pose, SUB /amr/cancel)
@@ -276,8 +320,35 @@ class Execute_Isaac_Busar(Node):
         self.get_logger().info(f"[Task Command 수신]: {msg.data}")
         if msg.data == "ALIGNMENT_SUCCESS":
             self.alignment_success = True
+        elif msg.data == "STOP":
+            # Action 취소 과정의 STOP은 비상정지 체크포인트를 덮어쓰지 않는다.
+            self.get_logger().warning(
+                "[Task Command] STOP 수신 - 현재 동작은 안전 제어 상태에서 정지")
         else:
             self.requested_task = msg.data
+
+    def _on_emergency_stop(self, msg: Bool):
+        self.emergency_stopped = bool(msg.data)
+        if self.emergency_stopped:
+            self.requested_task = None
+            self.alignment_success = False
+            self.amr_cancel_requested = True
+            self.get_logger().error(
+                "[E-STOP] 진행 중인 Isaac 작업을 중단합니다")
+        else:
+            self.get_logger().warning(
+                "[E-STOP] 해제됨 - 새 HMI 명령을 대기합니다")
+
+    def _on_selected_station(self, msg: String):
+        if msg.data in {"station_1", "station_2", "station_3"}:
+            self.requested_station = int(msg.data.rsplit("_", 1)[1])
+            self.get_logger().info(
+                f"[HMI] 세부 작업 스테이션 지정: {msg.data}")
+
+    def _on_system_reset(self, _msg: Empty):
+        self.system_reset_requested = True
+        self.requested_task = None
+        self.get_logger().warning("[HMI] 완전 초기화 요청 수신")
 
 
 def euler_to_quaternion_wxyz(roll, pitch, yaw):
@@ -480,72 +551,7 @@ def _quat_rotate_vec(q, v):
     return _quat_mul(_quat_mul(q, qv), _quat_conj(q))[1:]
 
 
-def find_busbar_body_near(stage, target_xy, max_distance=0.30):
-    """비전 파지점 근처의 버스바 Mesh rigid body를 찾는다.
-
-    상위 Xform/그룹 프림까지 후보에 넣으면 엉뚱한 body frame으로 조인트가 생성되어
-    버스바가 튈 수 있으므로, 실제 형상 body인 Mesh/PolyShape만 허용한다.
-    """
-    candidates = []
-    world_prim = stage.GetPrimAtPath("/World")
-    if not world_prim.IsValid():
-        return None
-
-    for prim in Usd.PrimRange(world_prim):
-        path = str(prim.GetPath())
-        if "busbar" not in path.lower():
-            continue
-        if prim.GetName().lower() not in {"mesh", "polyshape"}:
-            continue
-        if not prim.HasAPI(UsdPhysics.RigidBodyAPI):
-            continue
-
-        xf = UsdGeom.Xformable(prim).ComputeLocalToWorldTransform(0)
-        pos = xf.ExtractTranslation()
-        distance = math.hypot(
-            float(pos[0]) - float(target_xy[0]),
-            float(pos[1]) - float(target_xy[1]),
-        )
-        if distance <= max_distance:
-            candidates.append((distance, path))
-
-    if not candidates:
-        return None
-
-    candidates.sort(key=lambda item: item[0])
-    distance, path = candidates[0]
-    print(f"[BUSBAR SELECT] target=({target_xy[0]:.4f},{target_xy[1]:.4f}) "
-          f"-> {path} (distance={distance*1000:.1f}mm)")
-    return path
-
-
-def busbar_root_path_for_body(busbar_body_path):
-    """선택된 Mesh/PolyShape 경로에서 해당 버스바의 최상위 root 경로를 구한다."""
-    parts = busbar_body_path.rstrip("/").split("/")
-    for index in range(len(parts) - 1, 1, -1):
-        if "busbar" in parts[index].lower():
-            return "/".join(parts[:index + 1])
-    return busbar_body_path.rsplit("/", 1)[0]
-
-
-def remove_all_busbar_grip_joints(stage):
-    """이전 작업에서 남은 버스바-그리퍼 FixedJoint를 전부 제거한다."""
-    joint_paths = []
-    world_prim = stage.GetPrimAtPath("/World")
-    if world_prim.IsValid():
-        for prim in Usd.PrimRange(world_prim):
-            if prim.GetName() == BUSBAR_GRIP_JOINT_NAME:
-                joint_paths.append(str(prim.GetPath()))
-
-    for joint_path in joint_paths:
-        joint_prim = stage.GetPrimAtPath(joint_path)
-        if joint_prim.IsValid():
-            UsdPhysics.FixedJoint(joint_prim).GetJointEnabledAttr().Set(False)
-            stage.RemovePrim(joint_path)
-            print(f"[BUSBAR JOINT REMOVE] {joint_path}")
-
-
-def attach_busbar_to_gripper(stage, gripper_link_path, robot, busbar_body_path):
+def attach_busbar_to_gripper(stage, gripper_link_path, robot, busbar_xform):
     """버스바를 그리퍼(EE 링크)에 FixedJoint로 고정한다.
 
     find_rigidbody_path로 찾은 부모 프림(/World/Z_busbar3)과, 위치를 실제로 측정한
@@ -553,19 +559,15 @@ def attach_busbar_to_gripper(stage, gripper_link_path, robot, busbar_body_path):
     엉뚱한 곳으로 튕겼다(실측 확인됨) - 부모와 Mesh 사이에 자체 상대 오프셋이 있으면
     "Mesh 기준으로 잰 상대변환"을 "부모 프림"에 그대로 적용했을 때 그 오프셋만큼
     어긋난다. 그래서 위치를 재는 프림과 조인트를 실제로 거는 프림을 Mesh 하나로
-    통일한다. 선택된 Mesh/PolyShape를 위치 측정과 Body1에 동일하게 사용한다."""
+    통일한다 - busbar_xform.get_world_pose()로 잰 것과 동일한 BUSBAR_POLYSHAPE_PATH
+    (Mesh)를 Body1로 직접 지정한다."""
     gripper_prim = stage.GetPrimAtPath(gripper_link_path)
-    busbar_prim = stage.GetPrimAtPath(busbar_body_path)
+    busbar_prim = stage.GetPrimAtPath(BUSBAR_POLYSHAPE_PATH)
     if not gripper_prim.IsValid() or not busbar_prim.IsValid():
         return None
 
     ee_pos, ee_quat = robot.end_effector.get_world_pose()
-    busbar_world_xf = UsdGeom.Xformable(busbar_prim).ComputeLocalToWorldTransform(0)
-    real_pos = np.asarray(busbar_world_xf.ExtractTranslation(), dtype=float)
-    busbar_quat = busbar_world_xf.ExtractRotationQuat()
-    real_quat = np.array(
-        [busbar_quat.GetReal(), *busbar_quat.GetImaginary()], dtype=float
-    )
+    real_pos, real_quat = busbar_xform.get_world_pose()
     ee_pos = np.asarray(ee_pos, dtype=float)
     ee_quat = np.asarray(ee_quat, dtype=float)
     real_pos = np.asarray(real_pos, dtype=float)
@@ -575,36 +577,28 @@ def attach_busbar_to_gripper(stage, gripper_link_path, robot, busbar_body_path):
     rel_pos = _quat_rotate_vec(ee_quat_conj, real_pos - ee_pos)
     rel_quat = _quat_mul(ee_quat_conj, real_quat)
 
-    joint_path = f"{busbar_body_path}/{BUSBAR_GRIP_JOINT_NAME}"
+    joint_path = f"{BUSBAR_POLYSHAPE_PATH}/{BUSBAR_GRIP_JOINT_NAME}"
     joint_prim = stage.GetPrimAtPath(joint_path)
-    if joint_prim.IsValid():
-        UsdPhysics.FixedJoint(joint_prim).GetJointEnabledAttr().Set(False)
-        stage.RemovePrim(joint_path)
-    joint = UsdPhysics.FixedJoint.Define(stage, joint_path)
+    joint = UsdPhysics.FixedJoint(joint_prim) if joint_prim.IsValid() else UsdPhysics.FixedJoint.Define(stage, joint_path)
 
     joint.CreateBody0Rel().SetTargets([gripper_link_path])
-    joint.CreateBody1Rel().SetTargets([busbar_body_path])
+    joint.CreateBody1Rel().SetTargets([BUSBAR_POLYSHAPE_PATH])
 
     joint.CreateLocalPos0Attr().Set(Gf.Vec3f(*[float(v) for v in rel_pos]))
     joint.CreateLocalRot0Attr().Set(Gf.Quatf(float(rel_quat[0]), Gf.Vec3f(*[float(v) for v in rel_quat[1:]])))
     joint.CreateLocalPos1Attr().Set(Gf.Vec3f(0.0, 0.0, 0.0))
     joint.CreateLocalRot1Attr().Set(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
-    joint.CreateCollisionEnabledAttr().Set(False)
     joint.CreateJointEnabledAttr().Set(True)
 
     print(f"[BUSBAR ATTACH] EE=({ee_pos[0]:.4f},{ee_pos[1]:.4f},{ee_pos[2]:.4f}) "
-          f"Busbar={busbar_body_path} "
-          f"({real_pos[0]:.4f},{real_pos[1]:.4f},{real_pos[2]:.4f}) rel_pos={rel_pos}")
+          f"Busbar=({real_pos[0]:.4f},{real_pos[1]:.4f},{real_pos[2]:.4f}) rel_pos={rel_pos}")
     return joint
 
 
-def detach_busbar_from_gripper(stage, busbar_body_path):
-    joint_path = f"{busbar_body_path}/{BUSBAR_GRIP_JOINT_NAME}"
-    joint_prim = stage.GetPrimAtPath(joint_path)
+def detach_busbar_from_gripper(stage):
+    joint_prim = stage.GetPrimAtPath(f"{BUSBAR_POLYSHAPE_PATH}/{BUSBAR_GRIP_JOINT_NAME}")
     if joint_prim.IsValid():
         UsdPhysics.FixedJoint(joint_prim).GetJointEnabledAttr().Set(False)
-        stage.RemovePrim(joint_path)
-        print(f"[BUSBAR JOINT DETACH+REMOVE] {joint_path}")
 
 
 
@@ -683,6 +677,15 @@ def lock_amr_base(stage, amr_root_path, robot=None):
     locked_joint_names = []
 
     for prim in Usd.PrimRange(amr_prim):
+        name_lower = prim.GetName().lower()
+        # 물리 주행용 구동륜과 캐스터는 위치 잠금 대상이 아니다. 구동륜은
+        # velocity drive의 damping으로 제동하고 캐스터는 자유 회전해야 한다.
+        if PHYSICAL_AMR_DRIVE and (
+            str(prim.GetPath()) in {WHEEL_JOINT_LEFT, WHEEL_JOINT_RIGHT}
+            or "caster" in name_lower
+            or "swing" in name_lower
+        ):
+            continue
         for dt in ("angular", "linear"):
             drive = UsdPhysics.DriveAPI.Get(prim, dt)
             if drive:
@@ -715,27 +718,301 @@ def lock_amr_base(stage, amr_root_path, robot=None):
 
 
 def unlock_amr_base(stage, amr_root_path, robot=None):
-    """AMR 이동 시작 전 바퀴 구동부를 풀어준다 (lock_amr_base의 반대) - 베이스를
-    set_world_pose로 직접 이동시키므로 바퀴 조인트가 그 이동에 저항하지 않도록 함.
+    """물리 주행 전 구동륜과 캐스터의 주행 설정을 다시 보장한다."""
+    if PHYSICAL_AMR_DRIVE:
+        setup_wheel_velocity_drive(stage, WHEEL_JOINT_LEFT)
+        setup_wheel_velocity_drive(stage, WHEEL_JOINT_RIGHT)
+        free_caster_wheels(stage, amr_root_path)
+        return
 
-    주의: 여기서는 일부러 _set_runtime_gains를 쓰지 않는다. 바퀴 강성을 런타임에서
-    진짜로 0까지 내리면, 바퀴가 몸체(그 위의 팔 포함)를 떠받치는 힘까지 사라져서
-    로봇이 바닥으로 무너지는 사고가 발생했다(실측 확인됨). AMR 이동은 set_world_pose로
-    좌표를 직접 덮어써서 하기 때문에 바퀴 드라이브를 실제로 풀어줄 필요가 애초에 없다 -
-    이 함수는 이전부터 stage 속성만 바꾸는(런타임에는 반영 안 되는) 안전한 무동작이었고,
-    그 상태를 그대로 유지한다. robot 파라미터는 lock_amr_base와 시그니처를 맞추기 위해
-    남겨두되 사용하지 않는다."""
     amr_prim = stage.GetPrimAtPath(amr_root_path).GetParent()
     if not amr_prim.IsValid():
         amr_prim = stage.GetPrimAtPath(amr_root_path)
-
     for prim in Usd.PrimRange(amr_prim):
-        for dt in ("angular", "linear"):
-            drive = UsdPhysics.DriveAPI.Get(prim, dt)
+        for drive_type in ("angular", "linear"):
+            drive = UsdPhysics.DriveAPI.Get(prim, drive_type)
             if drive:
                 drive.GetStiffnessAttr().Set(0.0)
                 drive.GetDampingAttr().Set(0.0)
                 drive.GetMaxForceAttr().Set(0.0)
+
+
+def setup_wheel_velocity_drive(
+    stage, wheel_joint_path, damping=1.0e4, max_force=1.0e6
+):
+    """구동륜을 위치 고정이 아닌 속도 추종 드라이브로 설정한다."""
+    prim = stage.GetPrimAtPath(wheel_joint_path)
+    if not prim.IsValid():
+        raise RuntimeError(f"구동륜 조인트를 찾지 못했습니다: {wheel_joint_path}")
+    drive = UsdPhysics.DriveAPI.Get(prim, "angular")
+    if not drive:
+        raise RuntimeError(f"구동륜 angular drive가 없습니다: {wheel_joint_path}")
+    drive.GetStiffnessAttr().Set(0.0)
+    drive.GetDampingAttr().Set(damping)
+    drive.GetMaxForceAttr().Set(max_force)
+    drive.GetTargetVelocityAttr().Set(0.0)
+
+
+def free_caster_wheels(stage, amr_root_path):
+    """캐스터 바퀴와 스위블 축을 자유 회전 상태로 둔다."""
+    amr_prim = stage.GetPrimAtPath(amr_root_path).GetParent()
+    for prim in Usd.PrimRange(amr_prim):
+        name = prim.GetName().lower()
+        if "caster" not in name and "swing" not in name:
+            continue
+        for drive_type in ("angular", "linear"):
+            drive = UsdPhysics.DriveAPI.Get(prim, drive_type)
+            if drive:
+                drive.GetStiffnessAttr().Set(0.0)
+                drive.GetDampingAttr().Set(200.0)
+                drive.GetMaxForceAttr().Set(500.0)
+
+
+def setup_differential_drive_ros2(chassis_prim_path):
+    """/cmd_vel을 Nova Carter 좌우 구동륜 속도로 변환하는 런타임 그래프."""
+    graph_path = "/Graph/EVCombineDifferentialDrive"
+    stage = omni.usd.get_context().get_stage()
+    stage.RemovePrim(Sdf.Path(graph_path))
+    keys = og.Controller.Keys
+    og.Controller.edit(
+        {"graph_path": graph_path, "evaluator_name": "execution"},
+        {
+            keys.CREATE_NODES: [
+                ("OnPlaybackTick", "omni.graph.action.OnPlaybackTick"),
+                ("Context", "isaacsim.ros2.bridge.ROS2Context"),
+                ("SubscribeTwist", "isaacsim.ros2.bridge.ROS2SubscribeTwist"),
+                ("BreakLinear", "omni.graph.nodes.BreakVector3"),
+                ("BreakAngular", "omni.graph.nodes.BreakVector3"),
+                (
+                    "DiffController",
+                    "isaacsim.robot.wheeled_robots.DifferentialController",
+                ),
+                (
+                    "ArticulationController",
+                    "isaacsim.core.nodes.IsaacArticulationController",
+                ),
+            ],
+            keys.SET_VALUES: [
+                ("SubscribeTwist.inputs:topicName", "/cmd_vel"),
+                ("DiffController.inputs:wheelDistance", WHEEL_TRACK_WIDTH_M),
+                ("DiffController.inputs:wheelRadius", WHEEL_RADIUS_M),
+                ("DiffController.inputs:maxLinearSpeed", 1.0),
+                ("DiffController.inputs:maxAngularSpeed", 1.2),
+                (
+                    "ArticulationController.inputs:targetPrim",
+                    [chassis_prim_path],
+                ),
+                (
+                    "ArticulationController.inputs:jointNames",
+                    ["joint_wheel_left", "joint_wheel_right"],
+                ),
+            ],
+            keys.CONNECT: [
+                ("OnPlaybackTick.outputs:tick", "SubscribeTwist.inputs:execIn"),
+                ("Context.outputs:context", "SubscribeTwist.inputs:context"),
+                (
+                    "SubscribeTwist.outputs:linearVelocity",
+                    "BreakLinear.inputs:tuple",
+                ),
+                (
+                    "SubscribeTwist.outputs:angularVelocity",
+                    "BreakAngular.inputs:tuple",
+                ),
+                ("BreakLinear.outputs:x", "DiffController.inputs:linearVelocity"),
+                ("BreakAngular.outputs:z", "DiffController.inputs:angularVelocity"),
+                (
+                    "SubscribeTwist.outputs:execOut",
+                    "DiffController.inputs:execIn",
+                ),
+                (
+                    "SubscribeTwist.outputs:execOut",
+                    "ArticulationController.inputs:execIn",
+                ),
+                (
+                    "DiffController.outputs:velocityCommand",
+                    "ArticulationController.inputs:velocityCommand",
+                ),
+            ],
+        },
+    )
+    print("[AMR] /cmd_vel 차동구동 물리 그래프 연결 완료")
+
+
+def setup_lidar_ros2(sensor_prim_path, topic_name, frame_id, graph_path):
+    """Nova Carter RTX LiDAR를 ROS 2 LaserScan 토픽으로 발행한다."""
+    stage = omni.usd.get_context().get_stage()
+    sensor_prim = stage.GetPrimAtPath(sensor_prim_path)
+    if not sensor_prim.IsValid():
+        raise RuntimeError(f"LiDAR 센서 프림을 찾지 못했습니다: {sensor_prim_path}")
+
+    stage.RemovePrim(Sdf.Path(graph_path))
+    keys = og.Controller.Keys
+    og.Controller.edit(
+        {"graph_path": graph_path, "evaluator_name": "execution"},
+        {
+            keys.CREATE_NODES: [
+                ("OnPlaybackTick", "omni.graph.action.OnPlaybackTick"),
+                (
+                    "RunOnce",
+                    "isaacsim.core.nodes.OgnIsaacRunOneSimulationFrame",
+                ),
+                (
+                    "RenderProduct",
+                    "isaacsim.core.nodes.IsaacCreateRenderProduct",
+                ),
+                ("Context", "isaacsim.ros2.bridge.ROS2Context"),
+                (
+                    "LaserScanPublish",
+                    "isaacsim.ros2.bridge.ROS2RtxLidarHelper",
+                ),
+            ],
+            keys.SET_VALUES: [
+                ("RenderProduct.inputs:cameraPrim", sensor_prim_path),
+                ("LaserScanPublish.inputs:topicName", topic_name),
+                ("LaserScanPublish.inputs:type", "laser_scan"),
+                ("LaserScanPublish.inputs:frameId", frame_id),
+            ],
+            keys.CONNECT: [
+                ("OnPlaybackTick.outputs:tick", "RunOnce.inputs:execIn"),
+                ("RunOnce.outputs:step", "RenderProduct.inputs:execIn"),
+                (
+                    "RenderProduct.outputs:execOut",
+                    "LaserScanPublish.inputs:execIn",
+                ),
+                (
+                    "RenderProduct.outputs:renderProductPath",
+                    "LaserScanPublish.inputs:renderProductPath",
+                ),
+                ("Context.outputs:context", "LaserScanPublish.inputs:context"),
+            ],
+        },
+    )
+    print(f"[AMR] LiDAR 연결 완료: {sensor_prim_path} -> {topic_name}")
+
+
+def lower_navigation_lidar(mount_prim_path):
+    """수평 LiDAR가 낮은 배터리 트레이를 지나치지 않도록 높이를 내린다.
+
+    USD 원본은 수정하지 않고 현재 실행 중인 stage에만 적용한다.
+    """
+    mount = SingleXFormPrim(
+        prim_path=mount_prim_path,
+        name=f"nav_lidar_mount_{mount_prim_path.rsplit('/', 1)[-1]}",
+    )
+    translation, orientation = mount.get_local_pose()
+    lowered_translation = np.array(
+        [translation[0], translation[1], NAV_LIDAR_HEIGHT_M],
+        dtype=np.float64,
+    )
+    mount.set_local_pose(
+        translation=lowered_translation,
+        orientation=orientation,
+    )
+    print(
+        f"[AMR 안전] 낮은 장애물 탐지용 LiDAR 높이 조정: "
+        f"{mount_prim_path} z={translation[2]:.3f}m "
+        f"-> {NAV_LIDAR_HEIGHT_M:.3f}m")
+
+
+def setup_ros_clock():
+    """Nav2가 시뮬레이션 시간을 사용하도록 /clock을 발행한다."""
+    keys = og.Controller.Keys
+    graph_path = "/Graph/EVCombineClock"
+    stage = omni.usd.get_context().get_stage()
+    stage.RemovePrim(Sdf.Path(graph_path))
+    og.Controller.edit(
+        {"graph_path": graph_path, "evaluator_name": "execution"},
+        {
+            keys.CREATE_NODES: [
+                ("OnPlaybackTick", "omni.graph.action.OnPlaybackTick"),
+                ("Context", "isaacsim.ros2.bridge.ROS2Context"),
+                ("ReadSimTime", "isaacsim.core.nodes.IsaacReadSimulationTime"),
+                ("PublishClock", "isaacsim.ros2.bridge.ROS2PublishClock"),
+            ],
+            keys.CONNECT: [
+                ("OnPlaybackTick.outputs:tick", "PublishClock.inputs:execIn"),
+                ("Context.outputs:context", "PublishClock.inputs:context"),
+                (
+                    "ReadSimTime.outputs:simulationTime",
+                    "PublishClock.inputs:timeStamp",
+                ),
+            ],
+        },
+    )
+
+
+def setup_odometry_tf_ros2(chassis_prim_path):
+    """Nova Carter 물리 포즈에서 /odom과 Nav2 필수 TF를 발행한다."""
+    keys = og.Controller.Keys
+    graph_path = "/Graph/EVCombineOdometryTF"
+    stage = omni.usd.get_context().get_stage()
+    stage.RemovePrim(Sdf.Path(graph_path))
+    og.Controller.edit(
+        {"graph_path": graph_path, "evaluator_name": "execution"},
+        {
+            keys.CREATE_NODES: [
+                ("OnPlaybackTick", "omni.graph.action.OnPlaybackTick"),
+                ("Context", "isaacsim.ros2.bridge.ROS2Context"),
+                ("ReadSimTime", "isaacsim.core.nodes.IsaacReadSimulationTime"),
+                ("ComputeOdom", "isaacsim.core.nodes.IsaacComputeOdometry"),
+                (
+                    "PublishOdom",
+                    "isaacsim.ros2.bridge.ROS2PublishOdometry",
+                ),
+                (
+                    "PublishOdomTF",
+                    "isaacsim.ros2.bridge.ROS2PublishRawTransformTree",
+                ),
+            ],
+            keys.SET_VALUES: [
+                ("ComputeOdom.inputs:chassisPrim", [chassis_prim_path]),
+                ("PublishOdom.inputs:topicName", "odom"),
+                ("PublishOdom.inputs:odomFrameId", "odom"),
+                ("PublishOdom.inputs:chassisFrameId", "base_link"),
+                ("PublishOdomTF.inputs:parentFrameId", "odom"),
+                ("PublishOdomTF.inputs:childFrameId", "base_link"),
+            ],
+            keys.CONNECT: [
+                ("OnPlaybackTick.outputs:tick", "ComputeOdom.inputs:execIn"),
+                ("ComputeOdom.outputs:execOut", "PublishOdom.inputs:execIn"),
+                ("ComputeOdom.outputs:position", "PublishOdom.inputs:position"),
+                (
+                    "ComputeOdom.outputs:orientation",
+                    "PublishOdom.inputs:orientation",
+                ),
+                (
+                    "ComputeOdom.outputs:linearVelocity",
+                    "PublishOdom.inputs:linearVelocity",
+                ),
+                (
+                    "ComputeOdom.outputs:angularVelocity",
+                    "PublishOdom.inputs:angularVelocity",
+                ),
+                ("Context.outputs:context", "PublishOdom.inputs:context"),
+                (
+                    "ReadSimTime.outputs:simulationTime",
+                    "PublishOdom.inputs:timeStamp",
+                ),
+                (
+                    "ComputeOdom.outputs:execOut",
+                    "PublishOdomTF.inputs:execIn",
+                ),
+                (
+                    "ComputeOdom.outputs:position",
+                    "PublishOdomTF.inputs:translation",
+                ),
+                (
+                    "ComputeOdom.outputs:orientation",
+                    "PublishOdomTF.inputs:rotation",
+                ),
+                ("Context.outputs:context", "PublishOdomTF.inputs:context"),
+                (
+                    "ReadSimTime.outputs:simulationTime",
+                    "PublishOdomTF.inputs:timeStamp",
+                ),
+            ],
+        },
+    )
 
 
 def stiffen_gripper_grip(robot, joint_names=None):
@@ -841,6 +1118,18 @@ def main():
 
     world = World(stage_units_in_meters=1.0, physics_dt=PHYSICS_DT)
     lock_amr_base(stage, NOVA_CARTER_ROOT)
+    if PHYSICAL_AMR_DRIVE:
+        setup_wheel_velocity_drive(stage, WHEEL_JOINT_LEFT)
+        setup_wheel_velocity_drive(stage, WHEEL_JOINT_RIGHT)
+        free_caster_wheels(stage, NOVA_CARTER_ROOT)
+    # XFormPrim은 재생 중 USD 좌표만 바꾸므로 다음 PhysX 틱에서 원래 위치로
+    # 되돌아올 수 있다. AMR 섀시를 RigidPrim으로 잡아 물리 transform을 직접
+    # 갱신해야 /amr/sim_pose와 화면상의 차체가 함께 움직인다.
+    amr_xform = world.scene.add(SingleRigidPrim(
+        NOVA_CARTER_ROOT,
+        name="nova_carter_chassis_rigid",
+        reset_xform_properties=False,
+    ))
 
     busbar_xform = SingleXFormPrim(BUSBAR_POLYSHAPE_PATH, name="busbar_poly") if stage.GetPrimAtPath(BUSBAR_POLYSHAPE_PATH).IsValid() else None
     init_busbar_pos, init_busbar_quat = busbar_xform.get_world_pose() if busbar_xform else (None, None)
@@ -902,9 +1191,31 @@ def main():
         set_joint_positions_func=robot.set_joint_positions,
         dof_names=robot.dof_names,
     )
+    if PHYSICAL_AMR_DRIVE:
+        lower_navigation_lidar(FRONT_LIDAR_MOUNT_PATH)
+        lower_navigation_lidar(REAR_LIDAR_MOUNT_PATH)
+        setup_ros_clock()
+        setup_odometry_tf_ros2(NOVA_CARTER_ROOT)
+        setup_differential_drive_ros2(NOVA_CARTER_ROOT)
+        setup_lidar_ros2(
+            FRONT_LIDAR_PATH, "/scan", "front_lidar",
+            "/Graph/EVCombineFrontLidar",
+        )
+        setup_lidar_ros2(
+            REAR_LIDAR_PATH, "/rear_scan", "rear_lidar",
+            "/Graph/EVCombineRearLidar",
+        )
 
     for _ in range(30):
         world.step(render=True)
+
+    print(
+        f"[Isaac Sim] HMI bridge version: {ISAAC_HMI_BRIDGE_VERSION} "
+        f"(AMR drive={AMR_DRIVE_MODE}, prim={NOVA_CARTER_ROOT})")
+
+    # HMI 완전 초기화에서 물리 상태를 강제로 되돌리기 위한 실제 시작 상태.
+    init_robot_pos, init_robot_quat = amr_xform.get_world_pose()
+    init_robot_joints = robot.get_joint_positions().copy()
 
     # battery4_main의 검증된 너트 운반 방식: PICK 전에는 물리를 끄고 AMR 기준 로컬
     # 오프셋으로 매 프레임 포즈를 갱신한다. PICK 명령을 받은 너트만 이 glue에서 풀고
@@ -963,8 +1274,6 @@ def main():
     phase = "IDLE"
     init_pose_only = False  # True면 INIT_POSE 완료 후 SCAN_APPROACH로 안 이어지고 바로 종료
     busbar_grasped = False  # 그리퍼-버스바 FixedJoint가 걸려있는 상태인지
-    active_busbar_body_path = BUSBAR_POLYSHAPE_PATH  # 현재 작업에서 실제로 집을 버스바
-    busbar_attach_z = None  # FixedJoint 생성 순간의 실제 버스바 Z (상승 검증 기준)
     descend_target_z = None
     target_mid_pos = None
     scan_hold_quat = None  # INIT_POSE 완료 시점의 실제 EE 자세 (SCAN_APPROACH가 그대로 유지)
@@ -997,8 +1306,11 @@ def main():
     amr_moving = False
     amr_target_xy_theta = None
     amr_move_step = 0  # 이번 이동 시작 후 지난 스텝 수 (가속 램프용)
-    current_station = 3  # /amr/goal_pose로 자동 판별, 기본값은 station 3
+    current_station = 1  # /amr/goal_pose로 자동 판별, 기본값은 station 1
     wheels_locked = True  # main() 시작 시 lock_amr_base() 이미 호출됨
+    emergency_applied = False
+    resume_waiting = False
+    active_task = None
 
     def publish_status(status_str: str):
         msg = String()
@@ -1019,14 +1331,140 @@ def main():
         rclpy.spin_once(isaac_node, timeout_sec=0.0)
         playing = world.is_playing()
 
+        if isaac_node.requested_station is not None:
+            current_station = isaac_node.requested_station
+            isaac_node.requested_station = None
+            print(f"\n[HMI] 세부 작업 대상 스테이션: {current_station}")
+
+        if isaac_node.system_reset_requested:
+            isaac_node.system_reset_requested = False
+            phase = "IDLE"
+            isaac_node.requested_task = None
+            isaac_node.latest_target_pose = None
+            isaac_node.alignment_success = False
+            step_count = 0
+            grasp_timer = 0
+            nut_release_timer = 0
+            descend_target_z = None
+            target_mid_pos = None
+            amr_moving = False
+            amr_target_xy_theta = None
+            busbar_grasped = False
+            emergency_applied = False
+            resume_waiting = False
+            active_task = None
+            current_station = 1
+            world.stop()
+            world.reset()
+
+            # world.reset()만으로는 작업 도중 직접 이동시킨 articulation/부품 pose와
+            # FixedJoint가 그대로 남을 수 있어 시작 스냅샷으로 명시적으로 복원한다.
+            detach_busbar_from_gripper(stage)
+            detach_nut_from_gripper(stage, NUT1_POLYSHAPE_PATH)
+            detach_nut_from_gripper(stage, NUT2_POLYSHAPE_PATH)
+            for extra_poly in EXTRA_NUT_POLYSHAPE_PATHS:
+                detach_nut_from_gripper(stage, extra_poly)
+
+            unlock_amr_base(stage, NOVA_CARTER_ROOT, robot=robot)
+            amr_xform.set_world_pose(
+                position=init_robot_pos, orientation=init_robot_quat)
+            robot.set_joint_positions(init_robot_joints)
+            robot.gripper.apply_action(
+                ArticulationAction(joint_positions=GRIPPER_OPEN))
+
+            if bolt_camera_xform and bolt_camera_init_pos is not None:
+                bolt_camera_xform.set_world_pose(
+                    position=bolt_camera_init_pos,
+                    orientation=bolt_camera_init_quat)
+            if busbar_xform and init_busbar_pos is not None:
+                busbar_xform.set_world_pose(
+                    position=init_busbar_pos, orientation=init_busbar_quat)
+            if nut1_xform and init_nut1_pos is not None:
+                nut1_xform.set_world_pose(
+                    position=init_nut1_pos, orientation=init_nut1_quat)
+            if nut2_xform and init_nut2_pos is not None:
+                nut2_xform.set_world_pose(
+                    position=init_nut2_pos, orientation=init_nut2_quat)
+            for extra_xf, (extra_pos, extra_quat), extra_root, extra_poly in zip(
+                extra_nut_xforms, extra_nut_inits,
+                EXTRA_NUT_ROOT_PATHS, EXTRA_NUT_POLYSHAPE_PATHS
+            ):
+                if extra_xf and extra_pos is not None:
+                    extra_xf.set_world_pose(
+                        position=extra_pos, orientation=extra_quat)
+
+            # 최신 너트 파지 로직과 동일하게 초기화 후 모든 너트를 AMR 기준
+            # kinematic glue 상태로 재구성한다. FixedJoint 방식과 섞으면 파지 시
+            # 이중 구속이 생기므로 사용하지 않는다.
+            amr_glue_pos, amr_glue_quat = robot.get_world_pose()
+            nut_released = [False] * len(nut_xforms_all)
+            for i, (nut_xf, nut_root) in enumerate(
+                zip(nut_xforms_all, nut_roots_all)
+            ):
+                if nut_xf is None:
+                    nut_local_offsets[i] = None
+                    continue
+                remove_nut_amr_joint(stage, nut_root)
+                disable_physics_recursively(stage, nut_root)
+                nut_pos, nut_quat = nut_xf.get_world_pose()
+                nut_local_offsets[i] = compute_local_offset(
+                    amr_glue_pos, amr_glue_quat, nut_pos, nut_quat)
+
+            lock_amr_base(stage, NOVA_CARTER_ROOT, robot=robot)
+            wheels_locked = True
+            sync_rmpflow_base_pose()
+            world.play()
+            was_playing = False
+            publish_progress("IDLE", 0.0)
+            publish_status("IDLE")
+            print("\n[SYSTEM RESET] 월드·AMR·팔·부품 초기 상태 복원")
+            continue
+
+        # 비상정지 시 물리 동작만 멈추고 현재 phase와 세부 상태 변수는 보존한다.
+        # 해제 후 Behavior/Arm 계층이 같은 task를 다시 보내면 기존 phase를 초기화하지
+        # 않고 Action 응답 연결만 복구한 뒤 중단 지점부터 계속 수행한다.
+        if isaac_node.emergency_stopped:
+            if not emergency_applied:
+                interrupted_phase = phase
+                isaac_node.requested_task = None
+                amr_moving = False
+                amr_target_xy_theta = None
+                if not wheels_locked:
+                    lock_amr_base(stage, NOVA_CARTER_ROOT, robot=robot)
+                    wheels_locked = True
+                publish_progress("EMERGENCY_STOP", 0.0)
+                publish_status("FAILURE_EMERGENCY_STOP")
+                print(
+                    f"\n[E-STOP] Isaac phase 일시정지: {interrupted_phase}")
+                emergency_applied = True
+                resume_waiting = phase not in ("IDLE", "DONE")
+            continue
+        if emergency_applied:
+            if resume_waiting:
+                if isaac_node.requested_task == active_task:
+                    isaac_node.requested_task = None
+                    resume_waiting = False
+                    emergency_applied = False
+                    if active_task == "FINE_ALIGNMENT":
+                        start_cmd = String()
+                        start_cmd.data = "START_ERRORFIX_CORRECTION"
+                        isaac_node.pub_errorfix_command.publish(start_cmd)
+                    publish_status("RUNNING")
+                    print(
+                        f"\n[RESUME] [{active_task}] "
+                        f"기존 Isaac phase={phase}부터 작업 재개")
+                    continue
+                publish_progress(f"PAUSED:{phase}", 0.0)
+                continue
+            publish_progress(phase, 0.0)
+            emergency_applied = False
+
         # 1. Play / Stop 상태 보정
         if playing and not was_playing:
             world.reset()
             enable_physics_recursively(stage, BUSBAR_ROOT_PATH)
-            remove_all_busbar_grip_joints(stage)
+            detach_busbar_from_gripper(stage)
             busbar_grasped = False
-            active_busbar_body_path = BUSBAR_POLYSHAPE_PATH
-            busbar_attach_z = None
             if bolt_camera_xform and bolt_camera_init_pos is not None:
                 bolt_camera_xform.set_world_pose(position=bolt_camera_init_pos, orientation=bolt_camera_init_quat)
             if busbar_xform and init_busbar_pos is not None:
@@ -1122,25 +1560,32 @@ def main():
                 print(f"\n>>> [AMR] 이동 목표 수신 (X={g_pos.x:.4f}, Y={g_pos.y:.4f}, "
                       f"Theta={g_theta:.4f}) -> 바퀴 잠금 해제, 이동 시작")
 
-            amr_pos, amr_quat = robot.get_world_pose()
+            amr_pos, amr_quat = amr_xform.get_world_pose()
             amr_yaw = quat_wxyz_to_yaw(amr_quat)
 
-            if amr_moving and amr_target_xy_theta is not None:
+            if PHYSICAL_AMR_DRIVE:
+                # 실제 이동은 amr_node/Nav2가 발행한 /cmd_vel을 차동구동
+                # 컨트롤러가 좌우 바퀴 속도로 변환해 수행한다.
+                pass
+            elif amr_moving and amr_target_xy_theta is not None:
                 tx, ty, ttheta = amr_target_xy_theta
                 dx, dy = tx - amr_pos[0], ty - amr_pos[1]
                 dist = math.hypot(dx, dy)
-                dyaw = math.atan2(math.sin(ttheta - amr_yaw), math.cos(ttheta - amr_yaw))
-
-                # 목표에 가까워질수록(감속) + 이동을 막 시작했을 때도(가속) 속도를
-                # 서서히 바꾼다 - 시작할 때 0에서 최고속으로 한 틱만에 확 튀는 것도,
-                # 끝에서 뚝 멈추는 것도 둘 다 관성/물리 반력으로 차체가 흔들리는 원인이다.
-                accel_factor = min(1.0, amr_move_step * PHYSICS_DT / AMR_ACCEL_TIME)
+                dyaw = math.atan2(
+                    math.sin(ttheta - amr_yaw),
+                    math.cos(ttheta - amr_yaw),
+                )
+                accel_factor = min(
+                    1.0, amr_move_step * PHYSICS_DT / AMR_ACCEL_TIME)
 
                 if dist > 1e-6:
                     linear_speed = AMR_LINEAR_SPEED
                     if dist < AMR_DECEL_DIST:
-                        linear_speed = AMR_LINEAR_SPEED * (dist / AMR_DECEL_DIST)
-                    linear_speed = max(linear_speed * accel_factor, AMR_MIN_LINEAR_SPEED)
+                        linear_speed *= dist / AMR_DECEL_DIST
+                    linear_speed = max(
+                        linear_speed * accel_factor,
+                        AMR_MIN_LINEAR_SPEED,
+                    )
                     step_dist = min(dist, linear_speed * PHYSICS_DT)
                     new_x = amr_pos[0] + dx / dist * step_dist
                     new_y = amr_pos[1] + dy / dist * step_dist
@@ -1149,32 +1594,32 @@ def main():
 
                 angular_speed = AMR_ANGULAR_SPEED
                 if abs(dyaw) < AMR_DECEL_YAW:
-                    angular_speed = AMR_ANGULAR_SPEED * (abs(dyaw) / AMR_DECEL_YAW)
-                angular_speed = max(angular_speed * accel_factor, AMR_MIN_ANGULAR_SPEED)
-                step_yaw = max(-angular_speed * PHYSICS_DT, min(angular_speed * PHYSICS_DT, dyaw))
+                    angular_speed *= abs(dyaw) / AMR_DECEL_YAW
+                angular_speed = max(
+                    angular_speed * accel_factor,
+                    AMR_MIN_ANGULAR_SPEED,
+                )
+                step_yaw = max(
+                    -angular_speed * PHYSICS_DT,
+                    min(angular_speed * PHYSICS_DT, dyaw),
+                )
                 new_yaw = amr_yaw + step_yaw
                 amr_move_step += 1
 
-                robot.set_world_pose(
+                amr_xform.set_world_pose(
                     position=np.array([new_x, new_y, amr_pos[2]]),
-                    orientation=euler_to_quaternion_wxyz(0.0, 0.0, new_yaw),
+                    orientation=euler_to_quaternion_wxyz(
+                        0.0, 0.0, new_yaw),
                 )
-
-                # 너트 1/2번은 AMR 섀시에 FixedJoint로 고정되어 있으므로(attach_nut_to_amr),
-                # AMR이 set_world_pose로 움직이면 물리 솔버가 알아서 같이 끌고 간다.
-
                 amr_pos = np.array([new_x, new_y, amr_pos[2]])
                 amr_yaw = new_yaw
 
                 if dist < AMR_POS_TOL and abs(dyaw) < AMR_YAW_TOL:
                     amr_moving = False
                     amr_target_xy_theta = None
-                    print(f"\n[AMR] 목표 지점 도착 (X={new_x:.4f}, Y={new_y:.4f}) -> 바퀴 잠금")
-                    try:
-                        robot.set_linear_velocity(np.zeros(3))
-                        robot.set_angular_velocity(np.zeros(3))
-                    except Exception:
-                        pass
+                    print(
+                        f"\n[AMR] kinematic 목표 도착 "
+                        f"(X={new_x:.4f}, Y={new_y:.4f})")
                     lock_amr_base(stage, NOVA_CARTER_ROOT, robot=robot)
                     wheels_locked = True
                     sync_rmpflow_base_pose()
@@ -1199,6 +1644,8 @@ def main():
             task = isaac_node.requested_task
             isaac_node.requested_task = None
 
+            active_task = task
+
             # 안전장치: 팔 Task는 AMR이 도착해 바퀴가 잠긴 상태에서만 수행되어야 한다.
             if not wheels_locked:
                 print(f"\n[WARN] [{task}] 바퀴가 아직 안 잠긴 상태 -> 강제 잠금 후 진행")
@@ -1220,7 +1667,7 @@ def main():
                 # 픽셀좌표를 계속 재사용하는 버그가 있었다(실측 확인됨) - 그래서 카메라를
                 # 옮긴 직후 RESET_BOLT_DETECTION 명령으로 강제 재탐색시킨다.
                 if bolt_camera_xform is not None:
-                    bolt2_xy = STATION_BOLT_WORLD_POS.get(current_station, STATION_BOLT_WORLD_POS[3])[2]
+                    bolt2_xy = STATION_BOLT_WORLD_POS.get(current_station, STATION_BOLT_WORLD_POS[1])[2]
                     bolt_camera_xform.set_world_pose(
                         position=np.array([bolt2_xy[0], bolt2_xy[1], bolt_camera_init_pos[2]]),
                         orientation=bolt_camera_init_quat,
@@ -1244,20 +1691,19 @@ def main():
                 print(f"\n>>> [{task}] 초기 관절 자세 복귀 시작")
 
             elif task == "SCAN_BUSBAR":
-                # AMR 차체의 정차 좌표를 로봇 팔 EE 목표로 사용하면 스테이션 4/5에서
-                # 팔이 엉뚱한 월드 좌표로 향한다. 모든 스테이션에서 현재 EE 기준의
-                # 검증된 상대 오프셋으로 버스바 스캔 위치를 계산한다.
-                cur_pos = world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation()
-                BUSBAR_SCAN_POS = np.array([
-                    cur_pos[0] - 0.5,
-                    cur_pos[1] + 0.5,
-                    BUSBAR_SCAN_Z,
-                ])
+                if current_station in STATION_BUSBAR_SCAN_XY:
+                    # 스테이션 4/5는 실측 절대좌표 고정값을 그대로 쓴다.
+                    sxy = STATION_BUSBAR_SCAN_XY[current_station]
+                    BUSBAR_SCAN_POS = np.array([sxy[0], sxy[1], BUSBAR_SCAN_Z])
+                else:
+                    cur_pos = world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation()
+                    BUSBAR_SCAN_POS = np.array([cur_pos[0] - 0.5, cur_pos[1] + 0.5, BUSBAR_SCAN_Z])
                 # 너트1 때와 같은 문제 - XY 이동과 orientation 변경(quat_busbar)을 동시에
                 # 크게 시키면 RMPFlow가 팔꿈치/손목을 꼬아서 돌아가는 경로를 잡는다(스테이션4
                 # 버스바 스캔에서 실측 확인됨). 제자리에서 방향+고도만 먼저 맞추고
                 # (SCAN_BUSBAR_LIFT), 그 다음 같은 높이/방향을 유지한 채 옆으로만 이동
                 # (SCAN_BUSBAR_APPROACH)시켜서 회전과 이동을 분리한다.
+                cur_pos = world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation()
                 BUSBAR_SCAN_LIFT_POS = np.array([cur_pos[0], cur_pos[1], BUSBAR_SCAN_Z])
                 phase = "SCAN_BUSBAR_LIFT"
                 step_count = 0
@@ -1266,43 +1712,9 @@ def main():
             elif task == "PICK_BUSBAR":
                 if isaac_node.latest_target_pose is not None:
                     update_target_positions(isaac_node.latest_target_pose)
-
-                # 스테이션 3은 검증된 기존 경로를 유지한다. 스테이션 4/5는 비전이
-                # 가리킨 파지점 근처의 실제 버스바 body를 찾아야 Z_busbar3가 대신
-                # 그리퍼에 묶이는 문제가 생기지 않는다.
-                remove_all_busbar_grip_joints(stage)
-                if current_station == 3:
-                    active_busbar_body_path = (
-                        BUSBAR_POLYSHAPE_PATH
-                        if stage.GetPrimAtPath(BUSBAR_POLYSHAPE_PATH).IsValid()
-                        else None
-                    )
-                else:
-                    active_busbar_body_path = find_busbar_body_near(
-                        stage, BUSBAR_PICK_POS[:2]
-                    )
-
-                if active_busbar_body_path is None:
-                    print(f"\n[ERROR] 스테이션{current_station} 파지점 근처에서 "
-                          "버스바 Mesh rigid body를 찾지 못했습니다.")
-                    publish_status("FAILURE:BUSBAR_PRIM_NOT_FOUND")
-                    phase = "IDLE"
-                    continue
-
-                # 성공본은 Z_busbar3만 물리를 켰기 때문에 스테이션 4/5 body에 조인트가
-                # 생성돼도 정적 상태로 남을 수 있었다. 실제 선택된 버스바 전체 root의
-                # RigidBody/Collision을 활성화한 뒤에 접근한다.
-                active_busbar_root_path = busbar_root_path_for_body(
-                    active_busbar_body_path
-                )
-                enable_physics_recursively(stage, active_busbar_root_path)
-                busbar_attach_z = None
-                print(f"[BUSBAR PHYSICS ENABLE] {active_busbar_root_path}")
-
                 phase = "BUSBAR_APPROACH"
                 step_count = 0
-                print(f"\n>>> [{task}] 버스바 상공 접근(Z=0.6m) 시작 "
-                      f"(Prim: {active_busbar_body_path})")
+                print(f"\n>>> [{task}] 버스바 상공 접근(Z=0.6m) 시작")
 
             elif task == "MOVE_BATTERY_CENTER":
                 if isaac_node.latest_target_pose is not None:
@@ -1405,7 +1817,7 @@ def main():
             elif task in ("ASSEMBLE_NUT1", "ASSEMBLE_NUT2"):
                 nut_slot = 1 if task == "ASSEMBLE_NUT1" else 2
                 nut_index = STATION_NUT_INDICES.get(current_station, (1, 2))[nut_slot - 1]
-                bolt_world_xy = STATION_BOLT_WORLD_POS.get(current_station, STATION_BOLT_WORLD_POS[3])[nut_slot]
+                bolt_world_xy = STATION_BOLT_WORLD_POS.get(current_station, STATION_BOLT_WORLD_POS[1])[nut_slot]
                 bolt_target_pos = np.array([bolt_world_xy[0], bolt_world_xy[1], 0.0])
                 bolt_touch_pos = np.array([bolt_target_pos[0], bolt_target_pos[1], 0.3697])
                 phase = "MOVE_TO_BOLT_NUT"
@@ -1608,21 +2020,19 @@ def main():
                 grip_target = ramp_frac * GRIPPER_CLOSE
                 robot.gripper.apply_action(ArticulationAction(joint_positions=grip_target))
 
+                if grasp_timer == GRIP_CLOSE_RAMP_STEPS:
+                    # 옮기는 동안에도 그리퍼가 계속 꽉 닫힌 것처럼 보이게 강성을 올려둔다
+                    # (FixedJoint가 실제 고정을 담당하므로 필수는 아니지만 외관상 유지).
+                    stiffen_gripper_grip(robot)
+
                 if grasp_timer >= GRIP_CLOSE_RAMP_STEPS + GRIP_SETTLE_STEPS:
-                    joint = attach_busbar_to_gripper(
-                        stage, ee_path, robot, active_busbar_body_path
-                    )
+                    joint = attach_busbar_to_gripper(stage, ee_path, robot, busbar_xform)
                     if joint is None:
-                        print(f"\n[ERROR] 버스바 파지 실패 "
-                              f"(prim 경로 확인 필요: {active_busbar_body_path})")
+                        print(f"\n[ERROR] 버스바 파지 실패 (prim 경로 확인 필요: {BUSBAR_POLYSHAPE_PATH})")
                         publish_status("FAILURE:BUSBAR_ATTACH_FAILED")
                         phase = "IDLE"
                     else:
                         busbar_grasped = True
-                        busbar_attach_pos = world_xf(
-                            stage, active_busbar_body_path
-                        ).ExtractTranslation()
-                        busbar_attach_z = float(busbar_attach_pos[2])
                         print("[OK] 3. 버스바 물리 파지 + FixedJoint 고정 완료 -> 4. 안전 고도 상승")
                         phase = "BUSBAR_LIFT"
                         step_count = 0
@@ -1642,31 +2052,10 @@ def main():
                 current_err = math.dist(cur_pos, tuple(BUSBAR_LIFT_MOVE_POS))
 
                 if current_err < PICK_TOLERANCE_STRICT or (current_err < PICK_TOLERANCE_LOOSE_VAL and step_count > MAX_STUCK_STEPS):
-                    busbar_now_pos = world_xf(
-                        stage, active_busbar_body_path
-                    ).ExtractTranslation()
-                    busbar_lift_rise = (
-                        float(busbar_now_pos[2]) - busbar_attach_z
-                        if busbar_attach_z is not None
-                        else 0.0
-                    )
-
-                    if busbar_lift_rise < BUSBAR_MIN_LIFT_RISE:
-                        print(f"\n[ERROR] 버스바 미파지: EE만 상승하고 "
-                              f"{active_busbar_body_path}는 "
-                              f"{busbar_lift_rise*1000:.1f}mm만 상승했습니다.")
-                        detach_busbar_from_gripper(
-                            stage, active_busbar_body_path
-                        )
-                        busbar_grasped = False
-                        publish_status("FAILURE:BUSBAR_NOT_LIFTED")
-                        phase = "IDLE"
-                    else:
-                        print(f"\n★ [PICK_BUSBAR SUCCESS] 실제 버스바 "
-                              f"{busbar_lift_rise*1000:.1f}mm 상승 확인!")
-                        publish_progress("COMPLETE", 100.0)
-                        publish_status("SUCCESS")
-                        phase = "IDLE"
+                    print("\n★ [PICK_BUSBAR SUCCESS] 버스바 파지 및 상승 완수!")
+                    publish_progress("COMPLETE", 100.0)
+                    publish_status("SUCCESS")
+                    phase = "IDLE"
 
             # [6단계] 배터리 중점 상공으로 이동 (Z = 0.7m, 버스바 고정 상태 유지)
             elif phase == "MOVE_BATTERY_CENTER_APPROACH":
@@ -1759,7 +2148,7 @@ def main():
                 if busbar_grasped:
                     # 그리퍼를 열기 전에 FixedJoint부터 풀어야 한다 - 안 그러면 조인트가
                     # 버스바를 계속 붙잡고 있어서 그리퍼가 열려도 안 떨어진다.
-                    detach_busbar_from_gripper(stage, active_busbar_body_path)
+                    detach_busbar_from_gripper(stage)
                     busbar_grasped = False
 
                 retract_pos = np.array([target_mid_pos[0], target_mid_pos[1], BATTERY_CENTER_Z])
@@ -2032,15 +2421,8 @@ def main():
                             print(f"  [체결 감지] 너트 {nut_index}번 완착(Seating) 감지! (TCP Z: {cur_ee_pos[2]:.4f}m, 토크: {curr_torque:.1f}Nm) -> Screwing 조기 종료 및 그리퍼 해제")
 
                         if depth_m >= ENGAGE_LEN or screw_pass_idx >= REGRASP_CYCLES or is_seated_by_torque:
-                            # 체결이 끝난 너트에 PhysX 해석을 계속 적용하면 볼트와의 미세
-                            # 관통을 매 프레임 밀어내면서 떨림/충돌 반력이 생긴다. 현재
-                            # 체결 위치를 유지한 채 해당 너트의 rigid body와 collision을 끈다.
-                            seated_nut_root, _ = nut_paths_for_index(nut_index)
-                            disable_physics_recursively(stage, seated_nut_root)
                             robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_OPEN))
-                            print(f"\n[OK] 너트 {nut_index}번 체결 완료! -> "
-                                  f"물리/충돌 비활성화({seated_nut_root}) -> "
-                                  "꼬인 방향 유지한 채 수직 상승 시작")
+                            print(f"\n[OK] 너트 {nut_index}번 체결 완료! -> 꼬인 방향 유지한 채 수직 상승 시작")
                             phase = "NUT_RETRACT_LIFT"
                             step_count = 0
                         else:

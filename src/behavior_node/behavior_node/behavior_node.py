@@ -5,6 +5,8 @@ from enum import Enum, auto
 import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionClient
+from rclpy.qos import DurabilityPolicy, QoSProfile
+from std_msgs.msg import Bool, Empty, String
 
 from fms_interfaces.action import ExecuteArmTask
 from fms_interfaces.msg import AmrGoal, AmrStatus, FleetJob, FleetReport
@@ -15,15 +17,15 @@ Y_BUSBAR = 1.9078
 
 # amr_node의 amr_baseline 좌표계 기준 접근 지점.
 AMR_STATION_POSES = {
-    "station_5": {
+    "station_3": {
         "battery": ("battery5", X_BATTERY, -1.1964, -1.5707),
         "busbar": ("busbar5", -0.9586, Y_BUSBAR, -1.5707),
     },
-    "station_4": {
+    "station_2": {
         "battery": ("battery4", X_BATTERY, -0.6617, -1.5707),
         "busbar": ("busbar4", -0.2271, Y_BUSBAR, -1.5707),
     },
-    "station_3": {
+    "station_1": {
         "battery": ("battery3", X_BATTERY, -0.0382, -1.5707),
         "busbar": ("busbar3", 0.5867, Y_BUSBAR, -1.5707),
     },
@@ -50,6 +52,7 @@ class ProcessState(Enum):
     ASSEMBLE_NUT2 = auto()          # 볼트 2번 위치로 이동 및 너트 2번 체결 (신규)
     SUCCESS = auto()                # 성공
     FAILURE = auto()                # 실패
+    EMERGENCY_STOP = auto()          # HMI/외부 비상정지 래치
 
 
 class BehaviorNode(Node):
@@ -73,7 +76,19 @@ class BehaviorNode(Node):
         self._fleet_report_pub = self.create_publisher(
             FleetReport, '/fleet/report', 10)
 
-        self.declare_parameter('work_station', 'station_3')
+        # 운영 상태/안전 제어 인터페이스
+        self._state_pub = self.create_publisher(
+            String, '/behavior/state', 10)
+        emergency_qos = QoSProfile(
+            depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        self._emergency_stop_sub = self.create_subscription(
+            Bool, '/emergency_stop', self._on_emergency_stop, emergency_qos)
+        self._system_reset_sub = self.create_subscription(
+            Empty, '/system/reset', self._on_system_reset, 10)
+        self._amr_cancel_pub = self.create_publisher(
+            Empty, '/amr/cancel', 10)
+
+        self.declare_parameter('work_station', 'station_1')
         self.declare_parameter('amr_move_timeout_sec', 120.0)
         self.declare_parameter('auto_start', False)
         self._work_station = self.get_parameter('work_station').value
@@ -94,9 +109,14 @@ class BehaviorNode(Node):
         self.state = ProcessState.IDLE
         self.is_waiting_action = False
         self.next_state_on_success = ProcessState.IDLE
+        self._active_goal_handle = None
+        self._goal_generation = 0
+        self._emergency_stopped = False
+        self._resume_state = None
 
         # 메인 FSM 루프 실행 (10Hz)
         self.create_timer(0.1, self.fsm_loop)
+        self.create_timer(0.2, self._publish_state)
 
         # standalone 점검에서만 사용하는 선택적 자동 시작.
         self.start_timer = self.create_timer(3.0, self.auto_start_trigger)
@@ -114,6 +134,10 @@ class BehaviorNode(Node):
 
     def _on_fleet_job(self, msg: FleetJob):
         """Fleet 작업 하나를 받아 해당 station의 전체 조립 FSM을 시작한다."""
+        if self._emergency_stopped:
+            self._publish_fleet_report(
+                msg, False, "비상정지 상태이므로 작업을 시작할 수 없습니다")
+            return
         if self.state != ProcessState.IDLE or self._active_job is not None:
             self.get_logger().warn(
                 f"작업 수행 중이므로 /fleet/job 무시: {msg.job_id}")
@@ -160,6 +184,8 @@ class BehaviorNode(Node):
 
     def fsm_loop(self):
         """FSM 상태 관리 루프"""
+        if self._emergency_stopped:
+            return
         if self.is_waiting_action or self.state == ProcessState.IDLE:
             return
 
@@ -368,16 +394,24 @@ class BehaviorNode(Node):
 
         self.is_waiting_action = True
         self.next_state_on_success = next_state
+        self._goal_generation += 1
+        generation = self._goal_generation
 
         send_goal_future = self._action_client.send_goal_async(
             goal_msg,
             feedback_callback=self.feedback_callback
         )
-        send_goal_future.add_done_callback(self.goal_response_callback)
+        send_goal_future.add_done_callback(
+            lambda future: self.goal_response_callback(future, generation))
 
-    def goal_response_callback(self, future):
+    def goal_response_callback(self, future, generation):
         """Goal 수락 여부 확인"""
         goal_handle = future.result()
+        if generation != self._goal_generation or self._emergency_stopped:
+            if goal_handle.accepted:
+                goal_handle.cancel_goal_async()
+            return
+        self._active_goal_handle = goal_handle
         if not goal_handle.accepted:
             self.get_logger().error(" -> Arm Node가 Goal 수락을 거부했습니다.")
             self.is_waiting_action = False
@@ -386,7 +420,8 @@ class BehaviorNode(Node):
 
         self.get_logger().info(" -> Goal 수락됨. 하위 작업 수행 중...")
         result_future = goal_handle.get_result_async()
-        result_future.add_done_callback(self.get_result_callback)
+        result_future.add_done_callback(
+            lambda future: self.get_result_callback(future, generation))
 
     def feedback_callback(self, feedback_msg):
         """피드백 모니터링"""
@@ -396,12 +431,18 @@ class BehaviorNode(Node):
         )
         sys.stdout.flush()
 
-    def get_result_callback(self, future):
+    def get_result_callback(self, future, generation):
         """최종 결과 처리"""
+        if generation != self._goal_generation:
+            return
+        self._active_goal_handle = None
         result = future.result().result
         self.is_waiting_action = False
 
         print()
+
+        if self._emergency_stopped:
+            return
 
         if result.success:
             self.get_logger().info(f" -> [{self.state.name}] 작업 성공 완료!")
@@ -411,6 +452,79 @@ class BehaviorNode(Node):
             self.get_logger().error(f"    [Error Code] : {result.error_code}")
             self.get_logger().error(f"    [Error Message]: {result.message}")
             self.state = ProcessState.FAILURE
+
+    def _publish_state(self):
+        """실제 FSM 상태를 HMI 등 외부 운영 도구에 주기적으로 공개한다."""
+        msg = String()
+        msg.data = self.state.name
+        self._state_pub.publish(msg)
+
+    def _on_emergency_stop(self, msg: Bool):
+        """비상정지를 래치하고 해제 시 재개할 FSM 체크포인트를 보존한다."""
+        requested = bool(msg.data)
+        if requested == self._emergency_stopped:
+            return
+
+        self._emergency_stopped = requested
+        if requested:
+            interrupted_state = self.state.name
+            self._resume_state = (
+                self.state
+                if self.state not in (
+                    ProcessState.IDLE,
+                    ProcessState.SUCCESS,
+                    ProcessState.FAILURE,
+                    ProcessState.EMERGENCY_STOP,
+                )
+                else None
+            )
+            self._goal_generation += 1
+            self.state = ProcessState.EMERGENCY_STOP
+            self._amr_goal_sent = False
+            self._waiting_amr_station = None
+            self._amr_cancel_pub.publish(Empty())
+            if self._active_goal_handle is not None:
+                self._active_goal_handle.cancel_goal_async()
+                self._active_goal_handle = None
+            self.is_waiting_action = False
+            self.next_state_on_success = ProcessState.IDLE
+            self.get_logger().error(
+                f"비상정지 활성화: {interrupted_state} 체크포인트 보존")
+        else:
+            self._amr_goal_sent = False
+            self._waiting_amr_station = None
+            self.is_waiting_action = False
+            self._active_goal_handle = None
+            if self._resume_state is not None:
+                resume_state = self._resume_state
+                self._resume_state = None
+                self.state = resume_state
+                self.get_logger().warn(
+                    f"비상정지 해제: {resume_state.name} 체크포인트부터 재개")
+            else:
+                self.state = ProcessState.IDLE
+                self.get_logger().warn(
+                    "비상정지 해제: 보존된 작업 없이 IDLE 복귀")
+        self._publish_state()
+
+    def _on_system_reset(self, _msg: Empty):
+        """HMI 시험용 완전 초기화: 현재 작업을 폐기하고 IDLE로 복귀한다."""
+        self._goal_generation += 1
+        self._amr_cancel_pub.publish(Empty())
+        if self._active_goal_handle is not None:
+            self._active_goal_handle.cancel_goal_async()
+        self._active_goal_handle = None
+        self._finish_active_job(False, "HMI 시스템 완전 초기화")
+        self._emergency_stopped = False
+        self._resume_state = None
+        self._amr_goal_sent = False
+        self._waiting_amr_station = None
+        self.is_waiting_action = False
+        self.next_state_on_success = ProcessState.IDLE
+        self.state = ProcessState.IDLE
+        self.get_logger().warning(
+            "HMI 완전 초기화: 진행 작업 폐기 후 FSM IDLE 복귀")
+        self._publish_state()
 
 
 def main(args=None):

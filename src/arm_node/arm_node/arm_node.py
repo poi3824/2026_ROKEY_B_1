@@ -18,11 +18,11 @@ arm_node.py - ROS 2 Arm Control Node (MultiThreaded Executor & Reentrant Group)
 import time
 import rclpy
 from rclpy.node import Node
-from rclpy.action import ActionServer
+from rclpy.action import ActionServer, CancelResponse
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from geometry_msgs.msg import PoseStamped
-from std_msgs.msg import String, Float32
+from std_msgs.msg import Bool, Empty, String, Float32
 
 # Action 및 Custom Interfaces
 from fms_interfaces.action import ExecuteArmTask
@@ -39,6 +39,8 @@ class ArmNode(Node):
 
         # Reentrant Callback Group 적용 (교착 상태 방지)
         self.cb_group = ReentrantCallbackGroup()
+        self._cancel_epoch = 0
+        self._goal_epochs = {}
 
         # 1. Action Server 생성
         self._action_server = ActionServer(
@@ -46,6 +48,7 @@ class ArmNode(Node):
             ExecuteArmTask,
             '/execute_arm_task',
             execute_callback=self.execute_callback,
+            cancel_callback=self.cancel_callback,
             callback_group=self.cb_group
         )
 
@@ -80,6 +83,14 @@ class ArmNode(Node):
         )
         self.sub_isaac_status = self.create_subscription(
             String, '/isaac_status', self._on_isaac_status, 10, callback_group=self.cb_group
+        )
+        self.sub_emergency_stop = self.create_subscription(
+            Bool, '/emergency_stop', self._on_emergency_stop, 10,
+            callback_group=self.cb_group
+        )
+        self.sub_system_reset = self.create_subscription(
+            Empty, '/system/reset', self._on_system_reset, 10,
+            callback_group=self.cb_group
         )
 
         # 내부 상태 및 저장 변수
@@ -116,11 +127,29 @@ class ArmNode(Node):
         self.isaac_status = msg.data
         self.get_logger().info(f"[Isaac Status 수신]: {self.isaac_status}")
 
+    def _on_emergency_stop(self, msg: Bool):
+        if msg.data:
+            self._cancel_epoch += 1
+            self.isaac_status = "FAILURE_EMERGENCY_STOP"
+            self.get_logger().error(
+                "비상정지 수신: 진행 중인 모든 Arm Action을 종료합니다")
+
+    def _on_system_reset(self, _msg: Empty):
+        self._cancel_epoch += 1
+        self.isaac_status = "FAILURE_SYSTEM_RESET"
+        self.get_logger().warning(
+            "완전 초기화 수신: 진행 중인 모든 Arm Action을 종료합니다")
+
+    def cancel_callback(self, _goal_handle):
+        self.get_logger().warning("Arm Action 취소 요청 승인")
+        return CancelResponse.ACCEPT
+
     # =========================================================================
     # Action Callback
     # =========================================================================
     def execute_callback(self, goal_handle):
         task_type = goal_handle.request.task_type
+        self._goal_epochs[id(goal_handle)] = self._cancel_epoch
         self.get_logger().info(f"\n================ [Action Goal Received: {task_type}] ================")
         
         feedback_msg = ExecuteArmTask.Feedback()
@@ -500,6 +529,18 @@ class ArmNode(Node):
     def wait_for_isaac_completion(self, goal_handle, feedback_msg) -> bool:
         """타임아웃 없이 Isaac Sim의 SUCCESS 또는 FAILURE 상태만 대기"""
         while rclpy.ok():
+            goal_epoch = self._goal_epochs.get(id(goal_handle), -1)
+            if (
+                goal_handle.is_cancel_requested
+                or goal_epoch != self._cancel_epoch
+            ):
+                stop_msg = String()
+                stop_msg.data = "STOP"
+                self.pub_task_command.publish(stop_msg)
+                self.get_logger().warning(
+                    "Action 취소 요청 수신: Isaac 작업 중단 명령 전송")
+                return False
+
             feedback_msg.sub_phase = self.isaac_phase
             feedback_msg.progress_pct = float(self.isaac_progress)
             goal_handle.publish_feedback(feedback_msg)

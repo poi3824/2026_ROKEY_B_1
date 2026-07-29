@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 import sys
 import math
+import json
 import cv2
 import numpy as np
 
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, QoSProfile
 from sensor_msgs.msg import Image
 from geometry_msgs.msg import PoseStamped
-from std_msgs.msg import String
+from std_msgs.msg import Bool, String
 from cv_bridge import CvBridge
 
 
@@ -32,10 +34,17 @@ class BatteryAssemblyVisionNode(Node):
         self.sub_errorfix_cmd = self.create_subscription(
             String, '/errorfix_command', self.task_command_callback, 10
         )
+        emergency_qos = QoSProfile(
+            depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        self.sub_emergency_stop = self.create_subscription(
+            Bool, '/emergency_stop', self.emergency_stop_callback,
+            emergency_qos)
 
         # Isaac Sim 목표 포즈 퍼블리셔 및 보정 완료 상태 퍼블리셔
         self.pub_target_pose = self.create_publisher(PoseStamped, '/target_pose', 10)
         self.pub_task_cmd = self.create_publisher(String, '/task_command', 10)
+        self.pub_alignment_error = self.create_publisher(
+            String, '/alignment/error', 10)
 
         # ----------------------------------------------------------------------
         # 제어 및 오차 보정 파라미터
@@ -65,6 +74,7 @@ class BatteryAssemblyVisionNode(Node):
         self.last_valid_dy_px = 0       # hy - by (양수: 구멍이 아래쪽, 음수: 구멍이 위쪽)
         self.last_valid_dtheta = 0.0
         self.has_valid_tracking = False
+        self.emergency_stopped = False
 
         # 연속 30 Step 유지 카운터
         self.hold_count = 0
@@ -78,6 +88,10 @@ class BatteryAssemblyVisionNode(Node):
         """외부(Behavior / Isaac Sim)로부터 오차 보정 시작 명령 수신"""
         cmd = msg.data
         if cmd in ["START_ERRORFIX_CORRECTION", "START_VISION_CORRECTION", "MOVE_BATTERY_CENTER_SUCCESS"]:
+            if self.emergency_stopped:
+                self.get_logger().warn(
+                    "비상정지 상태이므로 오차 보정 시작 명령을 무시합니다")
+                return
             self.get_logger().info(f"\n>>> [Vision Correction] 오차 보정 시작 신호 수신 ({cmd})!")
             self.is_active = True
             self.hold_count = 0  # 새로 시작 시 연속 카운터 초기화
@@ -93,6 +107,28 @@ class BatteryAssemblyVisionNode(Node):
             self.hold_count = 0
             self._roi_logged = False
             self.get_logger().info(">>> [Vision Node] 카메라 이동 감지 -> 고정 볼트 위치 재탐색 시작")
+
+    def emergency_stop_callback(self, msg: Bool):
+        self.emergency_stopped = bool(msg.data)
+        if self.emergency_stopped:
+            self.is_active = False
+            self.hold_count = 0
+            self.get_logger().error("비상정지 활성화: 오차 보정을 중단합니다")
+        self.publish_alignment_error()
+
+    def publish_alignment_error(self):
+        """최근 유효 정렬 오차와 추적 상태를 운영 HMI에 공개한다."""
+        msg = String()
+        msg.data = json.dumps({
+            "dx_px": int(self.last_valid_dx_px),
+            "dy_px": int(self.last_valid_dy_px),
+            "dtheta_deg": float(self.last_valid_dtheta),
+            "valid": bool(self.has_valid_tracking),
+            "active": bool(self.is_active),
+            "hold_count": int(self.hold_count),
+            "hold_target": 30,
+        })
+        self.pub_alignment_error.publish(msg)
 
     def depth_callback(self, msg):
         try:
@@ -186,6 +222,9 @@ class BatteryAssemblyVisionNode(Node):
 
     def control_loop(self):
         """픽셀 좌표(hx, hy)와 볼트 좌표(bx, by)가 완벽히 일치할 때까지 보정하는 제어 루프"""
+        self.publish_alignment_error()
+        if self.emergency_stopped:
+            return
         if not self.is_active or not self.bolts_detected or not self.has_valid_tracking:
             return
 
