@@ -3,10 +3,8 @@
 sensor_msgs/CameraInfo에서 얻은 실제 intrinsic(K, D)을 사용한다
 (perception 브랜치 프로토타입의 D455 스펙 추정치 대신).
 
-transform_pixel_to_world()는 perception_node.py(실시간 노드)와
-scripts/inspect_bag_frame.py(bag 프레임 1개만 오프라인으로 확인하는 디버그 도구)
-양쪽에서 공유한다. tf_buffer를 실시간 TransformListener로 채우든, bag에서 읽은
-tf를 직접 set_transform으로 채우든 동일하게 동작한다.
+transform_pixel_to_world()는 perception_node.py의 실시간 검출 결과를 world 좌표로
+변환할 때 사용한다.
 
 tf 조회는 이미지 header.stamp가 아니라 "가장 최근에 들어온 tf"(rclpy.time.Time(),
 즉 시각 0 = latest)를 사용한다. rosbag2_busbar 등 이 프로젝트의 시뮬레이션 녹화본은

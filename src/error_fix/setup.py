@@ -17,11 +17,6 @@ setup(
     maintainer_email='liebeujs@gmail.com',
     description='TODO: Package description',
     license='MIT',
-    extras_require={
-        'test': [
-            'pytest',
-        ],
-    },
     entry_points={
         'console_scripts': [
             'error_fix_node = error_fix.error_fix:main'

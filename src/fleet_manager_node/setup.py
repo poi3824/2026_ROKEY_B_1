@@ -17,11 +17,6 @@ setup(
     maintainer_email='poi3824@gmail.com',
     description='FMS · 전체 작업을 보고 다음 job을 결정하는 관리자 노드',
     license='Apache-2.0',
-    extras_require={
-        'test': [
-            'pytest',
-        ],
-    },
     entry_points={
         'console_scripts': [
             'fleet_manager_node = fleet_manager_node.fleet_manager_node:main'

@@ -20,11 +20,6 @@ setup(
     maintainer_email='poi3824@gmail.com',
     description='FMS 연동 ROS2 시스템 아키텍처 전체 노드 launch 패키지',
     license='Apache-2.0',
-    extras_require={
-        'test': [
-            'pytest',
-        ],
-    },
     entry_points={
         'console_scripts': [
         ],

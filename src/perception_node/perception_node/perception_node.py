@@ -32,9 +32,7 @@ SMOOTHING_WINDOW_SEC(기본 2초) 안의 표본을 모아 평균/표준편차를
 터미널에 raw/평균/표준편차/표본수를 로그로 남긴다(표준편차가 크면 warn). 캐시·토픽·
 서비스 응답은 전부 이 평균값을 쓴다 — 단일 tick 노이즈에 팔이 흔들리는 것을 줄이기 위함.
 'bolt'는 위 이유로 개별 라벨 캐시(get_grasp_pose)에는 넣지 않고, 대신 2개를 쌍으로
-추적하는 get_bolt_pair 전용 경로로만 나간다. StudPose(fms_interfaces/msg)는 주석상
-YOLO가 아닌 Hough Circle 기반으로 설계돼 있어 이 노드의 YOLO 파이프라인과는 별개
-구현이 필요 — 여기서는 다루지 않는다.
+추적하는 get_bolt_pair 전용 경로로만 나간다.
 
 카메라 프레임 -> world_frame 변환은 tf2 lookupTransform으로 조회한다. 이 노드는
 카메라가 어디에 있는지 알지 못하며, world_frame -> 카메라 frame_id로의 tf가 어디선가

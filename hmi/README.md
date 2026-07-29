@@ -20,7 +20,7 @@ hmi/
 ### 0) Isaac Sim + 실제 조립 노드
 
 기본 월드는 최신 통합 작업 월드인
-`/home/rokey/EV_combine/src/Collected_Busbar/Busbar.usd`다.
+`isaacpjt/M0609/Imported_Collected_Busbar_20260728/Collected_Busbar/Busbar.usd`다.
 
 ```bash
 cd /home/rokey/EV_combine

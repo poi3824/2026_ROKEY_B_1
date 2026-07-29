@@ -17,11 +17,6 @@ setup(
     maintainer_email='poi3824@gmail.com',
     description='목표 스테이션으로 이동 · 상태 보고 노드',
     license='Apache-2.0',
-    extras_require={
-        'test': [
-            'pytest',
-        ],
-    },
     entry_points={
         'console_scripts': [
             'amr_node = amr_node.amr_node:main'

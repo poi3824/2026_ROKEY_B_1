@@ -300,11 +300,10 @@ HMI 표시용 주요 Phase 예시는 다음과 같습니다.
 ├── README.md
 ├── isaacpjt/M0609/
 │   ├── execute_isaac.py              # HMI 상태 연동 기준 전체 실행 파일
-│   ├── assembly_nut_fraction1.py     # 너트 체결 단독/개발 검증 스크립트
+│   ├── Imported_Collected_Busbar_20260728/
+│   │   └── Collected_Busbar/         # 현재 실행용 USD 월드와 종속 에셋
 │   ├── doosan-robot2/urdf/
 │   │   └── m0609_isaac_sim.urdf
-│   ├── onrobot_rg2/urdf/
-│   │   └── onrobot_rg2.urdf
 │   └── rmpflow/
 │       ├── m0609_description.yaml
 │       ├── m0609_rmpflow_common.yaml
@@ -437,19 +436,21 @@ source <REPOSITORY_PATH>/install/setup.bash
 
 ### 1) Set the USD Scene Path
 
-`execute_isaac.py`의 `USD_PATH`는 현재 개발 PC의 절대경로로 되어 있습니다.
+`execute_isaac.py`는 저장소 내부의 통합 월드를 기본으로 사용합니다.
 
 ```python
-USD_PATH = "/home/rokey/junhyeok_version/isaacpjt/M0609/Collected_Busbar_AMR/Busbar.usd"
+DEFAULT_USD_PATH = (
+    _THIS_DIR / "Imported_Collected_Busbar_20260728"
+    / "Collected_Busbar" / "Busbar.usd"
+)
 ```
 
-본인의 실제 Scene 경로로 변경하십시오.
+다른 Scene을 임시로 사용할 때만 환경변수로 지정하십시오.
 
-```python
-USD_PATH = "/absolute/path/to/Busbar.usd"
+```bash
+ISAAC_WORLD_PATH=/absolute/path/to/Busbar.usd \
+  isaac_python isaacpjt/M0609/execute_isaac.py
 ```
-
-> `Busbar.usd` 전체 Scene은 현재 저장소에 포함되어 있지 않습니다.
 
 ### 2) Restore M0609 Meshes and Fix URDF Paths
 

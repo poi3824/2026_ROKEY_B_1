@@ -17,11 +17,6 @@ setup(
     maintainer_email='poi3824@gmail.com',
     description='job 하나를 받아 한 스테이션의 조립을 끝까지 지휘하는 노드',
     license='Apache-2.0',
-    extras_require={
-        'test': [
-            'pytest',
-        ],
-    },
     entry_points={
         'console_scripts': [
             'behavior_node = behavior_node.behavior_node:main'

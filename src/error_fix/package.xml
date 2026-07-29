@@ -3,18 +3,15 @@
 <package format="3">
   <name>error_fix</name>
   <version>0.0.0</version>
-  <description>TODO: Package description</description>
+  <description>카메라 영상 기반 버스바 정밀 정렬 오차 보정 노드</description>
   <maintainer email="liebeujs@gmail.com">rokey</maintainer>
   <license>MIT</license>
 
   <depend>rclpy</depend>
-  <depend>fms_interfaces</depend>
+  <depend>sensor_msgs</depend>
+  <depend>geometry_msgs</depend>
   <depend>std_msgs</depend>
-
-  <test_depend>ament_copyright</test_depend>
-  <test_depend>ament_flake8</test_depend>
-  <test_depend>ament_pep257</test_depend>
-  <test_depend>python3-pytest</test_depend>
+  <depend>cv_bridge</depend>
 
   <export>
     <build_type>ament_python</build_type>
