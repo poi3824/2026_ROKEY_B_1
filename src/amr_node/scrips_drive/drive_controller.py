@@ -84,6 +84,7 @@ class ControllerConfig:
     yaw_capture_tolerance: float = 0.02
     final_approach_distance: float = 0.08
     turn_in_place_threshold: float = math.radians(5.0)
+    turn_in_place_release_threshold: float = math.radians(3.0)
     max_linear: float = 0.35
     max_angular: float = 0.75
     min_angular: float = 0.30
@@ -140,6 +141,16 @@ class GoToPoseController:
             raise ValueError(
                 'yaw tolerances must satisfy 0 <= capture <= arrival'
             )
+        if not (
+            math.isfinite(self.config.turn_in_place_release_threshold)
+            and math.isfinite(self.config.turn_in_place_threshold)
+            and 0.0 <= self.config.turn_in_place_release_threshold
+            < self.config.turn_in_place_threshold
+        ):
+            raise ValueError(
+                'turn thresholds must satisfy '
+                '0 <= release < turn-in-place'
+            )
         self._goal: Optional[Goal2D] = None
         self._last_linear = 0.0
         self._last_angular = 0.0
@@ -150,6 +161,7 @@ class GoToPoseController:
         self._position_captured = False
         self._position_trim_active = False
         self._yaw_captured = False
+        self._turn_to_path_active = False
 
     @property
     def goal(self) -> Optional[Goal2D]:
@@ -216,6 +228,7 @@ class GoToPoseController:
         self._position_captured = False
         self._position_trim_active = False
         self._yaw_captured = not self._goal.yaw_required
+        self._turn_to_path_active = False
         if current_pose is not None:
             self._select_direction(current_pose)
             self._position_captured = (
@@ -243,6 +256,7 @@ class GoToPoseController:
         self._position_captured = False
         self._position_trim_active = False
         self._yaw_captured = False
+        self._turn_to_path_active = False
 
     def clear_goal(self) -> None:
         """Clear the active goal and stop the controller."""
@@ -346,6 +360,8 @@ class GoToPoseController:
             )
         ):
             self._position_captured = True
+        if self._position_captured:
+            self._turn_to_path_active = False
 
         # A minimum turn command near the 0.03rad arrival boundary can move
         # the chassis just inside the tolerance, then a small PhysX drift can
@@ -475,6 +491,7 @@ class GoToPoseController:
             self._position_captured = False
             self._position_trim_active = False
             self._yaw_captured = not goal.yaw_required
+            self._turn_to_path_active = False
 
         if not self._position_captured:
             self._position_trim_active = False
@@ -496,7 +513,20 @@ class GoToPoseController:
                 self.config.max_angular,
             )
 
-            if abs(heading_error) > self.config.turn_in_place_threshold:
+            # Enter turning at 5 degrees, but do not resume translation until
+            # 3 degrees. This prevents pose jitter at the old single boundary
+            # from repeatedly zeroing the linear acceleration history.
+            abs_heading_error = abs(heading_error)
+            if self._turn_to_path_active:
+                if (
+                    abs_heading_error
+                    <= self.config.turn_in_place_release_threshold
+                ):
+                    self._turn_to_path_active = False
+            elif abs_heading_error > self.config.turn_in_place_threshold:
+                self._turn_to_path_active = True
+
+            if self._turn_to_path_active:
                 phase = 'turn_to_path'
                 raw_linear = 0.0
                 if abs(raw_angular) < self.config.min_angular:
@@ -536,6 +566,7 @@ class GoToPoseController:
         self._last_linear = 0.0
         self._last_angular = 0.0
         self._position_trim_active = False
+        self._turn_to_path_active = False
         # Capture/release hysteresis keeps the controller from chattering while
         # it corrects final yaw, but it must never relax the public ARRIVED
         # contract.  Count a stable tick only while the *measured* pose remains

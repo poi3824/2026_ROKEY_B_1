@@ -43,6 +43,10 @@ def test_launch_wires_three_isolated_perception_instances(monkeypatch):
             'launch.actions',
             DeclareLaunchArgument=_Action,
         ),
+        'launch.conditions': _module(
+            'launch.conditions',
+            IfCondition=_Substitution,
+        ),
         'launch.substitutions': _module(
             'launch.substitutions',
             LaunchConfiguration=_Substitution,
@@ -76,6 +80,12 @@ def test_launch_wires_three_isolated_perception_instances(monkeypatch):
     spec.loader.exec_module(launch_module)
 
     description = launch_module.generate_launch_description()
+    fleet_nodes = [
+        entity
+        for entity in description.entities
+        if isinstance(entity, _Node)
+        and entity.kwargs['package'] == 'fleet_manager_node'
+    ]
     perception_nodes = [
         entity
         for entity in description.entities
@@ -88,6 +98,11 @@ def test_launch_wires_three_isolated_perception_instances(monkeypatch):
         'busbar_perception_node',
         'bolt_perception_node',
     ]
+    assert len(fleet_nodes) == 1
+    assert isinstance(fleet_nodes[0].kwargs['condition'], _Substitution)
+    assert fleet_nodes[0].kwargs['condition'].args[0].args == (
+        'start_fleet_manager',
+    )
     for node, config in zip(
         perception_nodes,
         launch_module.CAMERA_CONFIGS,
@@ -99,7 +114,7 @@ def test_launch_wires_three_isolated_perception_instances(monkeypatch):
         assert parameters['camera_frame_override'] == config.optical_frame
         assert isinstance(parameters['model_path'], _Substitution)
         assert parameters['model_path'].args == ('perception_model_path',)
-        assert parameters['max_rgb_depth_skew_sec'] == 0.1
+        assert parameters['max_rgb_depth_skew_sec'] == 0.2
         assert parameters['max_input_receipt_age_sec'] == 1.0
         assert parameters['require_unique_camera_source'] is True
         assert parameters['required_target_frames'] == 3

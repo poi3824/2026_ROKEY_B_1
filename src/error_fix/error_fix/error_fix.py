@@ -25,6 +25,53 @@ from error_fix.alignment_policy import (
 )
 
 
+def select_closest_hole_candidate(candidates, reference):
+    """Return the valid hole nearest to the latched optical reference."""
+    try:
+        reference_x, reference_y = (
+            float(reference[0]),
+            float(reference[1]),
+        )
+    except (IndexError, TypeError, ValueError):
+        return None
+    if not math.isfinite(reference_x) or not math.isfinite(reference_y):
+        return None
+
+    valid_candidates = []
+    for candidate in candidates:
+        try:
+            candidate_x, candidate_y, candidate_depth = (
+                float(candidate[0]),
+                float(candidate[1]),
+                float(candidate[2]),
+            )
+        except (IndexError, TypeError, ValueError):
+            continue
+        if (
+            not math.isfinite(candidate_x)
+            or not math.isfinite(candidate_y)
+            or not math.isfinite(candidate_depth)
+            or candidate_depth <= 0.0
+        ):
+            continue
+        valid_candidates.append(
+            (int(round(candidate_x)), int(round(candidate_y)), candidate_depth)
+        )
+
+    if not valid_candidates:
+        return None
+    return min(
+        valid_candidates,
+        key=lambda item: (
+            (item[0] - reference_x) ** 2
+            + (item[1] - reference_y) ** 2,
+            item[0],
+            item[1],
+            item[2],
+        ),
+    )
+
+
 class BatteryAssemblyVisionNode(Node):
     def __init__(self):
         super().__init__('battery_assembly_vision_node')
@@ -36,7 +83,13 @@ class BatteryAssemblyVisionNode(Node):
         # ----------------------------------------------------------------------
         image_qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
-            depth=1,
+            # RGB and depth arrive independently.  A one-message DDS queue
+            # drops the only matching counterpart while the other callback is
+            # doing Hough/GUI work, which turns otherwise matched source
+            # stamps into repeated >100 ms skew rejections.  Keep the same
+            # small bounded backlog as the synchronizer; source freshness is
+            # still enforced below at <=1 s.
+            depth=10,
             reliability=ReliabilityPolicy.BEST_EFFORT,
             durability=DurabilityPolicy.VOLATILE,
         )
@@ -103,8 +156,9 @@ class BatteryAssemblyVisionNode(Node):
             decision_frames=self.ALIGNMENT_DECISION_FRAMES,
         )
         self.frame_pair_sync = LatestFramePairSynchronizer(
-            max_skew_sec=0.1,
+            max_skew_sec=0.2,
             max_receipt_age_sec=1.0,
+            history_size=10,
         )
         self.hold_count = self.alignment_gate.hold_count
 
@@ -229,7 +283,6 @@ class BatteryAssemblyVisionNode(Node):
             depth_stamp_ns,
             depth_receipt_ns,
         )
-        self._try_process_cached_pair()
 
     def rgb_callback(self, msg):
         rgb_stamp_ns = self._stamp_ns(msg)
@@ -249,7 +302,6 @@ class BatteryAssemblyVisionNode(Node):
             rgb_stamp_ns,
             rgb_receipt_ns,
         )
-        self._try_process_cached_pair()
         if not self.is_active:
             display_img = frame.copy()
             cv2.putText(
@@ -484,7 +536,15 @@ class BatteryAssemblyVisionNode(Node):
             f"X={bolt_x}, Y={bolt_y}")
 
     def control_loop(self):
-        """Fallback consumer for a pending alignment decision."""
+        """Process one strict pair outside the image-subscription callbacks.
+
+        The callbacks only convert/cache frames.  This keeps their QoS queues
+        draining while contour/Hough work runs here, so a valid RGB/depth pair
+        is not lost merely because the other callback was delayed.  The
+        synchronizer still rejects source skew over 0.2 s, stale receipt over
+        1 s, and any retrograde source stamp.
+        """
+        self._try_process_cached_pair()
         self._consume_alignment_decision()
 
     def _consume_alignment_decision(self):
@@ -495,6 +555,13 @@ class BatteryAssemblyVisionNode(Node):
         decision = self.alignment_gate.consume()
         self.hold_count = self.alignment_gate.hold_count
         if decision is None:
+            return
+        if decision.deferred:
+            self.get_logger().info(
+                "FINE_ALIGNMENT near-boundary 3-frame jitter 보류; "
+                "같은 방향의 새 3-frame 확인 대기",
+                throttle_duration_sec=1.0,
+            )
             return
         dtheta = decision.dtheta_deg
 
@@ -795,16 +862,39 @@ class BatteryAssemblyVisionNode(Node):
 
         detected_holes = []
         if circles is not None:
-            circles = np.uint16(np.around(circles))
-            for i in circles[0, :]:
-                cx, cy = int(i[0]), int(i[1])
-                if filtered_mask[cy, cx] > 0:
-                    val = float(depth_img_resized[cy, cx])
-                    detected_holes.append((cx, cy, val))
+            for circle in np.asarray(circles).reshape(-1, 3):
+                if not np.all(np.isfinite(circle)):
+                    continue
+                cx, cy = (
+                    int(round(float(circle[0]))),
+                    int(round(float(circle[1]))),
+                )
+                if not (0 <= cx < w and 0 <= cy < h):
+                    continue
+                if filtered_mask[cy, cx] == 0:
+                    continue
+                val = float(depth_img_resized[cy, cx])
+                if not math.isfinite(val) or val <= 0.0:
+                    continue
+                detected_holes.append((cx, cy, val))
 
-        detected_holes.sort(key=lambda item: item[0])
-        self.busbar_hole_coords = [(h[0], h[1]) for h in detected_holes]
-        self.busbar_hole_depths = [h[2] for h in detected_holes]
+        reference = (w // 2, h // 2)
+        if self.fixed_bolt_coords:
+            fixed_x, fixed_y = self.fixed_bolt_coords[0]
+            if math.isfinite(fixed_x) and math.isfinite(fixed_y):
+                reference = (fixed_x, fixed_y)
+        selected_hole = select_closest_hole_candidate(
+            detected_holes,
+            reference,
+        )
+        if selected_hole is None:
+            self.busbar_hole_coords = []
+            self.busbar_hole_depths = []
+        else:
+            self.busbar_hole_coords = [
+                (selected_hole[0], selected_hole[1])
+            ]
+            self.busbar_hole_depths = [selected_hole[2]]
 
     def draw_extended_line(self, img, line_data, color, thickness=2, label=""):
         if line_data is None:

@@ -21,7 +21,12 @@ class CameraPerceptionConfig:
     use_bolt_roi: bool = False
     prefer_busbar_depth: bool = False
     inference_image_size: int | None = None
-    bolt_roi_bounds: tuple[int, int, int, int] = (150, 490, 180, 450)
+    bolt_roi_bounds: tuple[int, int, int, int] = (150, 560, 180, 450)
+    # The wrist camera is only needed after an explicit reset/service request
+    # in the current fixed-camera-first flow.  Keep its detector dormant until
+    # then so its broad scene view cannot consume GPU or churn generic logs
+    # during a busbar latch/placement.
+    on_demand_inference: bool = False
 
 
 CAMERA_CONFIGS = (
@@ -33,6 +38,7 @@ CAMERA_CONFIGS = (
         camera_info_topic='/camera_info',
         optical_frame='camera_color_optical_frame',
         keep_global_outputs=('/vision/nut_pose',),
+        on_demand_inference=True,
     ),
     CameraPerceptionConfig(
         namespace='busbar_cam',
@@ -53,10 +59,11 @@ CAMERA_CONFIGS = (
         optical_frame='bolt_cam_optical_frame',
         use_bolt_roi=True,
         inference_image_size=640,
-        # Keep a central ROI while including station bolt_1 at x~=531 when
-        # Camera_bolt is centered over bolt_2.  The lower neighbouring pack at
-        # y~=512 remains excluded.
-        bolt_roi_bounds=(80, 560, 150, 450),
+        # Live v3 inference with Camera_bolt centered on the active bolt_2
+        # places its same-pack endpoints near (531,199) and (320,321).
+        # The calibrated ROI keeps both while excluding the next pack near
+        # y=521 and far-right packs near x=629.
+        bolt_roi_bounds=(150, 560, 180, 450),
     ),
 )
 

@@ -49,13 +49,18 @@ def test_error_fix_requires_synchronized_post_move_frames():
     ).read_text(encoding='utf-8')
 
     assert 'LatestFramePairSynchronizer' in source
-    assert 'max_skew_sec=0.1' in source
+    assert 'max_skew_sec=0.2' in source
     assert 'max_receipt_age_sec=1.0' in source
     assert 'BOLT_REFERENCE_FRAMES = 3' in source
-    assert '_try_process_cached_pair' in _method_calls(
+    # Subscription callbacks only cache frames so they cannot starve their
+    # counterpart while doing image work.  The control timer consumes the
+    # same strict pair gate.
+    assert '_try_process_cached_pair' not in _method_calls(
         source, 'rgb_callback')
-    assert '_try_process_cached_pair' in _method_calls(
+    assert '_try_process_cached_pair' not in _method_calls(
         source, 'depth_callback')
+    assert '_try_process_cached_pair' in _method_calls(
+        source, 'control_loop')
     assert '_update_bolt_reference' in _method_calls(
         source, '_process_accepted_pair')
     assert 'frame.shape[1] // 2' in source
@@ -73,23 +78,47 @@ def test_error_fix_requires_synchronized_post_move_frames():
     assert '_reset_alignment_tracking' not in pair_rejection
 
 
-def test_both_callbacks_cache_converted_frames_before_common_pair_retry():
+def test_callbacks_only_cache_frames_and_timer_retries_the_common_pair():
     source = (
         Path(__file__).parents[1] / 'error_fix' / 'error_fix.py'
     ).read_text(encoding='utf-8')
 
     rgb_calls = _method_calls(source, 'rgb_callback')
     depth_calls = _method_calls(source, 'depth_callback')
-    common_calls = _method_calls(source, '_try_process_cached_pair')
+    timer_calls = _method_calls(source, 'control_loop')
 
     assert 'imgmsg_to_cv2' in rgb_calls
     assert 'cache_rgb' in rgb_calls
-    assert '_try_process_cached_pair' in rgb_calls
+    assert '_try_process_cached_pair' not in rgb_calls
     assert 'imgmsg_to_cv2' in depth_calls
     assert 'cache_depth' in depth_calls
-    assert '_try_process_cached_pair' in depth_calls
+    assert '_try_process_cached_pair' not in depth_calls
+    assert '_try_process_cached_pair' in timer_calls
+
+    common_calls = _method_calls(source, '_try_process_cached_pair')
     assert 'try_accept' in common_calls
     assert '_process_accepted_pair' in common_calls
+
+
+def test_error_fix_uses_matching_bounded_qos_and_sync_history():
+    source = (
+        Path(__file__).parents[1] / 'error_fix' / 'error_fix.py'
+    ).read_text(encoding='utf-8')
+
+    qos_source = source[
+        source.index('image_qos = QoSProfile('):
+        source.index('self.rgb_sub =', source.index('image_qos = QoSProfile('))
+    ]
+    sync_source = source[
+        source.index('self.frame_pair_sync = LatestFramePairSynchronizer('):
+        source.index('self.hold_count =', source.index(
+            'self.frame_pair_sync = LatestFramePairSynchronizer('))
+    ]
+
+    assert 'depth=10' in qos_source
+    assert 'max_skew_sec=0.2' in sync_source
+    assert 'max_receipt_age_sec=1.0' in sync_source
+    assert 'history_size=10' in sync_source
 
 
 def test_accepted_frame_path_consumes_third_frame_decision_without_timer():
@@ -113,8 +142,9 @@ def test_accepted_frame_path_consumes_third_frame_decision_without_timer():
     ]
 
     # FineAlignmentGate makes its decision on submit of the third accepted
-    # observation. Consume it in this same callback so an always-ready image
-    # subscription cannot starve progress in a SingleThreadedExecutor.
+    # observation. Consume it in the accepted-pair path; the accepted-pair
+    # path itself now runs from the control timer so image callbacks stay
+    # short enough to preserve matching RGB/depth frames.
     assert process_source.index('self.alignment_gate.submit(') < (
         process_source.index('self._consume_alignment_decision()')
     )

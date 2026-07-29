@@ -6,9 +6,10 @@ Run the ROS 2 arm action server with camera-specific perception.
 - 타임아웃 없이 Isaac Sim 및 비전 서비스 응답을 무제한 대기
 - [지원 Task]
   1. SCAN_BATTERY        : 배터리 스캔 위치로 이동 후 Perception 노드로부터 두 볼트의 중앙 좌표 수신 및 저장
-  2. SCAN_BUSBAR         : 고정캠 버스바 좌표를 latch하고 손목캠 새 표본 2개로 동일 대상 확인
-  3. PICK_BUSBAR         : SCAN_BUSBAR에서 검증한 고정캠 snapshot만 사용해 파지 명령 중계
-  4. MOVE_BATTERY_CENTER : 스캔 시 저장한 배터리 중점 좌표를 Isaac Sim으로 퍼블리시 및 이동 명령 중계
+  2. LATCH_BUSBAR        : 고정캠 버스바 좌표만 latch하고 손목 스캔 없이 완료
+     SCAN_BUSBAR         : 명시적 legacy용 고정캠 + 손목캠 동일 대상 확인
+  3. PICK_BUSBAR         : latch된 고정캠 snapshot만 사용해 파지 명령 중계
+  4. MOVE_BATTERY_CENTER : Isaac Sim이 현재 station의 live bolt prim 중점을 읽어 이동하도록 명령 중계
   5. FINE_ALIGNMENT       : Isaac Sim 및 비전 노드의 정밀 1픽셀 오차 보정 명령 중계
   6. ASSEMBLE_BUSBAR      : Isaac Sim으로 버스바 하강 체결 및 그리퍼 해제 명령 중계
   7. SCAN_NUT1/SCAN_NUT2       : 너트 스캔 위치 이동 후 Perception 노드로부터 너트 좌표 수신 및 저장
@@ -31,6 +32,10 @@ from std_msgs.msg import Empty, Float32, String
 from fms_interfaces.action import ExecuteArmTask
 from fms_interfaces.srv import GetGraspPose, GetBoltPair
 from fms_interfaces.msg import NutPose
+
+
+class PerceptionProtocolError(RuntimeError):
+    """The connected perception server lacks the reset-generation contract."""
 
 
 class ArmNode(Node):
@@ -91,11 +96,21 @@ class ArmNode(Node):
         self.pub_bolt_reset = self.create_publisher(
             Empty, '/bolt_cam/perception/reset_cache', 10
         )
+        # Empty reset ACKs are kept for wire compatibility/diagnostics, but
+        # cannot identify which Empty request they acknowledge. Causal reset
+        # completion is verified below through the perception service's
+        # generation metadata instead.
         self._perception_reset_ack_counts = {
             "wrist": 0,
             "busbar_cam": 0,
             "bolt_cam": 0,
         }
+        self._required_perception_generation = {
+            "wrist": None,
+            "busbar_cam": None,
+            "bolt_cam": None,
+        }
+        self._last_perception_reset_error = None
         self.sub_wrist_reset_ack = self.create_subscription(
             Empty,
             '/wrist/perception/reset_ack',
@@ -118,7 +133,7 @@ class ArmNode(Node):
             callback_group=self.cb_group,
         )
 
-        # 3. 너트 작업용 legacy 토픽 백업 구독
+        # 3. 너트 legacy 진단 토픽 구독. SCAN_NUT 결과에는 사용하지 않는다.
         self.latest_nut_pose = None
 
         self.sub_nut_pose = self.create_subscription(
@@ -237,13 +252,43 @@ class ArmNode(Node):
 
             # 2. 이동 완료 뒤 과거 캐시를 버리고 고정 bolt camera의 새 좌표를 요청
             self.get_logger().info(" -> [SCAN_BATTERY] 배터리 스캔 위치 도착 완료. 비전 노드에 볼트 쌍 좌표 요청...")
-            self._reset_perception_cache(
-                self.pub_bolt_reset, goal_handle)
-            found, midpoint_pose, msg = (
-                self.request_bolt_pair_midpoint_async(
-                    goal_handle,
+            if not self._reset_perception_cache(
+                self.pub_bolt_reset,
+                goal_handle,
+            ):
+                result_msg.success = False
+                if goal_handle.is_cancel_requested:
+                    result_msg.error_code = "SCAN_BATTERY_CANCELED"
+                    result_msg.message = (
+                        "배터리 perception reset 대기 중 취소됐습니다."
+                    )
+                elif self._last_perception_reset_error is not None:
+                    result_msg.error_code = (
+                        "PERCEPTION_PROTOCOL_MISMATCH"
+                    )
+                    result_msg.message = self._last_perception_reset_error
+                else:
+                    result_msg.error_code = "BOLT_RESET_INTERRUPTED"
+                    result_msg.message = (
+                        "bolt camera perception reset generation 확인이 "
+                        "중단됐습니다."
+                    )
+                self._abort_or_cancel(goal_handle)
+                return result_msg
+            try:
+                found, midpoint_pose, msg = (
+                    self.request_bolt_pair_midpoint_async(
+                        goal_handle,
+                    )
                 )
-            )
+            except PerceptionProtocolError as exc:
+                result_msg.success = False
+                result_msg.error_code = "PERCEPTION_PROTOCOL_MISMATCH"
+                result_msg.message = (
+                    self._record_perception_protocol_error(exc)
+                )
+                self._abort_or_cancel(goal_handle)
+                return result_msg
 
             if found and midpoint_pose is not None:
                 self.scanned_battery_midpoint = midpoint_pose
@@ -273,10 +318,14 @@ class ArmNode(Node):
             return result_msg
 
         # ---------------------------------------------------------------------
-        # [Task 2] SCAN_BUSBAR (버스바 스캔 지점 이동 & 버스바 비전 좌표 저장)
+        # [Task 2] LATCH/SCAN_BUSBAR (고정캠 버스바 비전 좌표 저장)
         # ---------------------------------------------------------------------
-        elif task_type == "SCAN_BUSBAR":
-            self.get_logger().info(" -> [SCAN_BUSBAR] Isaac Sim으로 버스바 스캔 이동 명령 전송")
+        elif task_type in {"LATCH_BUSBAR", "SCAN_BUSBAR"}:
+            fixed_camera_only = task_type == "LATCH_BUSBAR"
+            self.get_logger().info(
+                f" -> [{task_type}] Isaac Sim으로 고정 버스바 카메라 "
+                "이동 명령 전송"
+            )
 
             # 이미 취소된 goal은 상태 변경이나 Isaac task를 시작하지 않는다.
             if goal_handle.is_cancel_requested:
@@ -328,6 +377,11 @@ class ArmNode(Node):
                 if goal_handle.is_cancel_requested:
                     result_msg.error_code = "SCAN_BUSBAR_CANCELED"
                     result_msg.message = "버스바 스캔이 취소됐습니다."
+                elif self._last_perception_reset_error is not None:
+                    result_msg.error_code = (
+                        "PERCEPTION_PROTOCOL_MISMATCH"
+                    )
+                    result_msg.message = self._last_perception_reset_error
                 else:
                     result_msg.error_code = "BUSBAR_RESET_INTERRUPTED"
                     result_msg.message = (
@@ -336,13 +390,23 @@ class ArmNode(Node):
                 self._abort_or_cancel(goal_handle)
                 return result_msg
 
-            found, fixed_pose, fixed_msg = (
-                self.request_grasp_pose_until_found(
-                    self.client_get_busbar_pose,
-                    "busbar",
-                    goal_handle,
+            try:
+                found, fixed_pose, fixed_msg = (
+                    self.request_grasp_pose_until_found(
+                        self.client_get_busbar_pose,
+                        "busbar",
+                        goal_handle,
+                    )
                 )
-            )
+            except PerceptionProtocolError as exc:
+                self._publish_cancel_arm_task()
+                result_msg.success = False
+                result_msg.error_code = "PERCEPTION_PROTOCOL_MISMATCH"
+                result_msg.message = (
+                    self._record_perception_protocol_error(exc)
+                )
+                self._abort_or_cancel(goal_handle)
+                return result_msg
             if not found or fixed_pose is None:
                 self._publish_cancel_arm_task()
                 result_msg.success = False
@@ -356,7 +420,9 @@ class ArmNode(Node):
                     self._abort_or_cancel(goal_handle)
                 return result_msg
 
-            # 3. fixed_pose를 지역 snapshot으로 보존한 뒤에만 wrist 이동을 허용한다.
+            # 3. fixed_pose를 지역 snapshot으로 보존한다. 기본 fleet 흐름의
+            # LATCH_BUSBAR는 여기서 wrist 자세/검증을 건너뛰고 pause를
+            # 완료한다. 명시적 legacy SCAN_BUSBAR만 기존 wrist 검증을 계속한다.
             if goal_handle.is_cancel_requested or self._isaac_has_failed():
                 self._publish_cancel_arm_task()
                 result_msg.success = False
@@ -369,6 +435,49 @@ class ArmNode(Node):
                         "고정 카메라 latch 뒤 Isaac failure를 수신했습니다."
                     )
                 self._abort_or_cancel(goal_handle)
+                return result_msg
+
+            if fixed_camera_only:
+                self.scanned_busbar_pose = fixed_pose
+
+                complete_msg = String()
+                complete_msg.data = "COMPLETE_BUSBAR_FIXED_SCAN"
+                self.pub_task_command.publish(complete_msg)
+
+                success = self.wait_for_isaac_completion(
+                    goal_handle,
+                    feedback_msg,
+                )
+                if not success:
+                    # wait_for_isaac_completion이 Action cancel이면 Isaac
+                    # pause 해제 명령까지 발행한다.
+                    self.scanned_busbar_pose = None
+                    result_msg.success = False
+                    if goal_handle.is_cancel_requested:
+                        result_msg.error_code = "SCAN_BUSBAR_CANCELED"
+                        result_msg.message = "버스바 latch가 취소됐습니다."
+                    else:
+                        result_msg.error_code = "SCAN_BUSBAR_FAILED"
+                        result_msg.message = (
+                            "고정 버스바 카메라 latch 완료 handshake 실패 "
+                            f"(Status: {self.isaac_status})"
+                        )
+                    self._abort_or_cancel(goal_handle)
+                    return result_msg
+
+                self.get_logger().info(
+                    " ★ [고정캠 버스바 snapshot latch 완료] "
+                    f"fixed=({fixed_pose.pose.position.x:.4f}, "
+                    f"{fixed_pose.pose.position.y:.4f}, "
+                    f"{fixed_pose.pose.position.z:.4f}); "
+                    "wrist scan 생략"
+                )
+                result_msg.success = True
+                result_msg.message = (
+                    "고정캠 버스바 snapshot latch 성공; "
+                    f"손목 스캔 생략 ({fixed_msg})"
+                )
+                goal_handle.succeed()
                 return result_msg
 
             continue_msg = String()
@@ -402,6 +511,11 @@ class ArmNode(Node):
                 if goal_handle.is_cancel_requested:
                     result_msg.error_code = "SCAN_BUSBAR_CANCELED"
                     result_msg.message = "버스바 스캔이 취소됐습니다."
+                elif self._last_perception_reset_error is not None:
+                    result_msg.error_code = (
+                        "PERCEPTION_PROTOCOL_MISMATCH"
+                    )
+                    result_msg.message = self._last_perception_reset_error
                 else:
                     result_msg.error_code = "WRIST_RESET_INTERRUPTED"
                     result_msg.message = (
@@ -410,12 +524,21 @@ class ArmNode(Node):
                 self._abort_or_cancel(goal_handle)
                 return result_msg
 
-            confirmed, wrist_pose, wrist_msg = (
-                self.wait_for_wrist_busbar_confirmation(
-                    fixed_pose,
-                    goal_handle,
+            try:
+                confirmed, wrist_pose, wrist_msg = (
+                    self.wait_for_wrist_busbar_confirmation(
+                        fixed_pose,
+                        goal_handle,
+                    )
                 )
-            )
+            except PerceptionProtocolError as exc:
+                result_msg.success = False
+                result_msg.error_code = "PERCEPTION_PROTOCOL_MISMATCH"
+                result_msg.message = (
+                    self._record_perception_protocol_error(exc)
+                )
+                self._abort_or_cancel(goal_handle)
+                return result_msg
             if not confirmed or wrist_pose is None:
                 result_msg.success = False
                 if goal_handle.is_cancel_requested:
@@ -456,8 +579,9 @@ class ArmNode(Node):
                 result_msg.success = False
                 result_msg.error_code = "NO_FIXED_CAMERA_BUSBAR_POSE"
                 result_msg.message = (
-                    "SCAN_BUSBAR에서 손목 검증을 마친 고정캠 "
-                    "버스바 snapshot이 없습니다."
+                    "LATCH_BUSBAR/SCAN_BUSBAR에서 latch한 고정캠 "
+                    "버스바 snapshot이 없습니다. wrist 또는 배터리 "
+                    "좌표로 대체하지 않습니다."
                 )
                 self._abort_or_cancel(goal_handle)
                 return result_msg
@@ -497,36 +621,21 @@ class ArmNode(Node):
             return result_msg
 
         # ---------------------------------------------------------------------
-        # [Task 4] MOVE_BATTERY_CENTER (저장된 배터리 중점 좌표 상공으로 이동)
+        # [Task 4] MOVE_BATTERY_CENTER (현재 station의 live bolt 중점 상공으로 이동)
         # ---------------------------------------------------------------------
         elif task_type == "MOVE_BATTERY_CENTER":
-            if self.scanned_battery_midpoint is None:
-                self.get_logger().error(" -> [MOVE_BATTERY_CENTER] 스캔 저장된 배터리 볼트 중점 좌표가 없습니다!")
-                result_msg.success = False
-                result_msg.error_code = "NO_SCANNED_BATTERY_MIDPOINT"
-                result_msg.message = "저장된 배터리 볼트 중점 좌표가 존재하지 않습니다."
-                self._abort_or_cancel(goal_handle)
-                return result_msg
-
             self.get_logger().info(
-                " -> [MOVE_BATTERY_CENTER] 스캔 시 저장한 배터리 중점 "
-                "좌표를 Isaac Sim으로 퍼블리시"
-            )
-            self.get_logger().info(
-                f"    [목표 좌표] X: {self.scanned_battery_midpoint.pose.position.x:.4f}, "
-                f"Y: {self.scanned_battery_midpoint.pose.position.y:.4f}, "
-                f"Z: {self.scanned_battery_midpoint.pose.position.z:.4f}"
+                " -> [MOVE_BATTERY_CENTER] Isaac Sim이 현재 station의 "
+                "live bolt prim 중점을 읽도록 이동 명령 전송"
             )
 
-            # 1. 저장된 배터리 볼트 중점 좌표 퍼블리시
-            self.pub_target_pose.publish(self.scanned_battery_midpoint)
-
-            # 2. Isaac Sim으로 이동 명령 전달
             cmd_msg = String()
             cmd_msg.data = "MOVE_BATTERY_CENTER"
             self.pub_task_command.publish(cmd_msg)
 
-            # 3. Isaac Sim 완료 대기
+            # 목표는 Isaac의 현재 physics stage에서 계산한다. 과거 camera
+            # snapshot을 /target_pose로 다시 보내면 pack 이동·station 전환 뒤
+            # stale 좌표를 사용할 수 있으므로 이 경로에서는 발행하지 않는다.
             success = self.wait_for_isaac_completion(goal_handle, feedback_msg)
 
             if success:
@@ -618,6 +727,10 @@ class ArmNode(Node):
         # ---------------------------------------------------------------------
         elif task_type in ("SCAN_NUT1", "SCAN_NUT2"):
             self.get_logger().info(f" -> [{task_type}] Isaac Sim으로 너트 스캔 이동 명령 전송")
+            if task_type == "SCAN_NUT1":
+                self.scanned_nut1_pose = None
+            else:
+                self.scanned_nut2_pose = None
 
             cmd_msg = String()
             cmd_msg.data = task_type
@@ -635,13 +748,43 @@ class ArmNode(Node):
 
             # 2. 이동 완료 후 Perception 노드에 너트 좌표 요청
             self.get_logger().info(f" -> [{task_type}] 너트 스캔 위치 도착 완료. 비전 노드에 너트 좌표 요청...")
-            self._reset_perception_cache(
-                self.pub_wrist_reset, goal_handle)
-            found, nut_pose, msg = self.request_grasp_pose_until_found(
-                self.client_get_wrist_pose,
-                "nut",
+            if not self._reset_perception_cache(
+                self.pub_wrist_reset,
                 goal_handle,
-            )
+            ):
+                result_msg.success = False
+                if goal_handle.is_cancel_requested:
+                    result_msg.error_code = f"{task_type}_CANCELED"
+                    result_msg.message = "너트 perception reset 대기 중 취소됐습니다."
+                elif self._last_perception_reset_error is not None:
+                    result_msg.error_code = (
+                        "PERCEPTION_PROTOCOL_MISMATCH"
+                    )
+                    result_msg.message = self._last_perception_reset_error
+                else:
+                    result_msg.error_code = "NUT_RESET_INTERRUPTED"
+                    result_msg.message = (
+                        "너트 perception reset generation 확인이 "
+                        "중단됐습니다."
+                    )
+                self._abort_or_cancel(goal_handle)
+                return result_msg
+            try:
+                found, nut_pose, msg = (
+                    self.request_grasp_pose_until_found(
+                        self.client_get_wrist_pose,
+                        "nut",
+                        goal_handle,
+                    )
+                )
+            except PerceptionProtocolError as exc:
+                result_msg.success = False
+                result_msg.error_code = "PERCEPTION_PROTOCOL_MISMATCH"
+                result_msg.message = (
+                    self._record_perception_protocol_error(exc)
+                )
+                self._abort_or_cancel(goal_handle)
+                return result_msg
 
             if found and nut_pose is not None:
                 if task_type == "SCAN_NUT1":
@@ -772,7 +915,7 @@ class ArmNode(Node):
         )
 
     def _record_perception_reset_ack(self, camera_name):
-        """Record that one camera instance processed its reset callback."""
+        """Record compatibility ACK telemetry; do not use it as a causal ID."""
         self._perception_reset_ack_counts[camera_name] += 1
 
     def _isaac_has_failed(self):
@@ -788,8 +931,114 @@ class ArmNode(Node):
         cancel_msg.data = "CANCEL_ARM_TASK"
         self.pub_task_command.publish(cancel_msg)
 
+    @staticmethod
+    def _perception_generation(message):
+        """Parse ``[generation=N]`` metadata from a service response."""
+        marker = "[generation="
+        if not isinstance(message, str) or not message.startswith(marker):
+            return None
+        end = message.find("]", len(marker))
+        if end < 0:
+            return None
+        try:
+            generation = int(message[len(marker):end])
+        except ValueError:
+            return None
+        return generation if generation >= 0 else None
+
+    def _camera_name_for_grasp_client(self, client):
+        if client is self.client_get_wrist_pose:
+            return "wrist"
+        if client is self.client_get_busbar_pose:
+            return "busbar_cam"
+        raise ValueError("알 수 없는 GetGraspPose client입니다")
+
+    def _validate_perception_response_generation(
+        self,
+        camera_name,
+        message,
+    ):
+        """Validate one concrete service response after a proven reset."""
+        required = self._required_perception_generation[camera_name]
+        if required is None:
+            # Requests made without this ArmNode initiating a reset retain the
+            # compatibility behavior used by diagnostics and narrow tests.
+            return None
+        observed = self._perception_generation(message)
+        if observed is None:
+            raise PerceptionProtocolError(
+                f"{camera_name} perception protocol mismatch after reset: "
+                "service response에 '[generation=N]' metadata가 없습니다 "
+                f"(required={required}, message={message!r})"
+            )
+        if observed < required:
+            raise PerceptionProtocolError(
+                f"{camera_name} perception generation regression after reset: "
+                f"required>={required}, observed={observed}; "
+                "perception service restart/rollback이 의심됩니다"
+            )
+        return observed
+
+    def _record_perception_protocol_error(self, error):
+        """Store and log a typed perception protocol failure."""
+        message = str(error)
+        self._last_perception_reset_error = message
+        self.get_logger().error(message)
+        return message
+
+    def _probe_perception_generation(self, camera_name, goal_handle):
+        """Read one camera's generation or reject an incompatible server."""
+        last_message = "perception generation 응답 없음"
+        while (
+            rclpy.ok()
+            and not goal_handle.is_cancel_requested
+            and not self._isaac_has_failed()
+        ):
+            if camera_name == "bolt_cam":
+                response, last_message = self._call_bolt_pair_once(
+                    goal_handle)
+                if response is not None:
+                    last_message = response.message
+            else:
+                client = (
+                    self.client_get_wrist_pose
+                    if camera_name == "wrist"
+                    else self.client_get_busbar_pose
+                )
+                response, last_message = (
+                    self._call_grasp_pose_response_once(
+                        client,
+                        "__reset_generation_probe__",
+                        goal_handle,
+                    )
+                )
+
+            if response is None:
+                self.get_logger().warn(
+                    f"{camera_name} perception generation 응답 재시도: "
+                    f"{last_message}",
+                    throttle_duration_sec=2.0,
+                )
+                if not self._wait_while_active(
+                    self.PERCEPTION_RETRY_INTERVAL_SEC,
+                    goal_handle,
+                ):
+                    break
+                continue
+
+            generation = self._perception_generation(response.message)
+            if generation is not None:
+                return generation
+
+            raise PerceptionProtocolError(
+                f"{camera_name} perception protocol mismatch: "
+                "service response에 '[generation=N]' metadata가 없습니다 "
+                f"(message={response.message!r})"
+            )
+        return None
+
     def _reset_perception_cache(self, publisher, goal_handle):
-        """Reset one cache and wait for its causal acknowledgement."""
+        """Reset one cache and prove the generation advanced via its service."""
         if publisher is self.pub_wrist_reset:
             camera_name = "wrist"
         elif publisher is self.pub_busbar_reset:
@@ -799,19 +1048,51 @@ class ArmNode(Node):
         else:
             raise ValueError("알 수 없는 perception reset publisher입니다")
 
-        previous_ack_count = self._perception_reset_ack_counts[camera_name]
+        self._last_perception_reset_error = None
+        try:
+            baseline_generation = self._probe_perception_generation(
+                camera_name,
+                goal_handle,
+            )
+        except PerceptionProtocolError as exc:
+            self._last_perception_reset_error = str(exc)
+            self.get_logger().error(str(exc))
+            return False
+        if baseline_generation is None:
+            return False
+
         publisher.publish(Empty())
         while (
             rclpy.ok()
             and not goal_handle.is_cancel_requested
             and not self._isaac_has_failed()
         ):
-            if (
-                self._perception_reset_ack_counts[camera_name]
-                > previous_ack_count
-            ):
+            try:
+                observed_generation = self._probe_perception_generation(
+                    camera_name,
+                    goal_handle,
+                )
+            except PerceptionProtocolError as exc:
+                self._last_perception_reset_error = str(exc)
+                self.get_logger().error(str(exc))
+                return False
+            if observed_generation is None:
+                break
+            if observed_generation > baseline_generation:
+                self._required_perception_generation[camera_name] = (
+                    observed_generation
+                )
                 return True
-            time.sleep(0.02)
+            self.get_logger().info(
+                f"{camera_name} perception reset 처리 대기 "
+                f"(generation={observed_generation})",
+                throttle_duration_sec=2.0,
+            )
+            if not self._wait_while_active(
+                self.PERCEPTION_RETRY_INTERVAL_SEC,
+                goal_handle,
+            ):
+                break
         return False
 
     @staticmethod
@@ -877,8 +1158,13 @@ class ArmNode(Node):
 
         return False
 
-    def _call_grasp_pose(self, client, target_label, goal_handle):
-        """한 번의 GetGraspPose 응답을 cancel 가능한 방식으로 기다린다."""
+    def _call_grasp_pose_response_once(
+        self,
+        client,
+        target_label,
+        goal_handle,
+    ):
+        """Return one concrete response while preserving transport failures."""
         while (
             rclpy.ok()
             and not goal_handle.is_cancel_requested
@@ -891,14 +1177,14 @@ class ArmNode(Node):
                 throttle_duration_sec=2.0,
             )
         else:
-            return False, None, "Action cancel 또는 ROS 종료"
+            return None, "Action cancel 또는 ROS 종료"
 
         req = GetGraspPose.Request()
         req.label = target_label
         try:
             future = client.call_async(req)
         except Exception as exc:
-            return False, None, f"GetGraspPose 호출 시작 실패: {exc}"
+            return None, f"GetGraspPose 호출 시작 실패: {exc}"
         while (
             rclpy.ok()
             and not goal_handle.is_cancel_requested
@@ -908,16 +1194,12 @@ class ArmNode(Node):
                 try:
                     response = future.result()
                 except Exception as exc:  # service transport failure: retryable
-                    return False, None, f"GetGraspPose 호출 실패: {exc}"
+                    return None, f"GetGraspPose 호출 실패: {exc}"
                 if response is None:
-                    return False, None, "GetGraspPose 응답 없음"
-                return (
-                    bool(response.found),
-                    response.pose if response.found else None,
-                    response.message,
-                )
+                    return None, "GetGraspPose 응답 없음"
+                return response, response.message
             time.sleep(0.05)
-        return False, None, (
+        return None, (
             "Action cancel"
             if goal_handle.is_cancel_requested
             else (
@@ -925,6 +1207,25 @@ class ArmNode(Node):
                 if self._isaac_has_failed()
                 else "ROS 종료"
             )
+        )
+
+    def _call_grasp_pose(self, client, target_label, goal_handle):
+        """한 번의 GetGraspPose 응답을 cancel 가능한 방식으로 기다린다."""
+        response, message = self._call_grasp_pose_response_once(
+            client,
+            target_label,
+            goal_handle,
+        )
+        if response is None:
+            return False, None, message
+        self._validate_perception_response_generation(
+            self._camera_name_for_grasp_client(client),
+            response.message,
+        )
+        return (
+            bool(response.found),
+            response.pose if response.found else None,
+            response.message,
         )
 
     def request_grasp_pose_until_found(
@@ -949,13 +1250,6 @@ class ArmNode(Node):
                     last_message = "검출 좌표에 NaN/inf가 있습니다"
                 else:
                     return True, pose, message
-
-            # NutPose fallback은 기존 너트 동작만 보존한다. 버스바 PICK에는
-            # 서비스 외 좌표나 battery midpoint 폴백을 절대 사용하지 않는다.
-            if target_label == "nut" and self.latest_nut_pose is not None:
-                nut_pose = self.latest_nut_pose
-                if self._pose_position_is_finite(nut_pose):
-                    return True, nut_pose, "너트 토픽 데이터 사용"
 
             self.get_logger().warn(
                 f"'{target_label}' GetGraspPose 대기: {last_message}",
@@ -1089,6 +1383,57 @@ class ArmNode(Node):
             )
         )
 
+    def _call_bolt_pair_once(self, goal_handle):
+        """Call GetBoltPair once while remaining cancel/shutdown aware."""
+        while (
+            rclpy.ok()
+            and not goal_handle.is_cancel_requested
+            and not self._isaac_has_failed()
+        ):
+            if self.client_get_bolt_pair.wait_for_service(
+                timeout_sec=1.0
+            ):
+                break
+            self.get_logger().warn(
+                "GetBoltPair 서비스 준비 대기 중...",
+                throttle_duration_sec=2.0,
+            )
+        else:
+            return None, (
+                "Action cancel 또는 Isaac failure 또는 ROS 종료"
+            )
+
+        try:
+            future = self.client_get_bolt_pair.call_async(
+                GetBoltPair.Request()
+            )
+        except Exception as exc:
+            return None, f"GetBoltPair 호출 시작 실패: {exc}"
+
+        while (
+            rclpy.ok()
+            and not goal_handle.is_cancel_requested
+            and not self._isaac_has_failed()
+        ):
+            if future.done():
+                try:
+                    response = future.result()
+                except Exception as exc:
+                    return None, f"GetBoltPair 호출 실패: {exc}"
+                if response is None:
+                    return None, "GetBoltPair 응답 없음"
+                return response, response.message
+            time.sleep(0.05)
+        return None, (
+            "Action cancel"
+            if goal_handle.is_cancel_requested
+            else (
+                "Isaac failure"
+                if self._isaac_has_failed()
+                else "ROS 종료"
+            )
+        )
+
     def request_bolt_pair_midpoint_async(
         self,
         goal_handle,
@@ -1136,7 +1481,16 @@ class ArmNode(Node):
             else:
                 break
 
-            if response is not None and response.found:
+            if response is not None:
+                self._validate_perception_response_generation(
+                    "bolt_cam",
+                    response.message,
+                )
+
+            if (
+                response is not None
+                and response.found
+            ):
                 pose_a_msg = response.pose_a
                 pose_b_msg = response.pose_b
                 stamps = (

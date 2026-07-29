@@ -6,6 +6,7 @@ error_fix_node를 함께 기동한다.
 """
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
+from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.substitutions import FindPackageShare
 from launch_ros.actions import Node
@@ -35,10 +36,11 @@ def _perception_nodes(model_path):
                     f'/{config.namespace}/perception/debug_image'
                 ),
                 'model_path': model_path,
-                'max_rgb_depth_skew_sec': 0.1,
+                'max_rgb_depth_skew_sec': 0.2,
                 'max_input_receipt_age_sec': 1.0,
                 'require_unique_camera_source': True,
                 'required_target_frames': 3,
+                'on_demand_inference': config.on_demand_inference,
                 'use_bolt_roi': config.use_bolt_roi,
                 'prefer_busbar_depth': config.prefer_busbar_depth,
                 'inference_image_size': (
@@ -59,7 +61,16 @@ def _perception_nodes(model_path):
 
 def generate_launch_description():
     model_path = LaunchConfiguration('perception_model_path')
+    start_fleet_manager = LaunchConfiguration('start_fleet_manager')
     nodes = [
+        DeclareLaunchArgument(
+            'start_fleet_manager',
+            default_value='true',
+            description=(
+                'Start the automatic station_3/4/5 job dispatcher; set false '
+                'for an externally published single-station diagnostic job'
+            ),
+        ),
         DeclareLaunchArgument(
             'perception_model_path',
             default_value=PathJoinSubstitution([
@@ -77,6 +88,7 @@ def generate_launch_description():
             executable='fleet_manager_node',
             name='fleet_manager_node',
             output='screen',
+            condition=IfCondition(start_fleet_manager),
         ),
         Node(
             package='behavior_node',

@@ -35,6 +35,11 @@ DEFAULT_ARRIVAL_TOLERANCE_M = 0.05
 GOAL_FRAME_ID = 'amr_baseline'
 ACTIVE_DRIVE_STATES = {'ACTIVE', 'DRIVING'}
 TERMINAL_DRIVE_STATES = {'ARRIVED', 'FAILED', 'CANCELED'}
+# An AMR command is normally sent once by behavior_node, but a transport retry
+# may overlap an already-active command.  Keep this much smaller than any
+# physical arrival tolerance: it identifies the *same command*, not a nearby
+# replacement destination.
+IDENTICAL_GOAL_TOLERANCE = 1e-6
 
 
 def _stamp_key(msg: PoseStamped) -> str:
@@ -87,6 +92,7 @@ class AmrNode(Node):
         self._current_pose = (0.0, 0.0, 0.0)
         self._goal_station_id = ''
         self._goal_xy = None
+        self._goal_theta = None
         self._goal_stamp = ''
         self._moving = False
         self._drive_state_seen = False
@@ -111,6 +117,17 @@ class AmrNode(Node):
             f'SUB /amr/goal <- {station_id} '
             f'({msg.x:.4f}, {msg.y:.4f}, {msg.theta:.4f})')
 
+        if self._is_identical_active_goal(
+            station_id, float(msg.x), float(msg.y), float(msg.theta)
+        ):
+            # Do not create a new bridge stamp here.  Isaac correctly treats a
+            # new goal_pose as an interruption of the current wheel command;
+            # forwarding a retry of the same FMS goal therefore made the active
+            # drive fail before it could report ARRIVED.
+            self.get_logger().info(
+                f'동일 활성 목표 {station_id} 재수신: 기존 wheel 주행 유지')
+            return
+
         if self._moving:
             old_station = self._goal_station_id
             self._moving = False
@@ -127,6 +144,7 @@ class AmrNode(Node):
 
         self._goal_station_id = station_id
         self._goal_xy = (float(msg.x), float(msg.y))
+        self._goal_theta = float(msg.theta)
         self._goal_stamp = _stamp_key(goal_pose)
         self._moving = True
         self._drive_state_seen = False
@@ -141,6 +159,29 @@ class AmrNode(Node):
             f'PUB /amr/goal_pose [{GOAL_FRAME_ID}] -> '
             f'({msg.x:.4f}, {msg.y:.4f}, {msg.theta:.4f}), '
             f'stamp={self._goal_stamp}')
+
+    def _is_identical_active_goal(
+        self, station_id: str, x: float, y: float, theta: float
+    ) -> bool:
+        """Return whether a retry names the exact active bridge command."""
+        if (
+            not self._moving
+            or self._goal_station_id != station_id
+            or self._goal_xy is None
+            or self._goal_theta is None
+        ):
+            return False
+        current_x, current_y = self._goal_xy
+        return all(
+            math.isclose(current, incoming,
+                         rel_tol=0.0,
+                         abs_tol=IDENTICAL_GOAL_TOLERANCE)
+            for current, incoming in (
+                (current_x, x),
+                (current_y, y),
+                (self._goal_theta, theta),
+            )
+        )
 
     def _on_sim_pose(self, msg: Pose2D):
         self._current_pose = (msg.x, msg.y, msg.theta)
@@ -205,6 +246,7 @@ class AmrNode(Node):
         station_id = self._goal_station_id
         self._moving = False
         self._goal_xy = None
+        self._goal_theta = None
         self._goal_stamp = ''
         self._drive_state_seen = False
         self._publish_status(state, station_id, message)

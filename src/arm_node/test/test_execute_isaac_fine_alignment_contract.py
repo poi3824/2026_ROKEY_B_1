@@ -46,7 +46,7 @@ def test_fine_delta_is_integrated_only_behind_a_settle_gate():
 
     assert consume_at < inactive_gate_at < integrate_at < begin_at
     assert begin_at < update_at < ack_at
-    assert "FINE_STEP_SETTLE_STEPS = 12" in EXECUTOR_SOURCE
+    assert "FINE_STEP_SETTLE_STEPS = 6" in EXECUTOR_SOURCE
     assert "position_error_m=position_error_m" in phase
     assert "orientation_error_rad=orientation_error_rad" in phase
     assert "position_error_m = math.dist(" in phase
@@ -78,6 +78,63 @@ def test_fine_delta_is_integrated_only_behind_a_settle_gate():
     )
     assert "and not fine_step_started_this_tick" in phase
     assert "FINE_STEP_ORIENTATION_MOTION_TOL_RAD" in EXECUTOR_SOURCE
+
+
+def test_subquantized_fine_steps_use_only_the_bounded_jitter_profile():
+    phase = _source_between(
+        'elif phase == "FINE_ALIGNMENT":',
+        "# [8단계] 버스바 수직 하강 체결",
+    )
+
+    assert "FINE_STEP_UNOBSERVABLE_MOTION_TOL_M = 0.0002" in (
+        EXECUTOR_SOURCE
+    )
+    assert (
+        "FINE_STEP_UNOBSERVABLE_ORIENTATION_MOTION_TOL_RAD = "
+        "math.radians(0.1)"
+    ) in EXECUTOR_SOURCE
+    assert "unobservable_motion_tolerance_m=(" in EXECUTOR_SOURCE
+    assert "unobservable_orientation_motion_tolerance_rad=(" in (
+        EXECUTOR_SOURCE
+    )
+    assert "using_unobservable_motion_tolerance" in phase
+    assert 'profile="sub-quantized"' not in phase
+    assert '"sub-quantized"' in phase
+    # The receipt tick cannot count toward the 6-tick settle proof.
+    assert "and not fine_step_started_this_tick" in phase
+
+
+def test_six_tick_budget_is_scoped_to_fine_alignment_only():
+    assert "FINE_STEP_SETTLE_STEPS = 6" in EXECUTOR_SOURCE
+    # Busbar physical contact/seat verification remains deliberately stricter.
+    assert "BUSBAR_HOLE_ALIGNMENT_SETTLE_STEPS = 12" in (
+        EXECUTOR_SOURCE
+    )
+    assert "BUSBAR_SEAT_SETTLE_STEPS = 12" in EXECUTOR_SOURCE
+    assert "BUSBAR_POSE_SETTLE_STEPS = 12" in EXECUTOR_SOURCE
+
+
+def test_alignment_success_final_settle_uses_bounded_jitter_profile():
+    phase = _source_between(
+        'elif phase == "FINE_ALIGNMENT":',
+        "# [8단계] 버스바 수직 하강 체결",
+    )
+    final_settle = phase[
+        phase.index("if fine_step_gate.active_stamp_ns is None:"):
+        phase.index("else:", phase.index(
+            "if fine_step_gate.active_stamp_ns is None:"))
+    ]
+
+    # Error bounds and the 6-tick proof remain strict; only inter-tick
+    # controller/quaternion jitter uses the already-bounded no-op profile.
+    assert "FINE_STEP_POSITION_TOL_M" in final_settle
+    assert "FINE_STEP_ORIENTATION_TOL_RAD" in final_settle
+    assert "FINE_STEP_UNOBSERVABLE_MOTION_TOL_M" in final_settle
+    assert "FINE_STEP_UNOBSERVABLE_ORIENTATION_MOTION_TOL_RAD" in (
+        final_settle
+    )
+    assert "required_steps=FINE_STEP_SETTLE_STEPS" in final_settle
+    assert "[FINE_ALIGNMENT FINAL SETTLE]" in final_settle
 
 
 def test_fine_delta_frame_stamp_bounds_and_yaw_are_validated():
@@ -135,14 +192,15 @@ def test_alignment_success_requires_the_active_expected_generation():
     assert callback.count("return") >= 5
 
 
-def test_fine_yaw_is_preserved_during_busbar_insert_and_retract():
+def test_measured_busbar_orientation_is_preserved_during_insert_and_retract():
     assembly = _source_between(
         'elif phase == "BUSBAR_DESCEND_TO_BOLT":',
         "# ════════════════════════════════════════════════════════════════",
     )
 
-    assert assembly.count("target_fine_yaw_rad") >= 2
-    assert assembly.count("euler_to_quaternion_wxyz(") >= 2
+    assert assembly.count("busbar_alignment_target_quat") >= 2
+    assert "target_fine_yaw_rad" not in assembly
+    assert "euler_to_quaternion_wxyz(" not in assembly
 
 
 def test_cancel_and_playback_restart_clear_pending_fine_step():
@@ -236,11 +294,12 @@ def test_fine_controller_lead_changes_only_the_bounded_xy_command():
     assert "saturated={lead_status.saturated}" in phase
     assert "step_count % 60 == 0" in phase
 
-    # Strictly settled controller XY becomes the canonical target before ACK;
-    # assembly then consumes that canonical target without adding lead twice.
+    # Strictly settled controller XY becomes the actual starting pose before
+    # assembly closes the remaining sub-clearance physical hole residual.
     assert "fine_controller_lead.commit_xy(" in phase
-    assert "target_fine_pos[0]" in assembly_setup
-    assert "target_fine_pos[1]" in assembly_setup
+    assert "observe_latched_busbar_seating(" in assembly_setup
+    assert "cur_ee[:2] - hole_midpoint" in assembly_setup
+    assert "desired_ee_xy = bolt_midpoint" in assembly_setup
     assert "fine_controller_target_pos" not in assembly_setup
 
 
@@ -267,7 +326,7 @@ def test_fine_settle_commits_effective_xy_before_ack_without_gate_relaxation():
     assert "committed lead=" in settled
     assert "fine_step_gate.update(" in phase
     assert "FINE_STEP_MIN_RESPONSE_RATIO = 0.80" in EXECUTOR_SOURCE
-    assert "FINE_STEP_SETTLE_STEPS = 12" in EXECUTOR_SOURCE
+    assert "FINE_STEP_SETTLE_STEPS = 6" in EXECUTOR_SOURCE
     assert "FINE_STEP_POSITION_TOL_M = 0.005" in EXECUTOR_SOURCE
     assert (
         "FINE_STEP_POSITION_RESPONSE_NOISE_MARGIN_M = 0.0001"

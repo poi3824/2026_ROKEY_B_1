@@ -57,6 +57,35 @@ def test_replacement_goal_does_not_publish_cross_topic_cancel(node):
     assert node._goal_station_id == 'station4'
 
 
+def test_identical_active_goal_keeps_existing_wheel_command(node):
+    """A transport retry must not make Isaac interrupt the same drive."""
+    goal = _goal('station3', 1.0, 2.0, 0.5)
+    node._on_goal(goal)
+    original_stamp = node._goal_stamp
+    published_statuses = len(node._status_pub.messages)
+
+    node._on_goal(_goal('station3', 1.0, 2.0, 0.5))
+
+    assert node._moving
+    assert node._goal_station_id == 'station3'
+    assert node._goal_stamp == original_stamp
+    assert len(node._goal_pose_pub.messages) == 1
+    assert len(node._status_pub.messages) == published_statuses
+    assert node._cancel_pub.messages == []
+
+
+def test_same_station_with_changed_pose_replaces_active_goal(node):
+    """Deduplication must not hide a real correction for one station."""
+    node._on_goal(_goal('station3', 1.0, 2.0, 0.5))
+    node._on_goal(_goal('station3', 1.01, 2.0, 0.5))
+
+    assert node._moving
+    assert node._goal_station_id == 'station3'
+    assert node._goal_xy == (1.01, 2.0)
+    assert len(node._goal_pose_pub.messages) == 2
+    assert node._cancel_pub.messages == []
+
+
 def test_sim_pose_never_short_circuits_physical_arrival(node):
     """Position-only feedback cannot satisfy yaw and settle requirements."""
     node._on_goal(_goal('station3', 1.0, 2.0, 0.5))

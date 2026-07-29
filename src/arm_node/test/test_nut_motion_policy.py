@@ -14,14 +14,464 @@ RMPFLOW_DIR = (
 sys.path.insert(0, str(RMPFLOW_DIR))
 
 from nut_motion_policy import (  # noqa: E402
+    compensated_ee_target_for_nut_axis,
+    consecutive_planar_alignment,
     consecutive_pose_settle,
     exact_collision_filter_targets,
     lead_xy_target,
     lead_z_target,
     nut_ee_coupling_error,
     nut_from_ee_offset,
+    planned_screw_depth,
     rate_limited_z_target,
+    required_seating_depth,
+    required_seating_depth_to_surface,
+    screw_pass_target_z,
+    signed_yaw_delta_wxyz,
+    thread_entry_ee_z,
 )
+
+
+def test_thread_entry_ee_z_places_nut_bottom_at_live_bolt_clearance():
+    bolt_tip_z = 0.153302
+    nut_height_m = 0.00847725
+    latched_nut_from_ee_z = -0.226
+    entry_clearance_m = 0.001
+
+    ee_z = thread_entry_ee_z(
+        bolt_tip_z,
+        nut_height_m,
+        latched_nut_from_ee_z,
+        entry_clearance_m,
+    )
+    nut_center_z = ee_z + latched_nut_from_ee_z
+    nut_bottom_z = nut_center_z - 0.5 * nut_height_m
+
+    assert nut_bottom_z == pytest.approx(
+        bolt_tip_z + entry_clearance_m
+    )
+    assert ee_z == pytest.approx(0.384540625)
+
+
+def test_thread_entry_target_tracks_bolt_and_latched_grasp_changes():
+    baseline = thread_entry_ee_z(0.153, 0.008, -0.220, 0.001)
+
+    assert thread_entry_ee_z(
+        0.158,
+        0.008,
+        -0.220,
+        0.001,
+    ) == pytest.approx(baseline + 0.005)
+    assert thread_entry_ee_z(
+        0.153,
+        0.008,
+        -0.217,
+        0.001,
+    ) == pytest.approx(baseline - 0.003)
+
+
+def test_dynamic_full_seating_depth_consumes_gap_and_nut_height():
+    bolt_tip_z = 0.153302
+    nut_height_m = 0.00847725
+    entry_clearance_m = 0.001
+    entry_nut_center_z = (
+        bolt_tip_z + 0.5 * nut_height_m + entry_clearance_m
+    )
+
+    required = required_seating_depth(
+        entry_nut_center_z,
+        bolt_tip_z,
+        nut_height_m,
+    )
+    tolerant_required = required_seating_depth(
+        entry_nut_center_z,
+        bolt_tip_z,
+        nut_height_m,
+        axial_tolerance_m=0.0005,
+    )
+
+    assert required == pytest.approx(
+        entry_clearance_m + nut_height_m
+    )
+    assert required == pytest.approx(0.00947725)
+    assert tolerant_required == pytest.approx(0.00897725)
+
+
+def test_dynamic_seating_depth_accounts_for_existing_thread_overlap():
+    bolt_tip_z = 0.15
+    nut_height_m = 0.008
+    target_overlap_m = 0.002
+    # The entry pose is already 0.5 mm onto the thread.
+    entry_nut_center_z = bolt_tip_z + 0.5 * nut_height_m - 0.0005
+
+    required = required_seating_depth(
+        entry_nut_center_z,
+        bolt_tip_z,
+        nut_height_m,
+        target_thread_overlap_m=target_overlap_m,
+    )
+
+    assert required == pytest.approx(0.0015)
+
+
+@pytest.mark.parametrize(
+    "bolt_tip_z,expected_depth_m",
+    [
+        (0.160008, 0.009352),
+        (0.160533, 0.009877),
+    ],
+)
+def test_station5_surface_seating_depth_uses_actual_slot_tip(
+    bolt_tip_z,
+    expected_depth_m,
+):
+    busbar_top_z = 0.150856
+    nut_height_m = 0.00847725
+    entry_clearance_m = 0.0002
+    entry_nut_center_z = (
+        bolt_tip_z + entry_clearance_m + 0.5 * nut_height_m
+    )
+
+    required = required_seating_depth_to_surface(
+        entry_nut_center_z,
+        nut_height_m,
+        busbar_top_z,
+    )
+
+    assert required == pytest.approx(expected_depth_m)
+    assert required * 1000.0 == pytest.approx(
+        expected_depth_m * 1000.0
+    )
+
+
+def test_surface_seating_depth_applies_axial_tolerance_and_clamps_at_zero():
+    assert required_seating_depth_to_surface(
+        0.155,
+        0.008,
+        0.15,
+        axial_tolerance_m=0.0005,
+    ) == pytest.approx(0.0005)
+    assert required_seating_depth_to_surface(
+        0.154,
+        0.008,
+        0.15,
+        axial_tolerance_m=0.0005,
+    ) == pytest.approx(0.0)
+
+
+def test_six_350_degree_passes_plan_about_ten_mm_of_thread_lead():
+    pass_angle_deg = 350.0
+    pass_count = 6
+    thread_pitch_m = 0.001714406
+
+    total_depth = planned_screw_depth(
+        pass_angle_deg,
+        pass_count,
+        thread_pitch_m,
+    )
+    per_pass_depth = screw_pass_target_z(
+        0.4,
+        pass_angle_deg,
+        thread_pitch_m,
+    )
+
+    assert total_depth == pytest.approx(0.010000701666666665)
+    assert total_depth * 1000.0 == pytest.approx(
+        10.000701666666666
+    )
+    assert 0.4 - per_pass_depth == pytest.approx(
+        total_depth / pass_count
+    )
+
+
+def test_six_pass_plan_covers_geometry_driven_full_seating_depth():
+    nut_height_m = 0.00847725
+    entry_clearance_m = 0.001
+    bolt_tip_z = 0.153302
+    entry_nut_center_z = (
+        bolt_tip_z + 0.5 * nut_height_m + entry_clearance_m
+    )
+
+    planned = planned_screw_depth(350.0, 6, 0.001714406)
+    required = required_seating_depth(
+        entry_nut_center_z,
+        bolt_tip_z,
+        nut_height_m,
+    )
+
+    assert planned > required
+    assert planned - required == pytest.approx(0.000523451666666665)
+
+
+@pytest.mark.parametrize(
+    "bolt_tip,nut_height,nut_from_ee,clearance",
+    [
+        (np.nan, 0.008, -0.2, 0.001),
+        (0.15, 0.0, -0.2, 0.001),
+        (0.15, -0.008, -0.2, 0.001),
+        (0.15, 0.008, np.inf, 0.001),
+        (0.15, 0.008, -0.2, -0.001),
+    ],
+)
+def test_thread_entry_ee_z_rejects_invalid_geometry(
+    bolt_tip,
+    nut_height,
+    nut_from_ee,
+    clearance,
+):
+    with pytest.raises(ValueError):
+        thread_entry_ee_z(
+            bolt_tip,
+            nut_height,
+            nut_from_ee,
+            clearance,
+        )
+
+
+@pytest.mark.parametrize(
+    "entry_center,tip,height,overlap,tolerance,exception",
+    [
+        (np.nan, 0.15, 0.008, None, 0.0, ValueError),
+        (0.155, 0.15, 0.0, None, 0.0, ValueError),
+        (0.155, 0.15, 0.008, -0.001, 0.0, ValueError),
+        (0.155, 0.15, 0.008, 0.009, 0.0, ValueError),
+        (0.155, 0.15, 0.008, 0.002, -0.001, ValueError),
+    ],
+)
+def test_required_seating_depth_rejects_invalid_geometry(
+    entry_center,
+    tip,
+    height,
+    overlap,
+    tolerance,
+    exception,
+):
+    with pytest.raises(exception):
+        required_seating_depth(
+            entry_center,
+            tip,
+            height,
+            target_thread_overlap_m=overlap,
+            axial_tolerance_m=tolerance,
+        )
+
+
+@pytest.mark.parametrize(
+    "entry_center,height,surface,tolerance",
+    [
+        (np.nan, 0.008, 0.15, 0.0),
+        (0.155, 0.0, 0.15, 0.0),
+        (0.155, -0.008, 0.15, 0.0),
+        (0.155, 0.008, np.inf, 0.0),
+        (0.155, 0.008, 0.15, -0.001),
+    ],
+)
+def test_surface_seating_depth_rejects_invalid_geometry(
+    entry_center,
+    height,
+    surface,
+    tolerance,
+):
+    with pytest.raises(ValueError):
+        required_seating_depth_to_surface(
+            entry_center,
+            height,
+            surface,
+            axial_tolerance_m=tolerance,
+        )
+
+
+@pytest.mark.parametrize(
+    "angle,passes,pitch,exception",
+    [
+        (np.nan, 6, 0.001714406, ValueError),
+        (-1.0, 6, 0.001714406, ValueError),
+        (350.0, 0, 0.001714406, ValueError),
+        (350.0, 6.0, 0.001714406, TypeError),
+        (350.0, True, 0.001714406, TypeError),
+        (350.0, 6, 0.0, ValueError),
+    ],
+)
+def test_planned_screw_depth_rejects_invalid_plan(
+    angle,
+    passes,
+    pitch,
+    exception,
+):
+    with pytest.raises(exception):
+        planned_screw_depth(angle, passes, pitch)
+
+
+def test_compensated_ee_target_subtracts_actual_grasp_offset():
+    ee = np.array([0.5720, -0.0990, 0.9])
+    nut = np.array([0.5720, -0.0940, 0.86])
+    bolt_axis = np.array([1.0552117, 0.3722289, 0.1248])
+
+    target = compensated_ee_target_for_nut_axis(
+        bolt_axis,
+        ee,
+        nut,
+        target_z=0.6,
+    )
+
+    # The nut is held +5 mm in world Y from the EE, so the EE must be sent
+    # 5 mm to the opposite side of the bolt axis.
+    np.testing.assert_allclose(
+        target,
+        np.array([bolt_axis[0], bolt_axis[1] - 0.005, 0.6]),
+    )
+
+
+@pytest.mark.parametrize(
+    "bolt,ee,nut,target_z",
+    [
+        ([1.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], 0.6),
+        ([1.0, 2.0], [0.0, 0.0], [0.0, 0.0, 0.0], 0.6),
+        ([1.0, 2.0], [0.0, 0.0, 0.0], [0.0, np.nan, 0.0], 0.6),
+        ([1.0, 2.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], np.inf),
+    ],
+)
+def test_compensated_ee_target_rejects_invalid_state(
+    bolt,
+    ee,
+    nut,
+    target_z,
+):
+    with pytest.raises(ValueError):
+        compensated_ee_target_for_nut_axis(
+            bolt,
+            ee,
+            nut,
+            target_z=target_z,
+        )
+
+
+def test_planar_alignment_requires_twelve_consecutive_physical_samples():
+    bolt = np.array([1.0552, 0.3722])
+    count = 0
+
+    for _ in range(11):
+        count, aligned, error = consecutive_planar_alignment(
+            np.array([1.05569, 0.3722, 0.5]),
+            bolt,
+            count,
+            tolerance_m=0.0005,
+            required_steps=12,
+        )
+        assert not aligned
+        assert error == pytest.approx(0.00049)
+
+    count, aligned, _ = consecutive_planar_alignment(
+        np.array([1.05569, 0.3722, 0.5]),
+        bolt,
+        count,
+        tolerance_m=0.0005,
+        required_steps=12,
+    )
+    assert count == 12
+    assert aligned
+
+
+def test_planar_alignment_resets_after_one_off_axis_sample():
+    count, aligned, error = consecutive_planar_alignment(
+        np.array([1.05621, 0.3722, 0.5]),
+        np.array([1.0552, 0.3722]),
+        11,
+        tolerance_m=0.0005,
+        required_steps=12,
+    )
+
+    assert count == 0
+    assert not aligned
+    assert error == pytest.approx(0.00101)
+
+
+def test_each_regrasped_screw_pass_moves_nut_by_one_physical_lead():
+    pitch = 0.001714406
+    pass_angle = 350.0
+    regrasp_height = 0.005
+    initial_ee_z = 0.3697
+    initial_nut_from_ee_z = -0.226
+
+    first_ee_end = screw_pass_target_z(
+        initial_ee_z,
+        pass_angle,
+        pitch,
+    )
+    first_nut_end = first_ee_end + initial_nut_from_ee_z
+
+    # Regrasp closes 5 mm above the prior EE pose.  The physical nut stays
+    # put while open, so the new nut-from-EE offset grows by the same 5 mm.
+    second_start_ee_z = first_ee_end + regrasp_height
+    second_nut_from_ee_z = (
+        first_nut_end - second_start_ee_z
+    )
+    second_ee_end = screw_pass_target_z(
+        second_start_ee_z,
+        pass_angle,
+        pitch,
+    )
+    second_nut_end = second_ee_end + second_nut_from_ee_z
+
+    expected_pass_lead = (pass_angle / 360.0) * pitch
+    assert first_nut_end == pytest.approx(
+        initial_ee_z + initial_nut_from_ee_z - expected_pass_lead
+    )
+    assert second_nut_end == pytest.approx(
+        first_nut_end - expected_pass_lead
+    )
+
+
+def test_signed_yaw_delta_accumulates_a_full_turn_across_wraparound():
+    accumulated = 0.0
+    previous_degrees = 0.0
+    for current_degrees in range(2, 352, 2):
+        previous = np.array([
+            np.cos(np.radians(previous_degrees) / 2.0),
+            0.0,
+            0.0,
+            np.sin(np.radians(previous_degrees) / 2.0),
+        ])
+        current = np.array([
+            np.cos(np.radians(current_degrees) / 2.0),
+            0.0,
+            0.0,
+            np.sin(np.radians(current_degrees) / 2.0),
+        ])
+        accumulated += signed_yaw_delta_wxyz(previous, current)
+        previous_degrees = current_degrees
+
+    assert accumulated == pytest.approx(np.radians(350.0))
+
+
+@pytest.mark.parametrize(
+    "previous,current",
+    [
+        ([1.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]),
+        ([0.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]),
+        ([1.0, 0.0, 0.0, np.nan], [1.0, 0.0, 0.0, 0.0]),
+    ],
+)
+def test_signed_yaw_delta_rejects_invalid_quaternions(previous, current):
+    with pytest.raises(ValueError):
+        signed_yaw_delta_wxyz(previous, current)
+
+
+@pytest.mark.parametrize(
+    "start_z,angle,pitch",
+    [
+        (np.nan, 350.0, 0.0017),
+        (0.37, -1.0, 0.0017),
+        (0.37, 350.0, 0.0),
+    ],
+)
+def test_screw_pass_target_rejects_invalid_state(
+    start_z,
+    angle,
+    pitch,
+):
+    with pytest.raises(ValueError):
+        screw_pass_target_z(start_z, angle, pitch)
 
 
 def test_pose_settle_requires_twelve_consecutive_actual_samples():

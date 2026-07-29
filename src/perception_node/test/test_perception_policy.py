@@ -8,12 +8,18 @@ from perception_node.perception_policy import (
     BoltPairAssociationGate,
     CameraFrameGate,
     DEFAULT_BOLT_PAIR_ASSOCIATION_MAX_ENDPOINT_M,
+    SingleTargetAssociationGate,
+    SourceTimestampEpochTracker,
     TargetFrameBarrier,
+    TimestampedFrame,
     advance_source_boundary,
     associate_bolt_pair_endpoints,
+    frame_receipt_error,
     scale_roi,
     select_central_bolt_pair,
     select_central_candidates,
+    select_newest_synchronized_pair,
+    select_sticky_single_target,
     stamp_to_nanoseconds,
 )
 
@@ -39,7 +45,9 @@ def test_frame_gate_accepts_fresh_synchronized_unique_sources():
     result = _evaluate(
         gate,
         rgb_ns=1_000_000_000,
-        depth_ns=1_100_000_000,
+        # The Isaac cameras can arrive a little more than one render tick
+        # apart; the default permits this bounded 133 ms source skew.
+        depth_ns=1_133_000_000,
     )
 
     assert result.accepted
@@ -50,7 +58,7 @@ def test_frame_gate_accepts_fresh_synchronized_unique_sources():
     [
         ({'publisher_counts': {'rgb': 2, 'depth': 1}}, 'publisher count'),
         ({'rgb_received_at': 8.9}, 'stale receipt'),
-        ({'depth_ns': 1_100_000_001}, 'skew'),
+        ({'depth_ns': 1_200_000_001}, 'skew'),
     ],
 )
 def test_frame_gate_rejects_ambiguous_stale_or_skewed_inputs(overrides, reason):
@@ -146,6 +154,383 @@ def test_callback_observed_boundary_is_monotonic_across_queued_frames():
         advance_source_boundary(boundary, -1)
 
 
+def _epoch_tracker_at_old_boundary():
+    tracker = SourceTimestampEpochTracker(
+        rollback_threshold_sec=5.0,
+        max_pair_skew_sec=0.1,
+        confirmation_pairs=2,
+        quarantine_pairs=2,
+    )
+    initial = tracker.observe_pair(
+        100_000_000_000,
+        100_010_000_000,
+    )
+    assert initial.accept_pair
+    return tracker
+
+
+def test_source_epoch_tracker_rejects_small_out_of_order_without_rebase():
+    tracker = _epoch_tracker_at_old_boundary()
+
+    out_of_order = tracker.observe_pair(
+        99_900_000_000,
+        99_910_000_000,
+    )
+
+    assert not out_of_order.accept_pair
+    assert not out_of_order.pending
+    assert not out_of_order.rebase
+    assert out_of_order.epoch == 0
+    assert out_of_order.rgb_boundary_ns == 100_000_000_000
+    recovered = tracker.observe_pair(
+        100_100_000_000,
+        100_110_000_000,
+    )
+    assert recovered.accept_pair
+    assert not recovered.rebase
+
+
+def test_source_epoch_tracker_needs_two_coherent_two_modality_pairs():
+    tracker = _epoch_tracker_at_old_boundary()
+
+    one_sided = tracker.observe_pair(
+        2_000_000_000,
+        100_020_000_000,
+    )
+    assert one_sided.pending
+    assert not one_sided.rebase
+    assert tracker.pending_confirmation_count == 0
+
+    first_pair = tracker.observe_pair(
+        2_000_000_000,
+        2_010_000_000,
+    )
+    assert first_pair.pending
+    assert not first_pair.accept_pair
+    assert not first_pair.rebase
+    assert tracker.pending_confirmation_count == 1
+
+    duplicate_pair = tracker.observe_pair(
+        2_000_000_000,
+        2_010_000_000,
+    )
+    assert duplicate_pair.pending
+    assert not duplicate_pair.rebase
+    assert tracker.pending_confirmation_count == 1
+
+    confirming_pair = tracker.observe_pair(
+        2_100_000_000,
+        2_110_000_000,
+    )
+    assert confirming_pair.accept_pair
+    assert confirming_pair.rebase
+    assert not confirming_pair.pending
+    assert confirming_pair.epoch == 1
+    assert confirming_pair.rgb_boundary_ns == 2_100_000_000
+    assert confirming_pair.depth_boundary_ns == 2_110_000_000
+
+
+def test_reset_seeded_tracker_rebases_low_epoch_before_frame_gate_deadlock():
+    tracker = SourceTimestampEpochTracker(
+        rollback_threshold_sec=5.0,
+        max_pair_skew_sec=0.1,
+        confirmation_pairs=2,
+        quarantine_pairs=2,
+    )
+    gate = CameraFrameGate()
+    barrier = TargetFrameBarrier(required_frames=3)
+    old_rgb_boundary = 100_000_000_000
+    old_depth_boundary = 100_010_000_000
+
+    assert tracker.seed_reset_boundaries(
+        old_rgb_boundary,
+        old_depth_boundary,
+    )
+    gate.reset(
+        rgb_boundary_ns=old_rgb_boundary,
+        depth_boundary_ns=old_depth_boundary,
+    )
+    barrier.reset()
+
+    first_low_pair = tracker.observe_pair(
+        2_000_000_000,
+        2_010_000_000,
+    )
+    assert first_low_pair.pending
+    assert not first_low_pair.accept_pair
+    assert not first_low_pair.rebase
+
+    confirming_low_pair = tracker.observe_pair(
+        2_100_000_000,
+        2_110_000_000,
+    )
+    assert confirming_low_pair.accept_pair
+    assert confirming_low_pair.rebase
+
+    # Mirror the node's atomic hard-reset path. The confirming pair becomes
+    # frame one in the new target generation, followed by two fresh pairs.
+    barrier.reset()
+    gate.reset(preserve_source_sequence=False)
+    accepted_stamps = (
+        (2_100_000_000, 2_110_000_000),
+        (2_200_000_000, 2_210_000_000),
+        (2_300_000_000, 2_310_000_000),
+    )
+    for index, (rgb_stamp_ns, depth_stamp_ns) in enumerate(
+        accepted_stamps,
+        start=1,
+    ):
+        if index > 1:
+            epoch_result = tracker.observe_pair(
+                rgb_stamp_ns,
+                depth_stamp_ns,
+            )
+            assert epoch_result.accept_pair
+            assert not epoch_result.rebase
+        gate_result = _evaluate(
+            gate,
+            rgb_ns=rgb_stamp_ns,
+            depth_ns=depth_stamp_ns,
+        )
+        assert gate_result.accepted
+        ready = barrier.record(
+            'bolt',
+            rgb_stamp_ns,
+            generation=barrier.generation,
+        )
+        assert ready is (index == 3)
+
+    assert barrier.ready('bolt')
+
+
+def test_reset_seed_requires_both_modalities_and_keeps_rollback_strict():
+    tracker = SourceTimestampEpochTracker(
+        rollback_threshold_sec=5.0,
+        max_pair_skew_sec=0.1,
+        confirmation_pairs=2,
+    )
+    assert not tracker.seed_reset_boundaries(
+        100_000_000_000,
+        None,
+    )
+    initial = tracker.observe_pair(
+        100_000_000_000,
+        100_010_000_000,
+    )
+    assert initial.accept_pair
+
+    small_rollback = tracker.observe_pair(
+        99_900_000_000,
+        99_910_000_000,
+    )
+    assert not small_rollback.accept_pair
+    assert not small_rollback.pending
+    assert not small_rollback.rebase
+
+    one_sided_rollback = tracker.observe_pair(
+        2_000_000_000,
+        100_020_000_000,
+    )
+    assert not one_sided_rollback.accept_pair
+    assert one_sided_rollback.pending
+    assert not one_sided_rollback.rebase
+    assert tracker.pending_confirmation_count == 0
+
+
+def test_source_epoch_tracker_old_epoch_recovery_cancels_pending():
+    tracker = _epoch_tracker_at_old_boundary()
+    assert tracker.observe_pair(
+        2_000_000_000,
+        100_020_000_000,
+    ).pending
+
+    recovered = tracker.observe_pair(
+        100_100_000_000,
+        100_110_000_000,
+    )
+
+    assert recovered.accept_pair
+    assert not recovered.pending
+    assert not recovered.rebase
+    assert 'pending canceled' in recovered.reason
+    assert tracker.pending_confirmation_count == 0
+
+
+def test_source_epoch_tracker_quarantines_delayed_old_high_stamps():
+    tracker = _epoch_tracker_at_old_boundary()
+    tracker.observe_pair(2_000_000_000, 2_010_000_000)
+    rebased = tracker.observe_pair(2_100_000_000, 2_110_000_000)
+    assert rebased.rebase
+    assert tracker.quarantine_active
+    assert tracker.stamp_is_quarantined(
+        'RGB',
+        99_900_000_000,
+    )
+    assert tracker.stamp_is_quarantined(
+        'depth',
+        99_910_000_000,
+    )
+    assert not tracker.stamp_is_quarantined(
+        'RGB',
+        2_200_000_000,
+    )
+
+    delayed_old_pair = tracker.observe_pair(
+        99_900_000_000,
+        99_910_000_000,
+    )
+    assert not delayed_old_pair.accept_pair
+    assert delayed_old_pair.quarantined
+    assert delayed_old_pair.epoch == 1
+    assert delayed_old_pair.rgb_boundary_ns == 2_100_000_000
+
+    one_sided_old_packet = tracker.observe_pair(
+        99_920_000_000,
+        2_120_000_000,
+    )
+    assert one_sided_old_packet.quarantined
+
+    assert tracker.observe_pair(
+        2_200_000_000,
+        2_210_000_000,
+    ).accept_pair
+    assert tracker.quarantine_active
+    assert tracker.observe_pair(
+        2_300_000_000,
+        2_310_000_000,
+    ).accept_pair
+    assert not tracker.quarantine_active
+    assert not tracker.stamp_is_quarantined(
+        'RGB',
+        99_900_000_000,
+    )
+
+
+@pytest.mark.parametrize(
+    'kwargs',
+    [
+        {'rollback_threshold_sec': 0.0},
+        {'max_pair_skew_sec': 0.0},
+        {'confirmation_pairs': 1},
+        {'quarantine_pairs': 0},
+    ],
+)
+def test_source_epoch_tracker_rejects_unsafe_configuration(kwargs):
+    with pytest.raises(ValueError):
+        SourceTimestampEpochTracker(**kwargs)
+
+
+def _frame(stamp_ns, received_at, payload):
+    return TimestampedFrame(
+        stamp_ns=stamp_ns,
+        received_at=received_at,
+        payload=payload,
+    )
+
+
+def test_pair_selector_recovers_matching_frames_when_individual_latest_skew():
+    rgb_frames = [
+        _frame(1_000_000_000, 9.7, 'rgb-matched'),
+        _frame(1_300_000_000, 9.9, 'rgb-latest'),
+    ]
+    depth_frames = [
+        _frame(1_000_000_000, 9.8, 'depth-matched'),
+        _frame(1_150_000_000, 9.95, 'depth-latest'),
+    ]
+
+    pair = select_newest_synchronized_pair(
+        rgb_frames,
+        depth_frames,
+        max_skew_sec=0.1,
+        max_receipt_age_sec=1.0,
+        now=10.0,
+    )
+
+    assert pair is not None
+    assert pair.rgb.payload == 'rgb-matched'
+    assert pair.depth.payload == 'depth-matched'
+
+
+def test_pair_selector_uses_newest_common_time_then_smallest_skew():
+    rgb_frames = [
+        _frame(1_000_000_000, 9.6, 'rgb-old'),
+        _frame(1_200_000_000, 9.8, 'rgb-new'),
+    ]
+    depth_frames = [
+        _frame(1_010_000_000, 9.65, 'depth-old'),
+        _frame(1_190_000_000, 9.85, 'depth-new'),
+        _frame(1_200_000_000, 9.9, 'depth-new-exact'),
+    ]
+
+    pair = select_newest_synchronized_pair(
+        rgb_frames,
+        depth_frames,
+        max_skew_sec=0.1,
+        max_receipt_age_sec=1.0,
+        now=10.0,
+    )
+
+    assert pair is not None
+    assert pair.rgb.payload == 'rgb-new'
+    assert pair.depth.payload == 'depth-new-exact'
+
+
+def test_pair_selector_keeps_strict_skew_age_and_reset_boundaries():
+    exact_limit_pair = select_newest_synchronized_pair(
+        [_frame(1_000_000_000, 9.5, 'rgb')],
+        [_frame(1_100_000_000, 9.5, 'depth')],
+        max_skew_sec=0.1,
+        max_receipt_age_sec=1.0,
+        now=10.0,
+    )
+    assert exact_limit_pair is not None
+
+    assert select_newest_synchronized_pair(
+        [_frame(1_000_000_000, 9.5, 'rgb')],
+        [_frame(1_100_000_001, 9.5, 'depth')],
+        max_skew_sec=0.1,
+        max_receipt_age_sec=1.0,
+        now=10.0,
+    ) is None
+    assert select_newest_synchronized_pair(
+        [_frame(2_000_000_000, 8.9, 'stale-rgb')],
+        [_frame(2_000_000_000, 9.5, 'depth')],
+        max_skew_sec=0.1,
+        max_receipt_age_sec=1.0,
+        now=10.0,
+    ) is None
+    assert select_newest_synchronized_pair(
+        [_frame(3_000_000_000, 9.5, 'pre-reset-rgb')],
+        [_frame(3_000_000_000, 9.5, 'pre-reset-depth')],
+        max_skew_sec=0.1,
+        max_receipt_age_sec=1.0,
+        now=10.0,
+        rgb_after_ns=3_000_000_000,
+        depth_after_ns=3_000_000_000,
+    ) is None
+
+
+def test_receipt_freshness_recheck_uses_both_actual_callback_times():
+    assert frame_receipt_error(
+        rgb_received_at=9.0,
+        depth_received_at=9.2,
+        now=10.0,
+        max_receipt_age_sec=1.0,
+    ) is None
+    assert 'stale receipt' in frame_receipt_error(
+        rgb_received_at=8.999,
+        depth_received_at=9.9,
+        now=10.0,
+        max_receipt_age_sec=1.0,
+    )
+    assert 'moved backwards' in frame_receipt_error(
+        rgb_received_at=10.1,
+        depth_received_at=9.9,
+        now=10.0,
+        max_receipt_age_sec=1.0,
+    )
+
+
 def test_target_barrier_needs_three_strictly_increasing_frames_after_reset():
     barrier = TargetFrameBarrier(required_frames=3)
 
@@ -160,6 +545,49 @@ def test_target_barrier_needs_three_strictly_increasing_frames_after_reset():
 
     assert not barrier.ready('busbar')
     assert barrier.count('busbar') == 0
+
+
+def test_target_barrier_rejects_inflight_frames_from_previous_reset_generation():
+    barrier = TargetFrameBarrier(required_frames=3)
+    stale_generation = barrier.generation
+
+    assert not barrier.record(
+        'bolt',
+        10,
+        generation=stale_generation,
+    )
+    barrier.reset()
+
+    assert barrier.generation == stale_generation + 1
+    assert not barrier.record(
+        'bolt',
+        11,
+        generation=stale_generation,
+    )
+    assert barrier.count('bolt') == 0
+
+    current_generation = barrier.generation
+    assert not barrier.record(
+        'bolt',
+        20,
+        generation=current_generation,
+    )
+    assert not barrier.record(
+        'bolt',
+        20,
+        generation=current_generation,
+    )
+    assert barrier.count('bolt') == 1
+    assert not barrier.record(
+        'bolt',
+        21,
+        generation=current_generation,
+    )
+    assert barrier.record(
+        'bolt',
+        22,
+        generation=current_generation,
+    )
 
 
 def test_target_barrier_can_restart_one_label_only():
@@ -195,6 +623,121 @@ def test_center_selection_uses_confidence_floor_then_image_distance():
     selected = select_central_candidates(candidates, (100, 100), limit=1)
 
     assert [candidate['name'] for candidate in selected] == ['center']
+
+
+def _nut(name, pixel, world_point, score=0.8):
+    return {
+        'name': name,
+        'score': score,
+        'pixel': pixel,
+        'world_point': world_point,
+    }
+
+
+def test_single_target_initial_selection_is_central_after_confidence_floor():
+    candidates = [
+        _nut('outer-high', (10, 10), (0.0, 0.0, 0.1), score=0.99),
+        _nut('center', (51, 49), (0.1, 0.0, 0.1), score=0.60),
+        _nut('below-floor', (50, 50), (0.2, 0.0, 0.1), score=0.59),
+    ]
+
+    selected = select_sticky_single_target(candidates, (100, 100))
+
+    assert selected['name'] == 'center'
+
+
+def test_single_target_selection_stays_on_world_anchor():
+    gate = SingleTargetAssociationGate(max_distance_m=0.05)
+    associated, distance = gate.record((1.0, 2.0, 0.1))
+    assert associated
+    assert distance == 0.0
+
+    candidates = [
+        _nut('same-nut', (10, 10), (1.01, 2.0, 0.1), score=0.61),
+        _nut('other-central', (50, 50), (1.2, 2.0, 0.1), score=0.99),
+    ]
+    selected = select_sticky_single_target(
+        candidates,
+        (100, 100),
+        anchor_point=gate.anchor,
+        max_anchor_distance_m=gate.max_distance_m,
+    )
+    reversed_selected = select_sticky_single_target(
+        list(reversed(candidates)),
+        (100, 100),
+        anchor_point=gate.anchor,
+        max_anchor_distance_m=gate.max_distance_m,
+    )
+
+    assert selected['name'] == 'same-nut'
+    assert reversed_selected['name'] == 'same-nut'
+    associated, distance = gate.record(selected['world_point'])
+    assert associated
+    assert distance == pytest.approx(0.01)
+
+
+def test_single_target_requires_three_misses_before_reselection():
+    gate = SingleTargetAssociationGate(
+        max_distance_m=0.05,
+        miss_limit=3,
+    )
+    gate.record((1.0, 2.0, 0.1))
+    far_candidate = _nut(
+        'other-nut',
+        (50, 50),
+        (1.2, 2.0, 0.1),
+    )
+
+    assert select_sticky_single_target(
+        [far_candidate],
+        (100, 100),
+        anchor_point=gate.anchor,
+        max_anchor_distance_m=gate.max_distance_m,
+    ) is None
+    associated, distance = gate.record(far_candidate['world_point'])
+    assert not associated
+    assert distance == pytest.approx(0.2)
+    assert not gate.record_miss()
+    assert not gate.record_miss()
+    assert gate.active
+    assert gate.consecutive_misses == 2
+    assert gate.record_miss()
+    assert not gate.active
+
+    selected = select_sticky_single_target(
+        [far_candidate],
+        (100, 100),
+    )
+    assert selected['name'] == 'other-nut'
+    assert gate.record(selected['world_point']) == (True, 0.0)
+
+
+def test_single_target_return_resets_miss_run_and_reset_clears_anchor():
+    gate = SingleTargetAssociationGate(miss_limit=3)
+    gate.record((1.0, 2.0, 0.1))
+    assert not gate.record_miss()
+    assert gate.consecutive_misses == 1
+
+    associated, _distance = gate.record((1.01, 2.0, 0.1))
+    assert associated
+    assert gate.consecutive_misses == 0
+
+    gate.reset()
+    assert not gate.active
+    assert gate.anchor is None
+    assert gate.consecutive_misses == 0
+
+
+def test_single_target_selector_ignores_malformed_or_nonfinite_candidates():
+    candidates = [
+        _nut('nan-world', (50, 50), (float('nan'), 0.0, 0.1)),
+        _nut('bad-pixel', (50,), (0.0, 0.0, 0.1)),
+        _nut('valid', (60, 50), (0.0, 0.0, 0.1)),
+    ]
+
+    selected = select_sticky_single_target(candidates, (100, 100))
+
+    assert selected['name'] == 'valid'
 
 
 def _bolt(name, pixel, world_point, score=0.8):
@@ -381,6 +924,86 @@ def test_bolt_pair_association_reset_requires_a_new_anchor():
     _ordered, restarted, distance = gate.record(pair)
     assert not restarted
     assert distance == 0.0
+
+
+def test_first_bolt_anchor_has_no_station_prior_then_stays_world_sticky():
+    station_5 = (
+        (1.0552, -0.7312, 0.16),
+        (1.26352, -1.093646, 0.16),
+    )
+    candidates = [
+        _bolt('anchor_a', (70, 200), station_5[0]),
+        _bolt('anchor_b', (110, 200), station_5[1]),
+        _bolt('neighbour_a', (160, 200), (1.0552, -0.2047, 0.16)),
+        _bolt(
+            'neighbour_b',
+            (200, 200),
+            (1.26352, -0.567146, 0.16),
+        ),
+    ]
+
+    # With no station input, the first selection can only use camera center.
+    initial = select_central_bolt_pair(candidates, (400, 400))
+    sticky = select_central_bolt_pair(
+        candidates,
+        (400, 400),
+        anchor_pair=station_5,
+    )
+
+    assert [candidate['name'] for candidate in initial] == [
+        'neighbour_a',
+        'neighbour_b',
+    ]
+    assert [candidate['name'] for candidate in sticky] == [
+        'anchor_a',
+        'anchor_b',
+    ]
+
+
+def test_anchor_requires_consecutive_misses_before_reselection():
+    gate = BoltPairAssociationGate(
+        max_endpoint_distance_m=0.05,
+        miss_limit=3,
+    )
+    anchor = (
+        (1.0552, -0.7312, 0.16),
+        (1.26352, -1.093646, 0.16),
+    )
+    gate.record(anchor)
+
+    assert not gate.record_miss()
+    assert not gate.record_miss()
+    assert gate.active
+    assert gate.consecutive_misses == 2
+
+    # One good anchored frame cancels the transient-miss run.
+    gate.record(anchor)
+    assert gate.consecutive_misses == 0
+    assert not gate.record_miss()
+    assert not gate.record_miss()
+    assert gate.record_miss()
+    assert not gate.active
+
+
+def test_one_neighbour_pack_frame_does_not_restart_three_frame_barrier():
+    gate = BoltPairAssociationGate(miss_limit=3)
+    barrier = TargetFrameBarrier(required_frames=3)
+    anchor = (
+        (1.0552, -0.7312, 0.16),
+        (1.26352, -1.093646, 0.16),
+    )
+    gate.record(anchor)
+    assert not barrier.record('bolt', 10)
+    assert not barrier.record('bolt', 11)
+
+    # A frame containing only another pack is a sticky-anchor miss, not a
+    # target switch and not a barrier reset.
+    assert not gate.record_miss()
+    assert barrier.count('bolt') == 2
+
+    gate.record(anchor)
+    assert barrier.record('bolt', 13)
+    assert barrier.ready('bolt')
 
 
 def test_bolt_pair_ranks_ordered_bolt_2_before_midpoint_and_confidence():

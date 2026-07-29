@@ -99,6 +99,127 @@ def test_consistent_error_gets_one_signed_fixed_step(
     assert decision.hold_count == 0
     assert gate.waiting_for_settle
     assert gate.pending_correction_stamp_ns == 3
+    assert not decision.deferred
+
+
+def test_mixed_near_boundary_window_requires_a_second_fresh_window_before_move():
+    gate = FineAlignmentGate()
+
+    strict = _submit_window(gate, 1, [(-2, 0, 0)] * 3)
+    assert strict.aligned
+    assert strict.hold_count == 3
+
+    # This reproduces the live Hough-centre jitter: one centred sample plus
+    # two near-boundary samples.  It must neither become a success sample nor
+    # reset earned strict evidence or cause a blind 0.2 mm move.
+    first = _submit_window(
+        gate,
+        4,
+        [(-2, 0, 0), (-4, 0, 0), (-6, 0, 0)],
+    )
+    assert first.consensus
+    assert not first.aligned
+    assert first.deferred
+    assert first.correction_x_m == 0.0
+    assert first.correction_y_m == 0.0
+    assert first.hold_count == 3
+    assert not gate.waiting_for_settle
+
+    # The same signed error in a wholly new strict-frame window is now real
+    # enough to receive the original fixed correction.
+    confirmed = _submit_window(
+        gate,
+        7,
+        [(-2, 0, 0), (-4, 0, 0), (-6, 0, 0)],
+    )
+    assert not confirmed.deferred
+    assert confirmed.correction_y_m == pytest.approx(0.0002)
+    assert confirmed.hold_count == 0
+    assert gate.waiting_for_settle
+
+
+def test_one_mixed_near_boundary_window_does_not_falsely_advance_hold():
+    gate = FineAlignmentGate(hold_frames=6)
+
+    first_strict = _submit_window(gate, 1, [(0, 2, 0)] * 3)
+    assert first_strict.hold_count == 3
+    assert not first_strict.success
+
+    jitter = _submit_window(
+        gate,
+        4,
+        [(0, -2, 0), (0, -4, 0), (0, -6, 0)],
+    )
+    assert jitter.deferred
+    assert jitter.hold_count == 3
+    assert not jitter.success
+
+    final_strict = _submit_window(gate, 7, [(0, -2, 0)] * 3)
+    assert final_strict.aligned
+    assert final_strict.hold_count == 6
+    assert final_strict.success
+
+
+def test_one_near_boundary_outlier_counts_only_strict_frames_and_never_moves():
+    gate = FineAlignmentGate(hold_frames=8)
+
+    initial = _submit_window(gate, 1, [(-2, -2, 1.0)] * 3)
+    assert initial.aligned
+    assert initial.hold_count == 3
+
+    # One integer-Hough excursion outside ±2 px must not discard the five
+    # strict source stamps collected so far.  Repeating the same shape must
+    # still never turn that lone outlier into a blind 0.2 mm correction.
+    first_jitter = _submit_window(
+        gate,
+        4,
+        [(-2, -2, 1.0), (-3, -2, 1.6), (-2, -2, 0.0)],
+    )
+    assert first_jitter.deferred
+    assert not first_jitter.aligned
+    assert not first_jitter.success
+    assert first_jitter.hold_count == 5
+    assert first_jitter.correction_x_m == 0.0
+    assert first_jitter.correction_y_m == 0.0
+    assert not gate.waiting_for_settle
+
+    second_jitter = _submit_window(
+        gate,
+        7,
+        [(-2, -2, 0.5), (-3, -2, 1.0), (-2, -2, 1.6)],
+    )
+    assert second_jitter.deferred
+    assert not second_jitter.success
+    assert second_jitter.hold_count == 7
+    assert second_jitter.correction_x_m == 0.0
+    assert second_jitter.correction_y_m == 0.0
+    assert not gate.waiting_for_settle
+
+    # Completion is still emitted only by a wholly strict fresh window.
+    final_strict = _submit_window(gate, 10, [(-2, -2, 1.6)] * 3)
+    assert final_strict.aligned
+    assert final_strict.hold_count == 8
+    assert final_strict.success
+
+
+@pytest.mark.parametrize(
+    'observations',
+    [
+        # Two position excursions are not the narrow lone-outlier case.
+        [(-3, -2, 0.0), (-3, -2, 0.0), (-2, -2, 0.0)],
+        # A large position excursion is not Hough boundary quantization.
+        [(-2, -2, 0.0), (-7, -2, 0.0), (-2, -2, 0.0)],
+        # Angle violations retain the normal correction/reset policy.
+        [(-2, -2, 0.0), (-3, -2, 4.0), (-2, -2, 0.0)],
+    ],
+)
+def test_lone_outlier_exception_remains_narrow(observations):
+    gate = FineAlignmentGate()
+
+    decision = _submit_window(gate, 1, observations)
+
+    assert decision.hold_count == 0
+    assert not decision.success
 
 
 def test_only_one_nonzero_correction_is_available_before_settle_ack():
@@ -226,7 +347,7 @@ def test_duplicate_retrograde_and_zero_stamps_never_count():
 
 def test_frame_pair_gate_enforces_skew_age_and_strict_stream_order():
     gate = FreshFramePairGate(
-        max_skew_sec=0.1,
+        max_skew_sec=0.2,
         max_receipt_age_sec=1.0,
     )
 
@@ -252,7 +373,7 @@ def test_frame_pair_gate_enforces_skew_age_and_strict_stream_order():
 
     skewed, reason = gate.accept(
         rgb_stamp_ns=1_300_000_000,
-        depth_stamp_ns=1_100_000_000,
+        depth_stamp_ns=1_099_999_999,
         rgb_receipt_ns=5_200_000_000,
         depth_receipt_ns=5_150_000_000,
         now_receipt_ns=5_200_000_000,
@@ -335,6 +456,132 @@ def test_latest_cache_accepts_three_pairs_in_either_callback_order(
         assert pair.depth.payload == payloads['depth']
         assert pair.rgb.stamp_ns == stamp_ns
         assert pair.depth.stamp_ns == stamp_ns
+
+
+def test_history_recovers_match_hidden_by_newer_rgb_and_retains_future_frame():
+    synchronizer = LatestFramePairSynchronizer(history_size=5)
+    receipt_ns = 15_000_000_000
+
+    synchronizer.cache_rgb(
+        'rgb-match',
+        2_000_000_000,
+        receipt_ns,
+    )
+    pair, reason = synchronizer.try_accept(now_receipt_ns=receipt_ns)
+    assert pair is None
+    assert reason == 'depth unavailable'
+
+    synchronizer.cache_rgb(
+        'rgb-future',
+        2_300_000_000,
+        receipt_ns,
+    )
+    pair, reason = synchronizer.try_accept(now_receipt_ns=receipt_ns)
+    assert pair is None
+    assert reason == 'depth unavailable'
+
+    synchronizer.cache_depth(
+        'depth-match',
+        2_050_000_000,
+        receipt_ns,
+    )
+    pair, reason = synchronizer.try_accept(now_receipt_ns=receipt_ns)
+    assert reason == ''
+    assert pair.rgb.payload == 'rgb-match'
+    assert pair.depth.payload == 'depth-match'
+
+    synchronizer.cache_depth(
+        'depth-future',
+        2_310_000_000,
+        receipt_ns,
+    )
+    pair, reason = synchronizer.try_accept(now_receipt_ns=receipt_ns)
+    assert reason == ''
+    assert pair.rgb.payload == 'rgb-future'
+    assert pair.depth.payload == 'depth-future'
+
+
+def test_history_skips_stale_closest_pair_for_fresh_valid_pair():
+    synchronizer = LatestFramePairSynchronizer(
+        max_skew_sec=0.1,
+        max_receipt_age_sec=1.0,
+    )
+    now_ns = 50_000_000_000
+
+    synchronizer.cache_rgb(
+        'rgb-stale-closest',
+        3_000_000_000,
+        now_ns - 2_000_000_000,
+    )
+    synchronizer.cache_rgb(
+        'rgb-fresh',
+        3_080_000_000,
+        now_ns,
+    )
+    synchronizer.cache_depth(
+        'depth-fresh',
+        3_010_000_000,
+        now_ns,
+    )
+
+    pair, reason = synchronizer.try_accept(now_receipt_ns=now_ns)
+
+    assert reason == ''
+    assert pair.rgb.payload == 'rgb-fresh'
+    assert pair.depth.payload == 'depth-fresh'
+
+
+def test_history_size_is_bounded_and_evicts_oldest_distinct_stamp():
+    synchronizer = LatestFramePairSynchronizer(history_size=2)
+    receipt_ns = 18_000_000_000
+
+    synchronizer.cache_rgb('rgb-1', 1_000_000_000, receipt_ns)
+    synchronizer.cache_rgb('rgb-2', 2_000_000_000, receipt_ns)
+    synchronizer.cache_rgb('rgb-3', 3_000_000_000, receipt_ns)
+    synchronizer.cache_depth('depth-1', 1_000_000_000, receipt_ns)
+
+    evicted, reason = synchronizer.try_accept(now_receipt_ns=receipt_ns)
+    assert evicted is None
+    assert reason == 'RGB/depth skew'
+
+    synchronizer.cache_depth('depth-3', 3_000_000_000, receipt_ns)
+    pair, reason = synchronizer.try_accept(now_receipt_ns=receipt_ns)
+    assert reason == ''
+    assert pair.rgb.payload == 'rgb-3'
+    assert pair.depth.payload == 'depth-3'
+
+
+def test_ten_frame_backlog_retains_the_matching_counterpart():
+    """A callback backlog must not lose a strict source-stamp match."""
+    synchronizer = LatestFramePairSynchronizer(history_size=10)
+    receipt_ns = 25_000_000_000
+
+    # Ten RGB callbacks can run before their queued depth counterpart gets a
+    # turn.  The exact first RGB match remains in the configured history.
+    for index in range(10):
+        stamp_ns = 5_000_000_000 + index * 10_000_000
+        synchronizer.cache_rgb(
+            f'rgb-{index}',
+            stamp_ns,
+            receipt_ns,
+        )
+    synchronizer.cache_depth(
+        'depth-match',
+        5_000_000_000,
+        receipt_ns,
+    )
+
+    pair, reason = synchronizer.try_accept(now_receipt_ns=receipt_ns)
+
+    assert reason == ''
+    assert pair.rgb.payload == 'rgb-0'
+    assert pair.depth.payload == 'depth-match'
+
+
+@pytest.mark.parametrize('history_size', [0, -1, 1.5, True])
+def test_history_size_must_be_a_positive_integer(history_size):
+    with pytest.raises(ValueError, match='positive integer'):
+        LatestFramePairSynchronizer(history_size=history_size)
 
 
 def test_rejected_old_counterpart_is_retried_with_the_same_new_rgb():

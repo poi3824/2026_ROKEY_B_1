@@ -43,6 +43,12 @@ def test_approved_physical_defaults():
     assert config.position_release_tolerance == pytest.approx(0.025)
     assert config.yaw_tolerance == pytest.approx(0.03)
     assert config.yaw_capture_tolerance == pytest.approx(0.02)
+    assert config.turn_in_place_threshold == pytest.approx(
+        math.radians(5.0),
+    )
+    assert config.turn_in_place_release_threshold == pytest.approx(
+        math.radians(3.0),
+    )
     assert config.settle_steps == 12
     assert config.max_wheel_radps == pytest.approx(10.0)
 
@@ -56,6 +62,23 @@ def test_controller_has_no_timeout_or_workspace_policy():
         'lease_timeout_sec',
         'workspace_radius',
     })
+
+
+def test_unreached_goal_remains_active_through_many_controller_steps():
+    """A fixed distant pose must never synthesize a timeout/stuck failure."""
+    controller = GoToPoseController(_fast_config())
+    goal = Goal2D(100.0, 0.0, 0.0)
+    fixed_pose = PoseState(0.0, 0.0, 0.0)
+    controller.set_goal(goal, current_pose=fixed_pose)
+
+    for _ in range(100_000):
+        command = controller.compute(fixed_pose, 1.0 / 60.0)
+        assert command.phase == 'drive'
+        assert not command.arrived
+        assert controller.goal == goal
+
+    assert command.linear > 0.0
+    assert command.distance_error == pytest.approx(100.0)
 
 
 def test_angle_and_quaternion_round_trip():
@@ -156,6 +179,111 @@ def test_reverse_can_be_disabled_per_goal():
 
     assert command.travel_direction == 'forward'
     assert command.phase == 'turn_to_path'
+
+
+def test_station5_turn_to_path_hysteresis_survives_boundary_jitter():
+    """The measured 5-degree station-5 boundary must not reset acceleration."""
+    controller = GoToPoseController(ControllerConfig())
+    goal = Goal2D(0.6667, -1.1964, -1.5707)
+    start = PoseState(-0.9586, 1.9078, -math.pi / 2.0)
+    controller.set_goal(goal, current_pose=start)
+    bearing = math.atan2(goal.y - 1.858, goal.x - (-0.940))
+
+    def pose_with_heading_error(error_degrees):
+        return PoseState(
+            -0.940,
+            1.858,
+            normalize_angle(bearing - math.radians(error_degrees)),
+        )
+
+    entering = controller.compute(
+        pose_with_heading_error(5.05),
+        1.0 / 60.0,
+    )
+    entry_jitter = controller.compute(
+        pose_with_heading_error(4.95),
+        1.0 / 60.0,
+    )
+    above_release = controller.compute(
+        pose_with_heading_error(3.10),
+        1.0 / 60.0,
+    )
+    released = controller.compute(
+        pose_with_heading_error(2.90),
+        1.0 / 60.0,
+    )
+    drive_jitter = controller.compute(
+        pose_with_heading_error(4.95),
+        1.0 / 60.0,
+    )
+
+    assert [
+        entering.phase,
+        entry_jitter.phase,
+        above_release.phase,
+        released.phase,
+        drive_jitter.phase,
+    ] == [
+        'turn_to_path',
+        'turn_to_path',
+        'turn_to_path',
+        'drive',
+        'drive',
+    ]
+    assert all(
+        command.travel_direction == 'forward'
+        for command in (
+            entering,
+            entry_jitter,
+            above_release,
+            released,
+            drive_jitter,
+        )
+    )
+    assert released.linear == pytest.approx(0.35 / 60.0)
+    assert drive_jitter.linear == pytest.approx(2.0 * 0.35 / 60.0)
+
+
+def test_turn_to_path_latch_resets_on_stop_and_replacement_goal():
+    controller = GoToPoseController(_fast_config())
+    goal = Goal2D(1.0, 0.0, 0.0)
+
+    def pose_with_heading_error(error_degrees):
+        return PoseState(
+            0.0,
+            0.0,
+            -math.radians(error_degrees),
+        )
+
+    controller.set_goal(goal, current_pose=pose_with_heading_error(5.1))
+    assert controller.compute(
+        pose_with_heading_error(5.1),
+        0.1,
+    ).phase == 'turn_to_path'
+
+    controller.stop()
+    after_stop = controller.compute(
+        pose_with_heading_error(4.9),
+        0.1,
+    )
+    assert after_stop.phase == 'drive'
+
+    controller.compute(pose_with_heading_error(5.1), 0.1)
+    controller.set_goal(goal, current_pose=pose_with_heading_error(4.9))
+    after_replacement = controller.compute(
+        pose_with_heading_error(4.9),
+        0.1,
+    )
+    assert after_replacement.phase == 'drive'
+    assert controller.travel_direction == 'forward'
+
+
+def test_turn_to_path_release_threshold_must_be_below_entry_threshold():
+    with pytest.raises(ValueError, match='turn thresholds'):
+        GoToPoseController(ControllerConfig(
+            turn_in_place_threshold=math.radians(5.0),
+            turn_in_place_release_threshold=math.radians(5.0),
+        ))
 
 
 def test_chassis_velocity_is_bounded():

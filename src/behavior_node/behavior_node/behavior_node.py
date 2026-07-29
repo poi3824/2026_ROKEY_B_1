@@ -44,7 +44,8 @@ class ProcessState(Enum):
     MOVE_AMR_BATTERY_SCAN = auto()  # AMR을 배터리 스캔 접근 지점으로 이동
     SCAN_BATTERY = auto()           # 배터리 스캔 지점으로 이동
     MOVE_AMR_BUSBAR = auto()        # AMR을 버스바 접근 지점으로 이동
-    SCAN_BUSBAR = auto()            # 버스바 스캔 지점으로 이동
+    INITIALIZE_ARM = auto()          # 버스바 정차 후 초기 안전 관절 자세로 복귀
+    SCAN_BUSBAR = auto()            # 고정 버스바 카메라 pose latch
     PICK_BUSBAR = auto()            # 버스바 파지 및 상승
     MOVE_AMR_BATTERY_ASSEMBLY = auto()  # 파지 후 배터리 조립 지점 복귀
     MOVE_BATTERY_CENTER = auto()    # 배터리 중점 상공으로 이동
@@ -123,14 +124,14 @@ class BehaviorNode(Node):
         self.has_started = False
 
     def auto_start_trigger(self):
-        """타이머 취소 후 배터리 스캔 이동부터 테스트 시퀀스를 시작한다."""
+        """타이머 취소 후 버스바 접근 이동부터 테스트 시퀀스를 시작한다."""
         self.start_timer.cancel()
         if self._auto_start and not self.has_started:
             self.has_started = True
             self.get_logger().info(
                 "\n[Behavior] 전체 공정 시퀀스를 시작합니다. "
-                "(AMR 배터리 접근 지점 이동 시작)")
-            self.state = ProcessState.MOVE_AMR_BATTERY_SCAN
+                "(AMR 버스바 접근 지점으로 바로 이동 시작)")
+            self.state = ProcessState.MOVE_AMR_BUSBAR
 
     def _on_fleet_job(self, msg: FleetJob):
         """Fleet 작업 하나를 받아 해당 station의 전체 조립 FSM을 시작한다."""
@@ -153,10 +154,11 @@ class BehaviorNode(Node):
         self._amr_goal_sent = False
         self._waiting_amr_station = None
         self.is_waiting_action = False
-        self.state = ProcessState.MOVE_AMR_BATTERY_SCAN
+        self.state = ProcessState.MOVE_AMR_BUSBAR
         self.get_logger().info(
             f"SUB /fleet/job <- {msg.job_id} "
-            f"({msg.station_id}, {msg.job_type}); 전체 공정 시작")
+            f"({msg.station_id}, {msg.job_type}); "
+            "버스바 접근 지점으로 바로 이동")
 
     def _publish_fleet_report(
         self, job: FleetJob, success: bool, message: str
@@ -215,11 +217,26 @@ class BehaviorNode(Node):
                 next_state=ProcessState.MOVE_AMR_BUSBAR
             )
 
-        # [STEP 1] 버스바 스캔 지점으로 이동
-        elif self.state == ProcessState.SCAN_BUSBAR:
-            self.get_logger().info("\n>>> [STEP 1] 버스바 스캔 지점 이동 (SCAN_BUSBAR) 요청")
+        # 기본 공정은 초기 배터리 스캔 결과를 요청하지 않으므로 배터리 방문과
+        # SCAN_BATTERY/GetBoltPair를 건너뛴다. 버스바 정차 뒤에는 기존 RETURN_HOME
+        # task로 안전 관절 자세만 먼저 만든다.
+        elif self.state == ProcessState.INITIALIZE_ARM:
+            self.get_logger().info(
+                "\n>>> [STEP 0] 버스바 정차 후 초기 안전 자세 "
+                "(RETURN_HOME) 요청")
             self.send_arm_goal(
-                task_type="SCAN_BUSBAR",
+                task_type="RETURN_HOME",
+                next_state=ProcessState.SCAN_BUSBAR
+            )
+
+        # [STEP 1] 고정 버스바 카메라 좌표 latch
+        elif self.state == ProcessState.SCAN_BUSBAR:
+            self.get_logger().info(
+                "\n>>> [STEP 1] 고정 버스바 카메라 좌표 "
+                "latch (LATCH_BUSBAR) 요청"
+            )
+            self.send_arm_goal(
+                task_type="LATCH_BUSBAR",
                 next_state=ProcessState.PICK_BUSBAR
             )
 
@@ -380,7 +397,7 @@ class BehaviorNode(Node):
         if self.state == ProcessState.MOVE_AMR_BATTERY_SCAN:
             self.state = ProcessState.SCAN_BATTERY
         elif self.state == ProcessState.MOVE_AMR_BUSBAR:
-            self.state = ProcessState.SCAN_BUSBAR
+            self.state = ProcessState.INITIALIZE_ARM
         elif self.state == ProcessState.MOVE_AMR_BATTERY_ASSEMBLY:
             self.state = ProcessState.MOVE_BATTERY_CENTER
 
