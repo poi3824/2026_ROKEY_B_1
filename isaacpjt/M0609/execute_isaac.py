@@ -156,7 +156,7 @@ BATTERY_CENTER_Z     = 0.40   # 배터리 중점 이동 고도 (Z = 0.7m)
 
 # 버스바 체결 및 하강 제어 파라미터
 INSERT_SPEED            = 0.0005   # Step당 수직 하강 거리
-BUSBAR_RELEASE_Z        = 0.37     # 그리퍼 해제 및 체결 완료 임계 Z 높이
+BUSBAR_RELEASE_CLEARANCE = 0.005   # 목표 높이에서 5mm 이내에 도달해야 해제
 INSERT_TOLERANCE_STRICT = 0.001    # Insert 단계 오차 허용범위 (1mm)
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1132,7 +1132,6 @@ def main():
     ))
 
     busbar_xform = SingleXFormPrim(BUSBAR_POLYSHAPE_PATH, name="busbar_poly") if stage.GetPrimAtPath(BUSBAR_POLYSHAPE_PATH).IsValid() else None
-    init_busbar_pos, init_busbar_quat = busbar_xform.get_world_pose() if busbar_xform else (None, None)
 
     bolt_camera_xform = SingleXFormPrim(BOLT_CAMERA_PATH, name="bolt_camera") if stage.GetPrimAtPath(BOLT_CAMERA_PATH).IsValid() else None
     bolt_camera_init_pos, bolt_camera_init_quat = bolt_camera_xform.get_world_pose() if bolt_camera_xform else (None, None)
@@ -1141,8 +1140,6 @@ def main():
 
     nut1_xform = SingleXFormPrim(NUT1_POLYSHAPE_PATH, name="nut1_poly") if stage.GetPrimAtPath(NUT1_POLYSHAPE_PATH).IsValid() else None
     nut2_xform = SingleXFormPrim(NUT2_POLYSHAPE_PATH, name="nut2_poly") if stage.GetPrimAtPath(NUT2_POLYSHAPE_PATH).IsValid() else None
-    init_nut1_pos, init_nut1_quat = nut1_xform.get_world_pose() if nut1_xform else (None, None)
-    init_nut2_pos, init_nut2_quat = nut2_xform.get_world_pose() if nut2_xform else (None, None)
 
     # 진단용: NUT1/2_POLYSHAPE_PATH에 실제 RigidBodyAPI가 있는지, 아니면 조상 프림에
     # 있는지 확인 - 다르면 조인트 Body1 대상을 재검토해야 한다.
@@ -1161,9 +1158,6 @@ def main():
     extra_nut_xforms = [
         SingleXFormPrim(p, name=f"extra_nut_poly_{i}") if stage.GetPrimAtPath(p).IsValid() else None
         for i, p in enumerate(EXTRA_NUT_POLYSHAPE_PATHS)
-    ]
-    extra_nut_inits = [
-        (xf.get_world_pose() if xf else (None, None)) for xf in extra_nut_xforms
     ]
 
     ee_path = find_prim_path(stage, M0609_PATH, EE_LINK_NAME)
@@ -1212,10 +1206,6 @@ def main():
     print(
         f"[Isaac Sim] HMI bridge version: {ISAAC_HMI_BRIDGE_VERSION} "
         f"(AMR drive={AMR_DRIVE_MODE}, prim={NOVA_CARTER_ROOT})")
-
-    # HMI 완전 초기화에서 물리 상태를 강제로 되돌리기 위한 실제 시작 상태.
-    init_robot_pos, init_robot_quat = amr_xform.get_world_pose()
-    init_robot_joints = robot.get_joint_positions().copy()
 
     # battery4_main의 검증된 너트 운반 방식: PICK 전에는 물리를 끄고 AMR 기준 로컬
     # 오프셋으로 매 프레임 포즈를 갱신한다. PICK 명령을 받은 너트만 이 glue에서 풀고
@@ -1276,6 +1266,7 @@ def main():
     busbar_grasped = False  # 그리퍼-버스바 FixedJoint가 걸려있는 상태인지
     descend_target_z = None
     target_mid_pos = None
+    target_fine_yaw = 0.0
     scan_hold_quat = None  # INIT_POSE 완료 시점의 실제 EE 자세 (SCAN_APPROACH가 그대로 유지)
 
     # ── 너트 조립(Nut Assembly) 상태 변수 ──
@@ -1347,6 +1338,7 @@ def main():
             nut_release_timer = 0
             descend_target_z = None
             target_mid_pos = None
+            target_fine_yaw = 0.0
             amr_moving = False
             amr_target_xy_theta = None
             busbar_grasped = False
@@ -1359,7 +1351,7 @@ def main():
             # Isaac Sim 5.1의 네이티브 OmniGraph 플러그인이 충돌한다. HMI reset은
             # ROS/FSM 명령 상태만 비우는 안전한 소프트 초기화로 제한한다. 월드의
             # 물리 상태까지 시작 스냅샷으로 돌려야 할 때는 Isaac 프로세스를 재시작한다.
-            was_playing = False
+            was_playing = world.is_playing()
             publish_progress("IDLE", 0.0)
             publish_status("IDLE")
             print("\n[SYSTEM RESET] 명령·FSM 상태 소프트 초기화 (월드 상태 유지)")
@@ -1404,41 +1396,11 @@ def main():
             publish_progress(phase, 0.0)
             emergency_applied = False
 
-        # 1. Play / Stop 상태 보정
+        # 1. Play 재개 시 제어 루프의 임시 카운터만 정리한다. RTX 카메라와
+        # SyntheticData 그래프가 활성화된 뒤 world.reset(), stage prim 삭제,
+        # rigid-body API 변경, 부품 순간이동을 수행하면 OmniGraph 네이티브
+        # 플러그인이 충돌할 수 있으므로 월드 상태는 건드리지 않는다.
         if playing and not was_playing:
-            world.reset()
-            enable_physics_recursively(stage, BUSBAR_ROOT_PATH)
-            detach_busbar_from_gripper(stage)
-            busbar_grasped = False
-            if bolt_camera_xform and bolt_camera_init_pos is not None:
-                bolt_camera_xform.set_world_pose(position=bolt_camera_init_pos, orientation=bolt_camera_init_quat)
-            if busbar_xform and init_busbar_pos is not None:
-                busbar_xform.set_world_pose(position=init_busbar_pos, orientation=init_busbar_quat)
-            if nut1_xform and init_nut1_pos is not None:
-                nut1_xform.set_world_pose(position=init_nut1_pos, orientation=init_nut1_quat)
-            if nut2_xform and init_nut2_pos is not None:
-                nut2_xform.set_world_pose(position=init_nut2_pos, orientation=init_nut2_quat)
-            for extra_xf, (extra_pos, extra_quat), extra_root, extra_poly in zip(
-                extra_nut_xforms, extra_nut_inits, EXTRA_NUT_ROOT_PATHS, EXTRA_NUT_POLYSHAPE_PATHS
-            ):
-                if extra_xf and extra_pos is not None:
-                    extra_xf.set_world_pose(position=extra_pos, orientation=extra_quat)
-
-            # battery4_main과 동일하게 재생 재시작 시 모든 너트를 kinematic glue 상태로
-            # 되돌리고 현재 AMR 포즈 기준 로컬 오프셋을 다시 계산한다.
-            amr_glue_pos, amr_glue_quat = robot.get_world_pose()
-            nut_released = [False] * len(nut_xforms_all)
-            for i, (nut_xf, nut_root) in enumerate(zip(nut_xforms_all, nut_roots_all)):
-                if nut_xf is None:
-                    nut_local_offsets[i] = None
-                    continue
-                remove_nut_amr_joint(stage, nut_root)
-                disable_physics_recursively(stage, nut_root)
-                nut_pos, nut_quat = nut_xf.get_world_pose()
-                nut_local_offsets[i] = compute_local_offset(
-                    amr_glue_pos, amr_glue_quat, nut_pos, nut_quat
-                )
-
             step_count = 0
             grasp_timer = 0
             nut_release_timer = 0
@@ -1684,6 +1646,7 @@ def main():
                 
                 cur_ee = world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation()
                 target_fine_pos = np.array([cur_ee[0], cur_ee[1], BATTERY_CENTER_Z])
+                target_fine_yaw = 0.0
                 phase = "FINE_ALIGNMENT"
                 step_count = 0
 
@@ -2033,9 +1996,18 @@ def main():
                         target_fine_pos[0] += offset.x
                         target_fine_pos[1] += offset.y
                         target_fine_pos[2] = BATTERY_CENTER_Z
+                        orientation = isaac_node.latest_target_pose.pose.orientation
+                        yaw_step = 2.0 * math.atan2(
+                            orientation.z, orientation.w)
+                        target_fine_yaw += yaw_step
                         
                         print(f"\n[FINE_ALIGNMENT] Vision Offset Received -> dx: {offset.x:+.4f}m, dy: {offset.y:+.4f}m")
-                        print(f"               └─ New Target Pos -> X: {target_fine_pos[0]:.4f}, Y: {target_fine_pos[1]:.4f}, Z: {target_fine_pos[2]:.4f}")
+                        print(
+                            f"               └─ New Target Pos -> "
+                            f"X: {target_fine_pos[0]:.4f}, "
+                            f"Y: {target_fine_pos[1]:.4f}, "
+                            f"Z: {target_fine_pos[2]:.4f}, "
+                            f"Yaw: {math.degrees(target_fine_yaw):+.3f}deg")
 
                     isaac_node.latest_target_pose = None
 
@@ -2047,7 +2019,8 @@ def main():
 
                 actions = arm_controller.forward(
                     target_end_effector_position=target_fine_pos,
-                    target_end_effector_orientation=euler_to_quaternion_wxyz(0.0, 3.1415, 0.0)
+                    target_end_effector_orientation=euler_to_quaternion_wxyz(
+                        0.0, 3.1415, target_fine_yaw)
                 )
                 robot.apply_action(actions)
 
@@ -2068,7 +2041,8 @@ def main():
 
                 actions = arm_controller.forward(
                     target_end_effector_position=step_target_pos,
-                    target_end_effector_orientation=euler_to_quaternion_wxyz(0.0, 3.1415, 0.0)
+                    target_end_effector_orientation=euler_to_quaternion_wxyz(
+                        0.0, 3.1415, target_fine_yaw)
                 )
                 robot.apply_action(actions)
                 robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_CLOSE))
@@ -2076,7 +2050,8 @@ def main():
                 cur_pos = world_xf(stage, f"{M0609_PATH}/{EE_LINK_NAME}").ExtractTranslation()
                 dist_err = math.dist(cur_pos, tuple(target_mid_pos))
 
-                if cur_pos[2] <= BUSBAR_RELEASE_Z or dist_err < INSERT_TOLERANCE_STRICT:
+                release_z = target_mid_pos[2] + BUSBAR_RELEASE_CLEARANCE
+                if cur_pos[2] <= release_z or dist_err < INSERT_TOLERANCE_STRICT:
                     # 실제 물리 그립 상태라 여기서 busbar 위치를 강제로 순간이동(snap)
                     # 시키면 안 된다 - 그리퍼가 여전히 물고 있는 채로 물체만 텔레포트하면
                     # 다음 physics step에서 손가락과 겹침이 발생해 튕겨나갈 수 있다.
@@ -2099,7 +2074,8 @@ def main():
                 retract_pos = np.array([target_mid_pos[0], target_mid_pos[1], BATTERY_CENTER_Z])
                 actions = arm_controller.forward(
                     target_end_effector_position=retract_pos,
-                    target_end_effector_orientation=euler_to_quaternion_wxyz(0.0, 3.1415, 0.0)
+                    target_end_effector_orientation=euler_to_quaternion_wxyz(
+                        0.0, 3.1415, target_fine_yaw)
                 )
                 robot.apply_action(actions)
                 robot.gripper.apply_action(ArticulationAction(joint_positions=GRIPPER_OPEN))

@@ -12,7 +12,7 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile
 from sensor_msgs.msg import Image
 from geometry_msgs.msg import PoseStamped
-from std_msgs.msg import Bool, String
+from std_msgs.msg import Bool, Empty, String
 from cv_bridge import CvBridge
 
 
@@ -41,6 +41,8 @@ class BatteryAssemblyVisionNode(Node):
         self.sub_emergency_stop = self.create_subscription(
             Bool, '/emergency_stop', self.emergency_stop_callback,
             emergency_qos)
+        self.sub_system_reset = self.create_subscription(
+            Empty, '/system/reset', self.system_reset_callback, 10)
 
         # Isaac Sim 목표 포즈 퍼블리셔 및 보정 완료 상태 퍼블리셔
         self.pub_target_pose = self.create_publisher(PoseStamped, '/target_pose', 10)
@@ -138,6 +140,13 @@ class BatteryAssemblyVisionNode(Node):
             self.hold_count = 0
             self.get_logger().error("비상정지 활성화: 오차 보정을 중단합니다")
         self.publish_alignment_error()
+
+    def system_reset_callback(self, _msg: Empty):
+        """제어 상태 초기화 후 이전 정렬 보정 명령이 계속 발행되지 않게 한다."""
+        self.is_active = False
+        self.reset_alignment_tracking()
+        self.publish_alignment_error()
+        self.get_logger().warning("시스템 제어 상태 초기화: 정렬 추적 중단")
 
     def publish_alignment_error(self):
         """최근 유효 정렬 오차와 추적 상태를 운영 HMI에 공개한다."""

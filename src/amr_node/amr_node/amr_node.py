@@ -221,7 +221,13 @@ class AmrNode(Node):
             self._clear_active_goal('비상정지')
 
     def _on_system_reset(self, _msg: Empty):
-        self._clear_active_goal('시스템 완전 초기화')
+        station_id = self._goal_station_id
+        self._clear_active_goal('시스템 제어 상태 초기화')
+        self._publish_status(
+            AmrStatus.STATE_IDLE,
+            station_id,
+            '시스템 제어 상태 초기화',
+        )
 
     def _finish(self, state: int, message: str):
         if not self._moving:
