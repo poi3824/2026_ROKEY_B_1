@@ -2,6 +2,8 @@
 import sys
 import math
 import json
+from collections import deque
+
 import cv2
 import numpy as np
 
@@ -49,8 +51,12 @@ class BatteryAssemblyVisionNode(Node):
         # ----------------------------------------------------------------------
         # 제어 및 오차 보정 파라미터
         # ----------------------------------------------------------------------
-        self.TOLERANCE_DEG = 3        # 목표 각도 정밀도: 0.5도 이하
+        self.TOLERANCE_DEG = 1.0
+        self.PIXEL_TOLERANCE = 1
         self.MAX_VALID_PIXEL_ERR = 400  # 이상치 픽셀 오차 스킵 가드
+        self.MAX_HOLE_JUMP_PX = 25.0
+        self.MAX_ANGLE_JUMP_DEG = 8.0
+        self.FILTER_WINDOW = 7
 
         # 최신 Depth 프레임 및 상태 변수
         self.current_depth_frame = None
@@ -75,6 +81,10 @@ class BatteryAssemblyVisionNode(Node):
         self.last_valid_dtheta = 0.0
         self.has_valid_tracking = False
         self.emergency_stopped = False
+        self.tracked_hole = None
+        self.dx_history = deque(maxlen=self.FILTER_WINDOW)
+        self.dy_history = deque(maxlen=self.FILTER_WINDOW)
+        self.dtheta_history = deque(maxlen=self.FILTER_WINDOW)
 
         # 연속 30 Step 유지 카운터
         self.hold_count = 0
@@ -83,6 +93,20 @@ class BatteryAssemblyVisionNode(Node):
         self.create_timer(0.1, self.control_loop)
 
         self.get_logger().info("🚀 [Vision Node] 실행 완료. 고정 볼트 탐색을 시작합니다 (트리거 대기 중...)")
+
+    def reset_alignment_tracking(self):
+        """스테이션/작업 변경 시 이전 프레임의 추적 상태를 완전히 비운다."""
+        self.tracked_hole = None
+        self.busbar_hole_coords = []
+        self.busbar_hole_depths = []
+        self.dx_history.clear()
+        self.dy_history.clear()
+        self.dtheta_history.clear()
+        self.has_valid_tracking = False
+        self.last_valid_dx_px = 0
+        self.last_valid_dy_px = 0
+        self.last_valid_dtheta = 0.0
+        self.hold_count = 0
 
     def task_command_callback(self, msg: String):
         """외부(Behavior / Isaac Sim)로부터 오차 보정 시작 명령 수신"""
@@ -93,8 +117,8 @@ class BatteryAssemblyVisionNode(Node):
                     "비상정지 상태이므로 오차 보정 시작 명령을 무시합니다")
                 return
             self.get_logger().info(f"\n>>> [Vision Correction] 오차 보정 시작 신호 수신 ({cmd})!")
+            self.reset_alignment_tracking()
             self.is_active = True
-            self.hold_count = 0  # 새로 시작 시 연속 카운터 초기화
         elif cmd == "RESET_BOLT_DETECTION":
             # bolt_camera가 다른 스테이션 좌표로 순간이동한 직후 호출된다. bolts_detected는
             # 노드 켜진 뒤 딱 한 번만 True가 되고 그 뒤로는 절대 다시 검출을 안 하므로(다음
@@ -103,8 +127,7 @@ class BatteryAssemblyVisionNode(Node):
             self.is_active = False
             self.bolts_detected = False
             self.fixed_bolt_coords = []
-            self.has_valid_tracking = False
-            self.hold_count = 0
+            self.reset_alignment_tracking()
             self._roi_logged = False
             self.get_logger().info(">>> [Vision Node] 카메라 이동 감지 -> 고정 볼트 위치 재탐색 시작")
 
@@ -202,10 +225,23 @@ class BatteryAssemblyVisionNode(Node):
                 if abs(dx_px) > self.MAX_VALID_PIXEL_ERR or abs(dy_px) > self.MAX_VALID_PIXEL_ERR:
                     self.get_logger().warn(f"⚠️ [비전 노이즈 차단] 비정상적 픽셀 오차 감지! dx:{dx_px}, dy:{dy_px} -> 프레임 스킵")
                     self.has_valid_tracking = False
+                elif (
+                    self.dtheta_history
+                    and abs(angle_error - float(np.median(self.dtheta_history)))
+                    > self.MAX_ANGLE_JUMP_DEG
+                ):
+                    self.get_logger().warn(
+                        f"⚠️ [각도 급변 차단] dTheta:{angle_error:+.2f}deg -> 프레임 스킵",
+                        throttle_duration_sec=1.0,
+                    )
+                    self.has_valid_tracking = False
                 else:
-                    self.last_valid_dx_px = dx_px
-                    self.last_valid_dy_px = dy_px
-                    self.last_valid_dtheta = angle_error
+                    self.dx_history.append(dx_px)
+                    self.dy_history.append(dy_px)
+                    self.dtheta_history.append(angle_error)
+                    self.last_valid_dx_px = int(round(np.median(self.dx_history)))
+                    self.last_valid_dy_px = int(round(np.median(self.dy_history)))
+                    self.last_valid_dtheta = float(np.median(self.dtheta_history))
                     self.has_valid_tracking = True
 
                     cv2.circle(display_img, (hx, hy), 5, (0, 0, 255), -1)
@@ -213,9 +249,18 @@ class BatteryAssemblyVisionNode(Node):
                     cv2.putText(display_img, f"E:({dx_px},{dy_px}) Z:{hole_depth:.2f}", (hx + 8, hy - 8),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 255), 1)
 
-                    status_line = f"dx:{dx_px:+2d}px, dy:{dy_px:+2d}px, dTheta:{angle_error:+.2f}deg [{self.hold_count}/30]"
+                    status_line = (
+                        f"raw=({dx_px:+d},{dy_px:+d},{angle_error:+.2f}) "
+                        f"filtered=({self.last_valid_dx_px:+d},"
+                        f"{self.last_valid_dy_px:+d},"
+                        f"{self.last_valid_dtheta:+.2f}) "
+                        f"[{self.hold_count}/30]"
+                    )
                     sys.stdout.write(f"\r\033[K[Tracking Status] {status_line}")
                     sys.stdout.flush()
+            else:
+                self.has_valid_tracking = False
+                self.hold_count = 0
 
         cv2.imshow("Battery Assembly Vision - RGB Tracking", display_img)
         cv2.waitKey(1)
@@ -228,18 +273,22 @@ class BatteryAssemblyVisionNode(Node):
         if not self.is_active or not self.bolts_detected or not self.has_valid_tracking:
             return
 
-        bx, by = self.fixed_bolt_coords[0]
-        hx, hy = self.busbar_hole_coords[0] if len(self.busbar_hole_coords) > 0 else (bx, by)
+        dx_px = self.last_valid_dx_px
+        dy_px = self.last_valid_dy_px
         dtheta = self.last_valid_dtheta
 
-        # 🎯 [수렴 조건] 픽셀 오차가 0 (hx == bx, hy == by) & 각도 0.5도 이하
-        if hx == bx and hy == by and abs(dtheta) <= self.TOLERANCE_DEG:
+        if (
+            abs(dx_px) <= self.PIXEL_TOLERANCE
+            and abs(dy_px) <= self.PIXEL_TOLERANCE
+            and abs(dtheta) <= self.TOLERANCE_DEG
+        ):
             self.hold_count += 1
             
             # 연속 30 Step(약 3초) 달성 시 완수 신호 퍼블리시 및 종료
             if self.hold_count >= 30:
                 self.get_logger().info(f"\n==========================================")
-                self.get_logger().info(f" ★ [정밀 정렬 완료] 픽셀 완전 일치(0px 오차) 30 Step 유지 달성")
+                self.get_logger().info(
+                    " ★ [정밀 정렬 완료] ±1px / ±1deg 범위 30 Step 유지 달성")
                 self.get_logger().info(f"==========================================")
                 
                 msg = String()
@@ -254,25 +303,25 @@ class BatteryAssemblyVisionNode(Node):
         FIXED_STEP = 0.0002  # 0.1mm (0.0001m) 고정 스텝
 
         # --- dx (위/아래) 설정 ---
-        if hy < by:          # 구멍이 위에 있음
+        if dy_px < -self.PIXEL_TOLERANCE:  # 구멍이 위에 있음
             step_x = +FIXED_STEP
-        elif hy > by:        # 구멍이 아래쪽에 있음
+        elif dy_px > self.PIXEL_TOLERANCE:  # 구멍이 아래쪽에 있음
             step_x = -FIXED_STEP
         else:
             step_x = 0.0
 
         # --- dy (왼쪽/오른쪽) 설정 ---
-        if hx < bx:          # 구멍이 오른쪽에 있음 (로봇 관점 dy 설정)
+        if dx_px < -self.PIXEL_TOLERANCE:
             step_y = +FIXED_STEP
-        elif hx > bx:        # 구멍이 왼쪽에 있음
+        elif dx_px > self.PIXEL_TOLERANCE:
             step_y = -FIXED_STEP
         else:
             step_y = 0.0
 
         # --- 각도 보정 ---
-        if dtheta > 0:
+        if dtheta > self.TOLERANCE_DEG:
             step_dtheta = -0.01
-        elif dtheta < 0:
+        elif dtheta < -self.TOLERANCE_DEG:
             step_dtheta = 0.01
         else:
             step_dtheta = 0.0
@@ -469,9 +518,34 @@ class BatteryAssemblyVisionNode(Node):
                     val = float(depth_img_resized[cy, cx])
                     detected_holes.append((cx, cy, val))
 
-        detected_holes.sort(key=lambda item: item[0])
-        self.busbar_hole_coords = [(h[0], h[1]) for h in detected_holes]
-        self.busbar_hole_depths = [h[2] for h in detected_holes]
+        if not detected_holes:
+            self.busbar_hole_coords = []
+            self.busbar_hole_depths = []
+            return
+
+        if self.tracked_hole is not None:
+            tx, ty = self.tracked_hole
+            selected = min(
+                detected_holes,
+                key=lambda hole: math.hypot(hole[0] - tx, hole[1] - ty),
+            )
+            jump = math.hypot(selected[0] - tx, selected[1] - ty)
+            if jump > self.MAX_HOLE_JUMP_PX:
+                self.busbar_hole_coords = []
+                self.busbar_hole_depths = []
+                return
+        elif self.fixed_bolt_coords:
+            bx, by = self.fixed_bolt_coords[0]
+            selected = min(
+                detected_holes,
+                key=lambda hole: math.hypot(hole[0] - bx, hole[1] - by),
+            )
+        else:
+            selected = min(detected_holes, key=lambda hole: hole[0])
+
+        self.tracked_hole = (selected[0], selected[1])
+        self.busbar_hole_coords = [self.tracked_hole]
+        self.busbar_hole_depths = [selected[2]]
 
     def draw_extended_line(self, img, line_data, color, thickness=2, label=""):
         if line_data is None:
