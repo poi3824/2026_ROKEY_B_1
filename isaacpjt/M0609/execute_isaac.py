@@ -1354,11 +1354,14 @@ def main():
             resume_waiting = False
             active_task = None
             current_station = 1
-            world.stop()
-            world.reset()
+            # RTX 카메라와 ROS OmniGraph가 실행 중인 상태에서 world.stop() 뒤
+            # world.reset()을 호출하면 SyntheticData 그래프가 종료/재초기화되는
+            # 과정에서 네이티브 플러그인이 충돌할 수 있다. 타임라인은 유지한 채
+            # 물리 진행만 잠시 멈추고, 아래의 시작 스냅샷을 직접 복원한다.
+            world.pause()
 
-            # world.reset()만으로는 작업 도중 직접 이동시킨 articulation/부품 pose와
-            # FixedJoint가 그대로 남을 수 있어 시작 스냅샷으로 명시적으로 복원한다.
+            # 작업 도중 직접 이동시킨 articulation/부품 pose와 FixedJoint를
+            # 시작 스냅샷으로 명시적으로 복원한다.
             detach_busbar_from_gripper(stage)
             detach_nut_from_gripper(stage, NUT1_POLYSHAPE_PATH)
             detach_nut_from_gripper(stage, NUT2_POLYSHAPE_PATH)
