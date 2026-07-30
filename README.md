@@ -1,6 +1,6 @@
 <!--
   Demo asset guide
-  - 전체 HMI 시연 영상: assets/demo/202607291149.mp4
+  - 전체 모니터링 대시보드 시연 영상: assets/demo/202607291149.mp4
   - README 미리보기 GIF: assets/gifs/hmi_full_demo.gif
 
   두 파일을 추가한 뒤 아래 Demo 섹션의 주석을 해제하면
@@ -13,7 +13,7 @@
 
 ### Vision · AMR · 협동로봇 기반 EV 배터리 버스바 조립 자동화
 
-**Isaac Sim + ROS 2 Humble + Nova Carter + Doosan M0609 + RGB-D Vision + HMI**
+**Isaac Sim + ROS 2 Humble + Nova Carter + Doosan M0609 + RGB-D Vision + Web Dashboard**
 
 ![Ubuntu](https://img.shields.io/badge/Ubuntu-22.04-E95420?style=flat-square&logo=ubuntu&logoColor=white)
 ![ROS2](https://img.shields.io/badge/ROS_2-Humble-22314E?style=flat-square&logo=ros)
@@ -28,12 +28,13 @@
 
 ## Demo
 
-본 README는 **HMI 상태 연동 인터페이스가 포함된**
-[`isaacpjt/M0609/execute_isaac.py`](./isaacpjt/M0609/execute_isaac.py)를
-기준 실행 파일로 설명합니다.
+이 프로젝트의 전체 공정은 [`isaacpjt/M0609/execute_isaac.py`](./isaacpjt/M0609/execute_isaac.py)
+하나로 Isaac Sim에서 실행됩니다. 이 파일이 AMR 이동, 로봇팔 조립, 비전 정렬을
+모두 제어하며, 진행 상태를 `/isaac_phase`, `/isaac_progress`, `/isaac_status`
+토픽으로 발행해 외부 모니터링 웹 대시보드가 구독할 수 있게 합니다.
 
 <!--
-[![HMI 통합 전체 공정 시연](./assets/gifs/hmi_full_demo.gif)](./assets/demo/202607291149.mp4)
+[![모니터링 대시보드 통합 전체 공정 시연](./assets/gifs/hmi_full_demo.gif)](./assets/demo/202607291149.mp4)
 
 GIF를 클릭하면 원본 시연 영상이 재생됩니다.
 -->
@@ -41,7 +42,7 @@ GIF를 클릭하면 원본 시연 영상이 재생됩니다.
 시연 영상에서 확인할 수 있는 전체 흐름은 다음과 같습니다.
 
 ```text
-HMI/FMS 작업 시작
+대시보드/FMS 작업 시작
 → AMR 배터리 스캔 위치 이동
 → 볼트 2개 및 버스바 검출
 → 버스바 파지
@@ -50,12 +51,12 @@ HMI/FMS 작업 시작
 → 버스바 안착
 → 너트 1·2 파지 및 래칫 체결
 → 원점 복귀
-→ HMI 완료 상태 표시
+→ 대시보드 완료 상태 표시
 ```
 
-> 현재 저장소에는 시연 영상과 HMI UI 패키지가 포함되어 있지 않습니다.
+> 현재 저장소에는 시연 영상과 모니터링 웹 대시보드 패키지가 포함되어 있지 않습니다.
 > 위 주석에 적힌 경로로 영상/GIF를 추가하면 README 최상단에서 바로 재생할 수
-> 있습니다. 이 저장소에 포함된 HMI 연동 범위는 `/isaac_phase`,
+> 있습니다. 이 저장소에 포함된 대시보드 연동 범위는 `/isaac_phase`,
 > `/isaac_progress`, `/isaac_status`를 이용한 공정 상태 전달입니다.
 
 ---
@@ -73,10 +74,10 @@ Nova Carter AMR 위에 탑재된 Doosan M0609 협동로봇이 배터리 작업 �
 3. 2-Finger Gripper로 버스바를 파지해 두 볼트의 중심에 배치합니다.
 4. 별도 보정 카메라로 볼트와 버스바 구멍의 픽셀·각도 오차를 반복 보정합니다.
 5. 너트 2개를 순서대로 파지하고 회전·하강·재파지하는 래칫 동작으로 체결합니다.
-6. 공정 단계, 진행률, 성공/실패 상태를 ROS 2 토픽으로 HMI에 전달합니다.
+6. 공정 단계, 진행률, 성공/실패 상태를 ROS 2 토픽으로 모니터링 웹 대시보드에 전달합니다.
 
 ```text
-RGB-D Vision → 3D Pose → FMS/FSM → AMR 이동 → M0609 조립 → HMI 모니터링
+RGB-D Vision → 3D Pose → FMS/FSM → AMR 이동 → M0609 조립 → 웹 대시보드 모니터링
 ```
 
 ### Core Goal
@@ -85,7 +86,7 @@ RGB-D Vision → 3D Pose → FMS/FSM → AMR 이동 → M0609 조립 → HMI 모
 > Isaac Sim에서 검증한다.”
 
 단순한 로봇 모션 데모가 아니라, **Vision 결과가 실제 조립 FSM과 연결되고 작업
-결과가 다시 FMS/HMI로 보고되는 End-to-End 자동화 파이프라인**을 목표로 합니다.
+결과가 다시 FMS/대시보드로 보고되는 End-to-End 자동화 파이프라인**을 목표로 합니다.
 
 ---
 
@@ -110,7 +111,7 @@ RGB-D Vision → 3D Pose → FMS/FSM → AMR 이동 → M0609 조립 → HMI 모
 
 ```mermaid
 flowchart TB
-    H["External HMI<br/>phase · progress · status"]
+    H["Monitoring Web Dashboard<br/>phase · progress · status"]
     F["FMS Layer<br/>fleet_manager_node"]
     B["Behavior Layer<br/>behavior_node FSM"]
     E["Execution Layer<br/>amr_node · arm_node"]
@@ -127,7 +128,7 @@ flowchart TB
 
 | Layer | Component | Role |
 |---|---|---|
-| HMI | 외부 HMI / ROS bridge | 공정 단계, 진행률, 성공·실패 상태 표시 |
+| Dashboard | 외부 모니터링 웹 대시보드 / ROS bridge | 공정 단계, 진행률, 성공·실패 상태 표시 |
 | FMS | `fleet_manager_node` | 남은 작업 생성, 스테이션별 작업 할당, 결과 수집 |
 | Behavior | `behavior_node` | 한 스테이션의 전체 조립 FSM과 작업 순서 제어 |
 | Execution | `amr_node`, `arm_node` | AMR 메시지 변환, Arm Action 실행, Vision/Isaac 결과 대기 |
@@ -224,30 +225,29 @@ fleet_manager_node
 - AMR 이동 후 RMPFlow가 사용하는 Robot Base Pose 갱신
 - Job 단위 성공/실패 보고와 다음 스테이션 작업 할당
 
-### HMI Monitoring
+### Web Dashboard Monitoring
 
 - 현재 Isaac Phase: `/isaac_phase`
 - 서브 작업 진행률: `/isaac_progress`
 - 서브 작업 성공/실패: `/isaac_status`
-- HMI가 로봇 내부 구현을 몰라도 표준 ROS 2 토픽으로 상태 표시 가능
+- 모니터링 웹 대시보드가 로봇 내부 구현을 몰라도 표준 ROS 2 토픽으로 상태 표시 가능
 
 ---
 
-## 6. HMI Integration Contract
+## 6. Monitoring Dashboard Integration Contract
 
-기준 실행 파일인 `execute_isaac.py`는 다음 토픽을 통해 HMI 및 ROS 2 제어 노드와
-연동됩니다.
+`execute_isaac.py`는 다음 토픽을 통해 모니터링 웹 대시보드 및 ROS 2 제어 노드와 연동됩니다.
 
 | Direction | Topic | Type | Description |
 |---|---|---|---|
-| Isaac → HMI/Arm | `/isaac_phase` | `std_msgs/String` | 현재 서브 단계 이름 |
-| Isaac → HMI/Arm | `/isaac_progress` | `std_msgs/Float32` | 현재 서브 작업 진행률(0~100) |
-| Isaac → HMI/Arm | `/isaac_status` | `std_msgs/String` | `SUCCESS` 또는 `FAILURE:<reason>` |
+| Isaac → Dashboard/Arm | `/isaac_phase` | `std_msgs/String` | 현재 서브 단계 이름 |
+| Isaac → Dashboard/Arm | `/isaac_progress` | `std_msgs/Float32` | 현재 서브 작업 진행률(0~100) |
+| Isaac → Dashboard/Arm | `/isaac_status` | `std_msgs/String` | `SUCCESS` 또는 `FAILURE:<reason>` |
 | Arm/Vision → Isaac | `/task_command` | `std_msgs/String` | 스캔·파지·체결 명령, 정렬 완료 신호 |
 | Arm/Vision → Isaac | `/target_pose` | `geometry_msgs/PoseStamped` | 검출 World Pose 또는 미세 보정 Offset |
 | Isaac → Error Fix | `/errorfix_command` | `std_msgs/String` | 미세 오차 보정 시작 Trigger |
 
-HMI 표시용 주요 Phase 예시는 다음과 같습니다.
+대시보드 표시용 주요 Phase 예시는 다음과 같습니다.
 
 | Process | Phase Examples |
 |---|---|
@@ -260,11 +260,11 @@ HMI 표시용 주요 Phase 예시는 다음과 같습니다.
 | Finish | `RETURNING_HOME_JOINTS`, `ASSEMBLE_NUT_COMPLETE` |
 
 > `/isaac_progress`는 전체 공정 누적 진행률이 아니라 **현재 Action의 서브 진행률**입니다.
-> HMI에서 전체 공정 Progress Bar를 만들 때는 `behavior_node`의 FSM Step과 함께
+> 대시보드에서 전체 공정 Progress Bar를 만들 때는 `behavior_node`의 FSM Step과 함께
 > 매핑해야 합니다.
 
-> 현재 `main` 브랜치에는 HMI 화면과 Start/Stop Service 구현이 포함되어 있지 않습니다.
-> `fleet_manager_node`는 실행 후 데모 Job을 자동 생성하므로, 현재 코드 그대로의 HMI는
+> 현재 `main` 브랜치에는 모니터링 웹 대시보드 화면과 Start/Stop Service 구현이 포함되어 있지 않습니다.
+> `fleet_manager_node`는 실행 후 데모 Job을 자동 생성하므로, 현재 코드 그대로의 대시보드는
 > 우선 모니터링 용도로 연동하는 것이 정확합니다.
 
 ---
@@ -284,7 +284,7 @@ HMI 표시용 주요 Phase 예시는 다음과 같습니다.
 | Vision | YOLO Pose, Ultralytics, PyTorch, OpenCV, NumPy |
 | 3D Geometry | RGB-D, CameraInfo, TF2 |
 | Communication | ROS 2 Topic / Service / Action |
-| HMI | External ROS 2 HMI using phase/progress/status topics |
+| Dashboard | External monitoring web dashboard using phase/progress/status topics |
 | Build | colcon, ament_python, ament_cmake |
 
 > 저장소에는 Isaac Sim 버전이 고정되어 있지 않습니다. 사용 중인 버전이
@@ -299,7 +299,7 @@ HMI 표시용 주요 Phase 예시는 다음과 같습니다.
 2026_ROKEY_B_1/
 ├── README.md
 ├── isaacpjt/M0609/
-│   ├── execute_isaac.py              # HMI 상태 연동 기준 전체 실행 파일
+│   ├── execute_isaac.py              # Isaac Sim 실행 진입점 (모니터링 대시보드용 상태 토픽 발행)
 │   ├── Imported_Collected_Busbar_20260728/
 │   │   └── Collected_Busbar/         # 현재 실행용 USD 월드와 종속 에셋
 │   ├── doosan-robot2/urdf/
@@ -341,7 +341,7 @@ HMI 표시용 주요 Phase 예시는 다음과 같습니다.
 5. Ultralytics, PyTorch, OpenCV, NumPy
 6. ROS Vision/TF 패키지
 7. 프로젝트용 `Busbar.usd` Scene과 M0609 Mesh
-8. HMI를 사용할 경우 별도 HMI Workspace
+8. 모니터링 웹 대시보드를 사용할 경우 별도 Dashboard Workspace
 
 ROS 2와 Isaac Sim 설치는 각 공식 문서를 먼저 확인하십시오.
 
@@ -514,7 +514,7 @@ Scene 배치를 변경했다면 반드시 재측정해야 합니다.
 
 ---
 
-## 12. Run — HMI-linked Full Pipeline
+## 12. Run — Web Dashboard-linked Full Pipeline
 
 ### Terminal A — Run Isaac Sim Standalone
 
@@ -580,20 +580,20 @@ source install/setup.bash
 ros2 run error_fix error_fix_node
 ```
 
-### Terminal D — Run External HMI
+### Terminal D — Run External Monitoring Web Dashboard
 
-HMI Workspace가 별도로 있다면 해당 Workspace를 Source한 뒤 실행합니다.
+모니터링 웹 대시보드 Workspace가 별도로 있다면 해당 Workspace를 Source한 뒤 실행합니다.
 
 ```bash
 source /opt/ros/humble/setup.bash
 source <REPOSITORY_PATH>/install/setup.bash
-source <HMI_WORKSPACE>/install/setup.bash
+source <DASHBOARD_WORKSPACE>/install/setup.bash
 
-# HMI 패키지의 실제 실행 명령 사용
-ros2 run <hmi_package> <hmi_executable>
+# 모니터링 웹 대시보드 패키지의 실제 실행 명령 사용
+ros2 run <dashboard_package> <dashboard_executable>
 ```
 
-HMI는 최소한 다음 Topic을 구독해야 합니다.
+대시보드는 최소한 다음 Topic을 구독해야 합니다.
 
 ```text
 /isaac_phase
@@ -614,7 +614,7 @@ ros2 launch fms_bringup fms_bringup.launch.py
 ```
 
 > `perception_node`는 현재 Launch 파일에서 주석 처리되어 있으므로 Terminal B에서
-> 별도로 실행해야 합니다. `error_fix_node`와 HMI도 별도 실행 대상입니다.
+> 별도로 실행해야 합니다. `error_fix_node`와 모니터링 웹 대시보드도 별도 실행 대상입니다.
 
 > `fleet_manager_node`는 기동 약 5초 후 `station_3`의 첫 Job을 자동 발행합니다.
 > 따라서 Isaac Sim과 Vision 노드를 먼저 정상 실행한 뒤 마지막에 Bringup을
@@ -642,7 +642,7 @@ ros2 node list
 /execute_isaac_busar
 ```
 
-### Check HMI Topics
+### Check Dashboard Topics
 
 ```bash
 ros2 topic echo /isaac_phase
@@ -691,13 +691,13 @@ ros2 topic pub --once /task_command std_msgs/msg/String \
 | `/amr/sim_pose` | `geometry_msgs/Pose2D` | Isaac → AMR |
 | `/target_pose` | `geometry_msgs/PoseStamped` | Arm/Vision → Isaac |
 | `/task_command` | `std_msgs/String` | Arm/Vision → Isaac |
-| `/isaac_phase` | `std_msgs/String` | Isaac → Arm/HMI |
-| `/isaac_progress` | `std_msgs/Float32` | Isaac → Arm/HMI |
-| `/isaac_status` | `std_msgs/String` | Isaac → Arm/HMI |
+| `/isaac_phase` | `std_msgs/String` | Isaac → Arm/Dashboard |
+| `/isaac_progress` | `std_msgs/Float32` | Isaac → Arm/Dashboard |
+| `/isaac_status` | `std_msgs/String` | Isaac → Arm/Dashboard |
 | `/vision/busbar_grasp` | `fms_interfaces/BusbarGrasp` | Perception → Arm |
 | `/vision/nut_pose` | `fms_interfaces/NutPose` | Perception → Arm |
-| `/perception/detections_3d` | `vision_msgs/Detection3DArray` | Perception → Debug/HMI |
-| `/perception/debug_image` | `sensor_msgs/Image` | Perception → rqt/HMI |
+| `/perception/detections_3d` | `vision_msgs/Detection3DArray` | Perception → Debug/Dashboard |
+| `/perception/debug_image` | `sensor_msgs/Image` | Perception → rqt/Dashboard |
 
 ### Services & Actions
 
@@ -783,7 +783,7 @@ ros2 run dummy_executor_node dummy_executor_node
 | URDF Mesh Load 실패 | `m0609_isaac_sim.urdf`의 절대경로 수정 및 누락된 `meshes/` 복원 |
 | `ModuleNotFoundError: isaacsim` | 시스템 `python3`가 아닌 Isaac Sim의 `python.sh` 사용 |
 | Isaac에서 `rclpy` import 실패 | 사용 중인 Isaac Sim 버전의 ROS 2 Bridge 환경/내장 라이브러리 설정 확인 |
-| HMI에 Phase가 표시되지 않음 | `execute_isaac_busar` 노드와 `/isaac_phase` Publisher 확인, `ROS_DOMAIN_ID` 통일 |
+| 대시보드에 Phase가 표시되지 않음 | `execute_isaac_busar` 노드와 `/isaac_phase` Publisher 확인, `ROS_DOMAIN_ID` 통일 |
 | `arm_node`가 계속 대기함 | 이 노드는 Isaac/Vision 응답을 무제한 기다리도록 구현됨. `/isaac_status`와 Perception Service 확인 |
 | YOLO가 검출하지 못함 | `/rgb`, `/depth`, `/camera_info`, Model Path, Label(`bolt/busbar/nut`), ROI 확인 |
 | 3D 좌표가 발행되지 않음 | `world ← camera_color_optical_frame` TF와 유효한 Depth 확인 |
@@ -801,7 +801,7 @@ ros2 run dummy_executor_node dummy_executor_node
 
 - 전체 `Busbar.usd` Scene이 저장소에 포함되어 있지 않습니다.
 - M0609 URDF가 참조하는 Mesh와 일부 절대경로가 저장소 외부 환경에 의존합니다.
-- HMI UI와 HMI Start/Stop 제어 패키지는 저장소에 포함되어 있지 않습니다.
+- 모니터링 웹 대시보드와 Start/Stop 제어 패키지는 저장소에 포함되어 있지 않습니다.
 - `fms_bringup.launch.py`에서 `perception_node`가 주석 처리되어 있습니다.
 - `fleet_manager_node`는 실제 잔여 작업 인식 대신 station 3~5 데모 Job을 생성합니다.
 - AMR은 `set_world_pose` 기반 Kinematic 이동이며 Nav2/바퀴 물리 주행이 아닙니다.
@@ -814,7 +814,7 @@ ros2 run dummy_executor_node dummy_executor_node
 
 ## 19. Future Work
 
-- HMI 패키지와 Start/Stop/E-Stop Service를 저장소에 통합
+- 모니터링 웹 대시보드 패키지와 Start/Stop/E-Stop Service를 저장소에 통합
 - 전체 공정 누적 Progress와 작업 이력 Dashboard 구현
 - USD Scene, Robot Mesh, Configuration 경로의 Portable Packaging
 - YAML 기반 Station/Bolt/Nut 좌표 관리
